@@ -22,7 +22,7 @@ required-features = ["dev-bridge"]
 [features]
 default = []
 # Dev-only HTTP bridge that serves the core over localhost for browser E2E tests.
-dev-bridge = ["dep:axum", "dep:tower-http", "dep:tempfile"]
+dev-bridge = ["dep:tower-http", "dep:tempfile"]
 # Integration tests against the sandb-test docker stack (testdb/).
 it = []
 
@@ -38,7 +38,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "mysql", "sqlite"] }
 aes-gcm = "0.10"
 uuid = { version = "1", features = ["v4"] }
-axum = { version = "0.8", optional = true }
+axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 tempfile = { version = "3", optional = true }
 sqlparser = { version = "0.63", features = ["visitor"] }
@@ -55,6 +55,8 @@ tokio-util = { version = "0.7", default-features = false }
 keyring = "4.2"
 # Local date of the machine for the AI prompt ("today", "last month").
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+openidconnect = { version = "=4.1.0", default-features = false, features = ["timing-resistant-secret-traits"] }
+open = { version = "=5.4.5", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

@@ -40,6 +40,16 @@ pub struct AppError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_body: Option<serde_json::Value>,
     /// The server's own error code when `message` is the server's text, e.g. `SQLSTATE 22P02`
     /// or `MySQL error 1366`. Not serialized: it lets a caller name the error without the text.
     #[serde(skip)]
@@ -52,7 +62,35 @@ impl AppError {
             code,
             message: message.into(),
             detail: None,
+            http_status: None,
+            request_id: None,
+            upstream_code: None,
+            upstream_param: None,
+            upstream_body: None,
             server_code: None,
+        }
+    }
+
+    pub(crate) fn redact(&mut self, secret: &str) {
+        if secret.is_empty() {
+            return;
+        }
+        let quoted = serde_json::to_string(secret).expect("a string always serializes");
+        let escaped = &quoted[1..quoted.len() - 1];
+        self.message = self.message.replace(secret, "***").replace(escaped, "***");
+        for field in [
+            &mut self.detail,
+            &mut self.server_code,
+            &mut self.request_id,
+            &mut self.upstream_code,
+            &mut self.upstream_param,
+        ] {
+            if let Some(text) = field {
+                *text = text.replace(secret, "***").replace(escaped, "***");
+            }
+        }
+        if let Some(body) = &mut self.upstream_body {
+            redact_value(body, secret, escaped);
         }
     }
 
@@ -71,6 +109,27 @@ impl AppError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
+    }
+}
+
+fn redact_value(value: &mut serde_json::Value, secret: &str, escaped: &str) {
+    match value {
+        serde_json::Value::String(text) => {
+            *text = text.replace(secret, "***").replace(escaped, "***")
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_value(value, secret, escaped);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            let old = std::mem::take(values);
+            for (key, mut value) in old {
+                redact_value(&mut value, secret, escaped);
+                values.insert(key.replace(secret, "***").replace(escaped, "***"), value);
+            }
+        }
+        _ => {}
     }
 }
 

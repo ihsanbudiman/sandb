@@ -1,6 +1,6 @@
 # sandb
 
-sandb is a light desktop database client with an AI assistant. You use your own AI server and your own API key (BYOK).
+sandb is a light desktop database client with an AI assistant. Use your own AI server and API key (BYOK), or an eligible ChatGPT plan.
 
 ## Features
 
@@ -45,14 +45,21 @@ sandb is a light desktop database client with an AI assistant. You use your own 
 - With the "Schema only" privacy setting, the AI model gets the column names and the row count, but no row values.
 - The chat history stays after a restart.
 
-sandb supports two AI server formats:
+sandb supports these AI options:
 
 | Option | Examples |
 |--------|----------|
 | OpenAI-compatible | Ollama, LM Studio, OpenRouter, OpenAI |
 | Anthropic-compatible | Anthropic |
+| ChatGPT plan (preview) | Eligible ChatGPT Plus / Pro accounts |
 
-In Settings > AI, set the provider, the base URL, the model and the API key.
+For API-key providers, set the provider, base URL, model and API key in Settings > AI.
+
+For ChatGPT, choose **Settings > AI > ChatGPT plan**, then **Continue with ChatGPT**. Authorize sandb in your system browser and select an account model. No Codex installation is required. If sign-in succeeds without usage permission, choose **Enable ChatGPT plan usage** to request it explicitly.
+
+Eligible requests use your ChatGPT plan or credits balance; sandb never silently falls back to paid API credentials. Availability depends on account, workspace, region and preview admission. **Manage usage** opens ChatGPT usage settings. **Sign out** clears local tokens and attempts remote revocation; sandb warns if revocation could not be confirmed.
+
+The existing prompt, database tools, privacy settings and write safeguards are unchanged. OAuth credentials stay encrypted in backend storage, not browser storage. ChatGPT sign-in requires the native desktop app; the demo and dev bridge do not support it. Only one native sandb instance may use a data directory at a time.
 
 ### Appearance and updates
 

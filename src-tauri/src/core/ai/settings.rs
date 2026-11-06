@@ -3,8 +3,10 @@
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::core::ai::client::{AiClient, Api};
+use crate::core::ai::responses;
 use crate::core::error::{AppError, ErrorCode};
 use crate::core::state::AppState;
 
@@ -30,8 +32,8 @@ pub enum Privacy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AiSettings {
-    /// Wire format: `anthropic` for an Anthropic-compatible server, `openai` for an
-    /// OpenAI-compatible one. Older files hold other labels (`ollama`, `custom`, …); they load as `openai`.
+    /// `chatgpt` uses OAuth Responses; `anthropic` and `openai` use API-key transports.
+    /// Older provider labels (`ollama`, `custom`, …) load as `openai`.
     pub provider: String,
     /// API root, e.g. `http://localhost:11434/v1`. No trailing `/`.
     pub base_url: String,
@@ -74,24 +76,27 @@ pub struct AiTestResult {
 
 impl AiSettings {
     pub fn api(&self) -> Api {
-        if self.provider == "anthropic" {
-            Api::Anthropic
-        } else {
-            Api::OpenAi
+        match self.provider.as_str() {
+            "anthropic" => Api::Anthropic,
+            "chatgpt" => Api::ChatGpt,
+            _ => Api::OpenAi,
         }
     }
 
     /// Trims the text fields and checks the limits. The base URL loses its trailing `/`.
-    /// Any provider other than `anthropic` becomes `openai`.
+    /// Unknown providers become `openai`; `chatgpt` never uses the saved base URL.
     pub fn normalized(mut self) -> Result<Self, AppError> {
         self.provider = match self.provider.trim() {
             "anthropic" => "anthropic",
+            "chatgpt" => "chatgpt",
             _ => "openai",
         }
         .to_string();
         self.model = self.model.trim().to_string();
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
-        if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
+        if self.provider != "chatgpt"
+            && !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://"))
+        {
             return Err(AppError::invalid(
                 "The base URL must start with http:// or https://",
             ));
@@ -150,6 +155,43 @@ fn resolve_key(state: &AppState, key: Option<String>) -> Result<Option<String>, 
     }
 }
 
+pub(crate) async fn client(
+    state: &AppState,
+    settings: &AiSettings,
+    key: Option<String>,
+    cancel: &CancellationToken,
+) -> Result<AiClient, AppError> {
+    if settings.api() == Api::ChatGpt {
+        return Ok(chatgpt_client(state, cancel).await?.with_redaction(key));
+    }
+    AiClient::new(settings.api(), &settings.base_url, resolve_key(state, key)?)
+}
+
+async fn chatgpt_client(
+    state: &AppState,
+    cancel: &CancellationToken,
+) -> Result<AiClient, AppError> {
+    let lease = state
+        .chatgpt
+        .access_token(state.secrets.as_ref(), cancel)
+        .await?;
+    let client = AiClient::chatgpt(lease)?.with_redaction(stored_key(state)?);
+    #[cfg(test)]
+    let client = match &state.chatgpt.inference_base {
+        Some(base) => client.with_test_base(base),
+        None => client,
+    };
+    Ok(client)
+}
+
+/// Account catalog retains display labels and server order for the forthcoming picker.
+pub async fn chatgpt_catalog(state: &AppState) -> Result<Vec<responses::Model>, AppError> {
+    chatgpt_client(state, &CancellationToken::new())
+        .await?
+        .chatgpt_models()
+        .await
+}
+
 /// Model ids of `settings` (saved or not), sorted, without duplicates. The model field is not
 /// checked. `key`: as in [`test`].
 pub async fn models(
@@ -158,7 +200,13 @@ pub async fn models(
     key: Option<String>,
 ) -> Result<Vec<String>, AppError> {
     let settings = settings.normalized()?;
-    let client = AiClient::new(settings.api(), &settings.base_url, resolve_key(state, key)?)?;
+    if settings.api() == Api::ChatGpt {
+        return client(state, &settings, key, &CancellationToken::new())
+            .await?
+            .list_models()
+            .await;
+    }
+    let client = client(state, &settings, key, &CancellationToken::new()).await?;
     let mut models = client.list_models().await?;
     models.sort_by(|a, b| {
         a.to_lowercase()
@@ -180,7 +228,7 @@ pub async fn test(
     if settings.model.is_empty() {
         return Err(AppError::invalid("Enter a model name"));
     }
-    let client = AiClient::new(settings.api(), &settings.base_url, resolve_key(state, key)?)?;
+    let client = client(state, &settings, key, &CancellationToken::new()).await?;
     let started = Instant::now();
     let models = client.list_models().await?;
     let latency_ms = started.elapsed().as_millis() as u64;

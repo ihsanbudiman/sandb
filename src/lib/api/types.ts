@@ -304,6 +304,22 @@ export interface AiTestResult {
   modelCount: number;
 }
 
+export interface ChatGptStatus {
+  signedIn: boolean;
+  accountLabel: string | null;
+  usageEnabled: boolean;
+}
+
+export interface ChatGptModel {
+  slug: string;
+  display_name: string;
+  visibility: string;
+}
+
+export interface ChatGptLogout {
+  revocationUnconfirmed: boolean;
+}
+
 /** One database of a chat. */
 export interface ChatSource {
   connId: string;
@@ -392,17 +408,32 @@ export interface AppErrorBody {
   code: ErrorCode;
   message: string;
   detail?: string;
+  http_status?: number;
+  request_id?: string;
+  upstream_code?: string;
+  upstream_param?: string;
+  upstream_body?: unknown;
 }
 
 export class ApiError extends Error {
   code: ErrorCode;
   detail?: string;
+  http_status?: number;
+  request_id?: string;
+  upstream_code?: string;
+  upstream_param?: string;
+  upstream_body?: unknown;
 
   constructor(body: AppErrorBody) {
     super(body.message);
     this.name = 'ApiError';
     this.code = body.code;
     this.detail = body.detail;
+    this.http_status = body.http_status;
+    this.request_id = body.request_id;
+    this.upstream_code = body.upstream_code;
+    this.upstream_param = body.upstream_param;
+    this.upstream_body = body.upstream_body;
   }
 
   static from(e: unknown): ApiError {
@@ -469,6 +500,13 @@ export interface Backend {
   classifyWrite(engine: Engine, sql: string): Promise<WriteInfo>;
   /** AI read path: guard, then a read-only session with the default limits. Fails with `guard_rejected`, `read_only_violation` or `timeout`. */
   runAiRead(connId: string, database: string | null, sql: string): Promise<AiReadResult>;
+  chatgptStatus(): Promise<ChatGptStatus>;
+  chatgptSignIn(enableUsage: boolean): Promise<ChatGptStatus>;
+  chatgptCancelSignIn(): Promise<void>;
+  chatgptLogout(): Promise<ChatGptLogout>;
+  chatgptModels(): Promise<ChatGptModel[]>;
+  /** Native only: opens the fixed ChatGPT usage settings page. */
+  chatgptManageUsage(): Promise<void>;
   getAiSettings(): Promise<AiSettingsView>;
   /** Fails with `invalid_input` for a URL that is not http(s), max rows outside 1–10,000 or a time limit outside 1–300 s. */
   saveAiSettings(settings: AiSettings): Promise<AiSettingsView>;

@@ -4,6 +4,7 @@ use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::core::ai::oauth::{LogoutView, SessionView};
 use crate::core::ai::session::{self as chat, ChatEvent, ChatRequest};
 use crate::core::ai::settings::{self as ai_settings, AiSettings, AiSettingsView, AiTestResult};
 use crate::core::connections::{self, Connection, ConnectionInput, Engine, TestResult};
@@ -244,6 +245,51 @@ pub async fn run_ai_read(
         ReadLimits::default(),
     )
     .await
+}
+
+#[tauri::command]
+pub async fn chatgpt_sign_in(state: State<'_, AppState>, enable_usage: bool) -> Res<SessionView> {
+    if enable_usage {
+        state
+            .chatgpt
+            .enable_plan_usage(state.secrets.as_ref())
+            .await
+    } else {
+        state.chatgpt.sign_in(state.secrets.as_ref()).await
+    }
+}
+
+#[tauri::command]
+pub async fn chatgpt_models(
+    state: State<'_, AppState>,
+) -> Res<Vec<crate::core::ai::responses::Model>> {
+    ai_settings::chatgpt_catalog(&state).await
+}
+
+#[tauri::command]
+pub async fn chatgpt_manage_usage() -> Res<()> {
+    open::that("https://chatgpt.com/settings/usage").map_err(|_| {
+        AppError::new(
+            crate::core::error::ErrorCode::Io,
+            "Could not open ChatGPT usage settings",
+        )
+    })
+}
+
+#[tauri::command]
+pub async fn chatgpt_cancel_sign_in(state: State<'_, AppState>) -> Res<()> {
+    state.chatgpt.cancel_sign_in();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn chatgpt_logout(state: State<'_, AppState>) -> Res<LogoutView> {
+    state.chatgpt.logout(state.secrets.as_ref()).await
+}
+
+#[tauri::command]
+pub async fn chatgpt_status(state: State<'_, AppState>) -> Res<SessionView> {
+    state.chatgpt.status(state.secrets.as_ref())
 }
 
 #[tauri::command]

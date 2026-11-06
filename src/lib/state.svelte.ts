@@ -1,4 +1,4 @@
-import { api, ApiError, type AiSettings, type Connection, type Engine, type Env } from './api';
+import { api, ApiError, type AiSettings, type ChatGptModel, type ChatGptStatus, type AppErrorBody, type Connection, type Engine, type Env } from './api';
 import { seedConnections } from './api/mock';
 import { tabs, activeTab, setTabConn } from './tabs.svelte';
 
@@ -55,12 +55,13 @@ export const ui = $state({
   resultsOpen: true,
 });
 
-/** The wire format of the AI server. Any other saved label loads as `openai`. */
-export type Provider = 'openai' | 'anthropic';
+/** API-key transports and the additional OAuth ChatGPT plan option. */
+export type Provider = 'openai' | 'anthropic' | 'chatgpt';
 
 export const providers: Record<Provider, { label: string; url: string; model: string }> = {
   openai: { label: 'OpenAI-compatible', url: 'https://api.openai.com/v1', model: 'gpt-4.1-mini' },
   anthropic: { label: 'Anthropic-compatible', url: 'https://api.anthropic.com/v1', model: 'claude-sonnet-4-5' },
+  chatgpt: { label: 'ChatGPT plan', url: '', model: '' },
 };
 
 export const ai = $state({
@@ -106,13 +107,16 @@ export async function loadAiSettings() {
   if (isMock) return;
   try {
     const s = await api.getAiSettings();
-    ai.provider = s.provider === 'anthropic' ? 'anthropic' : 'openai';
+    ai.provider = s.provider === 'chatgpt' ? 'chatgpt' : s.provider === 'anthropic' ? 'anthropic' : 'openai';
     ai.baseUrl = s.baseUrl;
     ai.model = s.model;
     ai.privacy = s.privacy;
     ai.maxRows = s.maxRows;
     ai.timeoutSec = s.timeoutSec;
     ai.hasKey = s.hasKey;
+    invalidateAiModels();
+    await loadChatGptStatus();
+    if (ai.provider === 'chatgpt') await loadAiModels();
   } catch (e) {
     console.warn('AI settings were not loaded; using the defaults.', ApiError.from(e).message);
   }
@@ -196,32 +200,234 @@ export async function removeAiKey() {
   ai.hasKey = false;
 }
 
-/** Models the AI server lists. `target`: the provider, URL and key that the list is for. */
-export const aiModels = $state({ list: [] as string[], loading: false, error: '', target: '' });
+export const chatgpt = $state({
+  supported: api.kind === 'tauri', signedIn: false, accountLabel: null as string | null,
+  usageEnabled: false, loading: false, pending: false, cancelling: false, signingOut: false,
+  welcome: false, usagePaused: false, error: null as ApiError | null, warning: '',
+});
+let authSeq = 0;
+let accountRevision = 0;
+const WELCOME_KEY = 'sandb.chatgpt.welcomed';
+let welcomed = false;
+
+export const aiModels = $state({ list: [] as string[], catalog: [] as ChatGptModel[], loading: false, error: '', target: '' });
 let modelsSeq = 0;
 
-/** Loads the model list unless it is already loaded (or loading) for the current provider, URL and key. `force` loads again. */
+function invalidateAiModels() {
+  modelsSeq++;
+  aiModels.list = [];
+  aiModels.catalog = [];
+  aiModels.target = aiModels.error = '';
+  aiModels.loading = false;
+}
+
+function applyChatGptStatus(status: ChatGptStatus) {
+  if (chatgpt.signedIn !== status.signedIn || chatgpt.accountLabel !== status.accountLabel || chatgpt.usageEnabled !== status.usageEnabled) {
+    accountRevision++;
+    invalidateAiModels();
+  }
+  chatgpt.signedIn = status.signedIn;
+  chatgpt.accountLabel = status.accountLabel;
+  chatgpt.usageEnabled = status.usageEnabled;
+}
+
+export async function loadChatGptStatus() {
+  const seq = authSeq;
+  chatgpt.loading = true;
+  try {
+    const status = await api.chatgptStatus();
+    if (seq === authSeq) applyChatGptStatus(status);
+  } catch (e) {
+    if (seq === authSeq) chatgpt.error = ApiError.from(e);
+  } finally {
+    if (seq === authSeq) chatgpt.loading = false;
+  }
+}
+
+export async function signInChatGpt(enableUsage = false) {
+  if (chatgpt.pending || chatgpt.signingOut) return;
+  const seq = ++authSeq;
+  chatgpt.pending = true;
+  chatgpt.cancelling = false;
+  chatgpt.loading = false;
+  chatgpt.error = null;
+  chatgpt.warning = '';
+  accountRevision++;
+  invalidateAiModels();
+  try {
+    const status = await api.chatgptSignIn(enableUsage);
+    if (seq !== authSeq) return;
+    applyChatGptStatus(status);
+    chatgpt.usagePaused = false;
+    if (status.signedIn && status.usageEnabled) {
+      try { welcomed ||= localStorage.getItem(WELCOME_KEY) === 'yes'; } catch { /* Storage may be disabled. */ }
+      if (!welcomed) {
+        welcomed = true;
+        chatgpt.welcome = true;
+        ui.settingsSection = 'ai';
+        ui.page = 'settings';
+        try { localStorage.setItem(WELCOME_KEY, 'yes'); } catch { /* The in-memory flag still prevents repeats. */ }
+      }
+    }
+    chatgpt.pending = false;
+    if (ai.provider === 'chatgpt') await loadAiModels(true);
+  } catch (e) {
+    if (seq === authSeq) {
+      const error = ApiError.from(e);
+      chatgpt.pending = false;
+      await loadChatGptStatus();
+      if (seq !== authSeq) return;
+      if (ai.provider === 'chatgpt') await loadAiModels(true);
+      if (seq === authSeq && error.code !== 'cancelled') chatgpt.error = error;
+    }
+  } finally {
+    if (seq === authSeq) chatgpt.pending = false;
+  }
+}
+
+export async function cancelChatGptSignIn() {
+  if (!chatgpt.pending || chatgpt.cancelling) return;
+  const seq = ++authSeq;
+  chatgpt.cancelling = true;
+  accountRevision++;
+  invalidateAiModels();
+  try { await api.chatgptCancelSignIn(); }
+  catch (e) { if (seq === authSeq) chatgpt.error = ApiError.from(e); }
+  finally {
+    if (seq === authSeq) {
+      chatgpt.pending = chatgpt.cancelling = false;
+      await loadChatGptStatus();
+      if (ai.provider === 'chatgpt') await loadAiModels(true);
+    }
+  }
+}
+
+export async function logoutChatGpt() {
+  if (chatgpt.signingOut) return;
+  const seq = ++authSeq;
+  chatgpt.pending = chatgpt.cancelling = chatgpt.loading = false;
+  chatgpt.signingOut = true;
+  chatgpt.error = null;
+  chatgpt.warning = '';
+  chatgpt.welcome = false;
+  accountRevision++;
+  applyChatGptStatus({ signedIn: false, accountLabel: null, usageEnabled: false });
+  invalidateAiModels();
+  try {
+    const result = await api.chatgptLogout();
+    if (seq === authSeq && result.revocationUnconfirmed) chatgpt.warning = 'Signed out locally. Remote revocation was not confirmed; disconnect sandb in ChatGPT Settings if needed.';
+  } catch (e) {
+    if (seq === authSeq) { chatgpt.error = ApiError.from(e); await loadChatGptStatus(); }
+  } finally { if (seq === authSeq) chatgpt.signingOut = false; }
+}
+
+export async function manageChatGptUsage() {
+  try { await api.chatgptManageUsage(); }
+  catch (e) { chatgpt.error = ApiError.from(e); }
+}
+
+export function dismissChatGptWelcome() { chatgpt.welcome = false; }
+export function resumeChatGptUsage() { chatgpt.usagePaused = false; }
+
+export function chatGptIssue(error: AppErrorBody): { text: string; action?: 'usage' | 'signin' | 'settings' | 'retry'; diagnostic?: string; requestId?: string } {
+  const code = error.upstream_code;
+  let text = error.message;
+  let action: 'usage' | 'signin' | 'settings' | 'retry' | undefined;
+  if (code === 'subscription_sharing_usage_limit_exceeded') {
+    text = "ChatGPT usage limit reached. Review your plan or this app's limit in ChatGPT settings."; action = 'usage';
+  } else if (code === 'subscription_sharing_user_not_eligible') {
+    text = 'ChatGPT plan usage is unavailable for this account, workspace, or policy.'; action = 'settings';
+  } else if (code === 'subscription_sharing_unsupported_capability') {
+    text = 'This capability is not supported for ChatGPT plan usage. Review the model and request settings.'; action = 'settings';
+  } else if (code === 'chatpass_v2_scope_not_authorized' || code === 'chatpass_v2_invalid_authorization_context' || code === 'subscription_sharing_route_not_supported') {
+    text = 'ChatGPT rejected the permission context or route. Review the integration; repeating sign-in may not fix it.'; action = 'settings';
+  } else if (error.http_status === 503 || code === 'subscription_sharing_usage_unavailable' || code === 'subscription_sharing_user_unavailable' || error.code === 'connect_failed' || error.code === 'timeout') {
+    text = 'ChatGPT is temporarily unavailable. Your sign-in is preserved; try again later.'; action = 'retry';
+  } else if (error.http_status === 403) {
+    text = 'ChatGPT plan usage is restricted by policy, permission, or region.'; action = 'settings';
+  } else if (error.code === 'auth_failed' || error.http_status === 401) {
+    text = 'ChatGPT authorization was not accepted. Continue with ChatGPT again or review plan permission.'; action = 'signin';
+  }
+  return { text, action, diagnostic: [code, error.upstream_param].filter(Boolean).join(' · ').slice(0, 240) || undefined, requestId: error.request_id?.slice(0, 200) };
+}
+
+export function reportChatGptError(error: AppErrorBody) {
+  if (error.upstream_code === 'subscription_sharing_usage_limit_exceeded') chatgpt.usagePaused = true;
+  if (error.code === 'auth_failed') void loadChatGptStatus();
+  return chatGptIssue(error);
+}
+
+export function canUseChatGpt() {
+  return chatgpt.supported && chatgpt.signedIn && chatgpt.usageEnabled && !chatgpt.pending && !chatgpt.loading && !chatgpt.signingOut && !chatgpt.usagePaused && aiModels.list.includes(ai.model);
+}
+
+function modelTarget() {
+  return ai.provider === 'chatgpt' ? `chatgpt\n${accountRevision}`
+    : [ai.provider, ai.baseUrl.trim().replace(/\/+$/, ''), ai.apiKey.trim() || (ai.hasKey ? '(saved)' : '')].join('\n');
+}
+
 export async function loadAiModels(force = false) {
-  const target = [ai.provider, ai.baseUrl.trim().replace(/\/+$/, ''), ai.apiKey.trim() || (ai.hasKey ? '(saved)' : '')].join('\n');
+  if (ai.provider === 'chatgpt' && (!chatgpt.supported || !chatgpt.signedIn || !chatgpt.usageEnabled || chatgpt.pending || chatgpt.signingOut || chatgpt.loading)) {
+    invalidateAiModels();
+    return;
+  }
+  const target = modelTarget();
   if (!force && aiModels.target === target && (aiModels.loading || (aiModels.list.length && !aiModels.error))) return;
   const seq = ++modelsSeq;
-  if (aiModels.target !== target) aiModels.list = [];
+  if (aiModels.target !== target) { aiModels.list = []; aiModels.catalog = []; }
   aiModels.target = target;
   aiModels.loading = true;
   aiModels.error = '';
   try {
-    const list = await api.listAiModels(aiSettings(), ai.apiKey.trim() || null);
-    if (seq === modelsSeq) aiModels.list = list;
+    if (ai.provider === 'chatgpt') {
+      const catalog = await api.chatgptModels();
+      if (seq !== modelsSeq || target !== modelTarget()) return;
+      chatgpt.error = null;
+      aiModels.catalog = catalog;
+      aiModels.list = catalog.map((model) => model.slug);
+      if (!aiModels.list.includes(ai.model)) setAiModel(aiModels.list[0] ?? '');
+    } else {
+      const list = await api.listAiModels(aiSettings(), ai.apiKey.trim() || null);
+      if (seq === modelsSeq && target === modelTarget()) aiModels.list = list;
+    }
   } catch (e) {
-    if (seq === modelsSeq) aiModels.error = ApiError.from(e).message;
+    if (seq === modelsSeq && target === modelTarget()) {
+      const error = ApiError.from(e);
+      aiModels.error = ai.provider === 'chatgpt' ? chatGptIssue(error).text : error.message;
+      if (ai.provider === 'chatgpt') chatgpt.error = error;
+    }
   } finally {
-    if (seq === modelsSeq) aiModels.loading = false;
+    if (seq === modelsSeq && target === modelTarget()) aiModels.loading = false;
   }
+}
+
+export function modelLabel(slug: string) {
+  return ai.provider === 'chatgpt' ? aiModels.catalog.find((model) => model.slug === slug)?.display_name ?? slug : slug;
+}
+
+export function pickProvider(provider: Provider) {
+  if (provider === ai.provider) return;
+  const previous = ai.provider;
+  const preset = providers[previous];
+  try { localStorage.setItem(`sandb.ai.model.${previous}`, ai.model); } catch { /* Preferences are optional. */ }
+  let remembered: string | null = null;
+  try { remembered = localStorage.getItem(`sandb.ai.model.${provider}`); } catch { /* Preferences are optional. */ }
+  ai.provider = provider;
+  const presetUrl = previous === 'chatgpt'
+    ? ai.baseUrl === providers.openai.url || ai.baseUrl === providers.anthropic.url
+    : ai.baseUrl === preset.url;
+  if (provider !== 'chatgpt' && (!ai.baseUrl.trim() || presetUrl)) ai.baseUrl = providers[provider].url;
+  ai.model = remembered ?? (provider === 'chatgpt' ? '' : previous === 'chatgpt' || !ai.model.trim() || ai.model === preset.model ? providers[provider].model : ai.model);
+  invalidateAiModels();
+  saveAiSoon();
+  if (provider === 'chatgpt') void loadAiModels();
 }
 
 /** Chooses the model for every chat and saves it. */
 export function setAiModel(model: string) {
-  ai.model = model.trim();
+  const slug = model.trim();
+  if (ai.provider === 'chatgpt' && slug && !aiModels.list.includes(slug)) return;
+  ai.model = slug;
   saveAiSoon();
 }
 

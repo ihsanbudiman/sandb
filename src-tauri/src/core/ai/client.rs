@@ -1,6 +1,5 @@
-//! AI HTTP client for two wire formats. OpenAI-compatible: `GET /models` and a streaming
-//! `POST /chat/completions`. Anthropic-compatible: `GET /models` and a streaming `POST /messages`.
-//! The caller always builds an OpenAI chat body; the Anthropic path translates it.
+//! AI HTTP client: Chat Completions, Anthropic Messages, and OAuth Responses.
+//! The caller builds an OpenAI chat body for API-key transports or a Responses body for ChatGPT.
 //! Every error leaves out the API key, also when the server echoes it back.
 
 use std::time::Duration;
@@ -12,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::core::ai::{oauth::TokenLease, responses};
 use crate::core::error::{AppError, ErrorCode};
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -26,7 +26,7 @@ const ERROR_BODY_BYTES: usize = 64 * 1024;
 /// Longest SSE line; a longer one is treated as a broken stream.
 const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// Highest tool call index accepted in one answer.
-const MAX_TOOL_CALLS: usize = 64;
+pub(super) const MAX_TOOL_CALLS: usize = 64;
 /// `anthropic-version` header of every Anthropic request.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; this leaves room for a long report.
@@ -38,6 +38,7 @@ pub enum Api {
     #[default]
     OpenAi,
     Anthropic,
+    ChatGpt,
 }
 
 /// One tool call of a model answer. `arguments` is the raw JSON text the model sent.
@@ -54,6 +55,8 @@ pub struct Completion {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
+    /// Backend replay only: retains encrypted reasoning and assistant phase without UI events.
+    pub output: Vec<Value>,
 }
 
 pub struct AiClient {
@@ -62,6 +65,8 @@ pub struct AiClient {
     base: String,
     key: Option<String>,
     idle: Duration,
+    lease: Option<TokenLease>,
+    redactions: Vec<String>,
 }
 
 impl AiClient {
@@ -71,19 +76,65 @@ impl AiClient {
         // reqwest is built without a bundled crypto provider; use ring, as sqlx and the updater
         // do. An error only means a provider is already installed.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .map_err(|e| {
-                AppError::internal("Could not start the HTTP client").with_detail(chain(&e))
-            })?;
+        let mut builder = reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT);
+        if api == Api::ChatGpt {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder.build().map_err(|e| {
+            AppError::internal("Could not start the HTTP client").with_detail(chain(&e))
+        })?;
         Ok(Self {
             http,
             api,
-            base: base_url.trim_end_matches('/').to_string(),
-            key: key.filter(|k| !k.is_empty()),
+            base: if api == Api::ChatGpt {
+                responses::BASE.to_owned()
+            } else {
+                base_url.trim_end_matches('/').to_string()
+            },
+            key: if api == Api::ChatGpt {
+                None
+            } else {
+                key.filter(|k| !k.is_empty())
+            },
             idle: DEFAULT_IDLE_TIMEOUT,
+            lease: None,
+            redactions: Vec::new(),
         })
+    }
+
+    pub fn chatgpt(lease: TokenLease) -> Result<Self, AppError> {
+        let mut client = Self::new(Api::ChatGpt, responses::BASE, None)?;
+        client.lease = Some(lease);
+        client.check_session()?;
+        Ok(client)
+    }
+
+    pub(crate) fn with_redaction(mut self, secret: Option<String>) -> Self {
+        self.redactions.extend(secret.filter(|s| !s.is_empty()));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_base(mut self, base: &str) -> Self {
+        self.base = base.to_owned();
+        self
+    }
+
+    pub(crate) fn check_session(&self) -> Result<(), AppError> {
+        if self.api == Api::ChatGpt {
+            self.lease
+                .as_ref()
+                .ok_or_else(|| AppError::new(ErrorCode::AuthFailed, "Sign in to ChatGPT first"))?
+                .token()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn session_cancelled(&self) {
+        match &self.lease {
+            Some(lease) => lease.cancellation().cancelled().await,
+            None => std::future::pending().await,
+        }
     }
 
     /// Replaces the wait limit for the response headers and for each stream chunk.
@@ -102,34 +153,68 @@ impl AiClient {
         struct Model {
             id: String,
         }
+        if self.api == Api::ChatGpt {
+            return Ok(self
+                .chatgpt_models()
+                .await?
+                .into_iter()
+                .map(|model| model.slug)
+                .collect());
+        }
+        let list: ModelList = self.model_list().await?;
+        Ok(list.data.into_iter().map(|m| m.id).collect())
+    }
+
+    pub async fn chatgpt_models(&self) -> Result<Vec<responses::Model>, AppError> {
+        self.check_session()?;
+        let list: responses::ModelList = self.model_list().await?;
+        Ok(list
+            .models
+            .into_iter()
+            .filter(|model| model.visibility == "list")
+            .collect())
+    }
+
+    async fn model_list<T: serde::de::DeserializeOwned>(&self) -> Result<T, AppError> {
         let work = async {
-            // Anthropic pages the list at 20 by default.
             let url = match self.api {
-                Api::OpenAi => format!("{}/models", self.base),
+                Api::OpenAi | Api::ChatGpt => format!("{}/models", self.base),
                 Api::Anthropic => format!("{}/models?limit=1000", self.base),
             };
-            let req = self.auth(self.http.get(url));
+            let req = self.auth(self.http.get(url))?;
             let resp = req.send().await.map_err(|e| self.send_error(e))?;
-            let resp = self.check_status(resp).await?;
-            let bytes = resp.bytes().await.map_err(|e| self.send_error(e))?;
-            let list: ModelList = serde_json::from_slice(&bytes).map_err(|e| {
+            let mut resp = self.check_status(resp).await?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = resp.chunk().await.map_err(|e| self.send_error(e))? {
+                if bytes.len() + chunk.len() > MAX_LINE_BYTES {
+                    return Err(protocol(
+                        "The AI server sent an oversized model list",
+                        "model catalog is too large",
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            serde_json::from_slice(&bytes).map_err(|e| {
                 AppError::new(
                     ErrorCode::AiProtocol,
                     "The AI server sent an unexpected model list",
                 )
                 .with_detail(e.to_string())
-            })?;
-            Ok(list.data.into_iter().map(|m| m.id).collect())
+            })
         };
-        let res = match tokio::time::timeout(MODELS_TIMEOUT, work).await {
-            Ok(r) => r,
-            Err(_) => Err(timeout_error(MODELS_TIMEOUT)),
+        let res = tokio::select! {
+            biased;
+            _ = self.session_cancelled() => Err(cancelled()),
+            result = tokio::time::timeout(MODELS_TIMEOUT, work) => match result {
+                Ok(result) => result,
+                Err(_) => Err(timeout_error(MODELS_TIMEOUT)),
+            },
         };
         res.map_err(|e| self.redact(e))
     }
 
     /// Streams the answer to `body`, an OpenAI chat body that asks for `stream: true`.
-    /// `on_text` gets each text delta; returning false stops the stream as a cancel does.
+    /// ChatGPT instead takes a Responses body. `on_text` false stops the stream like a cancel.
     pub async fn chat_stream(
         &self,
         body: &Value,
@@ -150,9 +235,10 @@ impl AiClient {
         let (path, body) = match self.api {
             Api::OpenAi => ("chat/completions", serde_json::to_vec(body)?),
             Api::Anthropic => ("messages", serde_json::to_vec(&anthropic_body(body))?),
+            Api::ChatGpt => ("responses", serde_json::to_vec(body)?),
         };
         let req = self
-            .auth(self.http.post(format!("{}/{path}", self.base)))
+            .auth(self.http.post(format!("{}/{path}", self.base)))?
             .header(ACCEPT, "text/event-stream")
             .header(CONTENT_TYPE, "application/json")
             .body(body);
@@ -163,18 +249,26 @@ impl AiClient {
         let resp = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(cancelled()),
+            _ = self.session_cancelled() => return Err(cancelled()),
             r = tokio::time::timeout(self.idle, send) => r.map_err(|_| timeout_error(self.idle))??,
         };
-        let mut stream = resp.bytes_stream();
         let mut lines = LineBuffer::default();
         let mut acc = Accumulator {
             api: self.api,
+            http_status: Some(resp.status().as_u16()),
+            request_id: resp
+                .headers()
+                .get("x-request-id")
+                .and_then(|id| id.to_str().ok())
+                .map(str::to_owned),
             ..Default::default()
         };
+        let mut stream = resp.bytes_stream();
         loop {
             let next = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(cancelled()),
+                _ = self.session_cancelled() => return Err(cancelled()),
                 n = tokio::time::timeout(self.idle, stream.next()) => n,
             };
             let chunk = match next {
@@ -190,11 +284,19 @@ impl AiClient {
                 Ok(Some(Ok(b))) => b,
             };
             for line in lines.push(&chunk)? {
+                if cancel.is_cancelled() {
+                    return Err(cancelled());
+                }
+                self.check_session()?;
                 if acc.line(&line, &mut on_text)? {
                     return acc.finish();
                 }
             }
         }
+        if cancel.is_cancelled() {
+            return Err(cancelled());
+        }
+        self.check_session()?;
         if let Some(line) = lines.rest()?
             && acc.line(&line, &mut on_text)?
         {
@@ -210,15 +312,19 @@ impl AiClient {
         ))
     }
 
-    fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match (self.api, &self.key) {
+    fn auth(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, AppError> {
+        self.check_session()?;
+        Ok(match (self.api, &self.key) {
+            (Api::ChatGpt, _) => {
+                req.bearer_auth(self.lease.as_ref().expect("checked lease").token()?)
+            }
             (Api::OpenAi, Some(k)) => req.header(AUTHORIZATION, format!("Bearer {k}")),
             (Api::OpenAi, None) => req,
             (Api::Anthropic, Some(k)) => req
                 .header("x-api-key", k)
                 .header("anthropic-version", ANTHROPIC_VERSION),
             (Api::Anthropic, None) => req.header("anthropic-version", ANTHROPIC_VERSION),
-        }
+        })
     }
 
     fn send_error(&self, e: reqwest::Error) -> AppError {
@@ -240,10 +346,32 @@ impl AiClient {
         if status.is_success() {
             return Ok(resp);
         }
+        if self.api == Api::ChatGpt {
+            let request_id = resp
+                .headers()
+                .get("x-request-id")
+                .and_then(|id| id.to_str().ok())
+                .map(str::to_owned);
+            let body = tokio::time::timeout(self.idle.min(MODELS_TIMEOUT), read_capped(resp))
+                .await
+                .unwrap_or_default();
+            let body = serde_json::from_str(&body).unwrap_or(Value::String(body));
+            let mut error = responses::upstream(&body);
+            error.http_status = Some(status.as_u16());
+            error.request_id = request_id;
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                error.code = ErrorCode::AuthFailed;
+            }
+            return Err(error);
+        }
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             return Err(AppError::new(
                 ErrorCode::AuthFailed,
-                "The AI server refused the API key",
+                if self.api == Api::ChatGpt {
+                    "ChatGPT refused authorization or plan usage"
+                } else {
+                    "The AI server refused the API key"
+                },
             ));
         }
         let body = tokio::time::timeout(self.idle.min(MODELS_TIMEOUT), read_capped(resp))
@@ -266,8 +394,13 @@ impl AiClient {
     /// never leave a part of the key.
     fn redact(&self, mut e: AppError) -> AppError {
         if let Some(k) = &self.key {
-            e.message = e.message.replace(k.as_str(), "***");
-            e.detail = e.detail.map(|d| d.replace(k.as_str(), "***"));
+            e.redact(k);
+        }
+        if let Some(lease) = &self.lease {
+            e = lease.redact(e);
+        }
+        for secret in &self.redactions {
+            e.redact(secret);
         }
         if e.code == ErrorCode::AiUpstream {
             e.detail = e
@@ -283,11 +416,11 @@ async fn read_capped(resp: reqwest::Response) -> String {
     let mut out = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(Ok(b)) = stream.next().await {
-        out.extend_from_slice(&b);
-        if out.len() >= ERROR_BODY_BYTES {
-            out.truncate(ERROR_BODY_BYTES);
-            break;
+        // Truncating inside a reflected credential could expose a prefix that redaction cannot match.
+        if out.len() + b.len() > ERROR_BODY_BYTES {
+            return "[AI error body exceeded 64 KiB]".into();
         }
+        out.extend_from_slice(&b);
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -333,6 +466,12 @@ impl LineBuffer {
         self.buf.extend_from_slice(bytes);
         let mut out = Vec::new();
         while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            if pos > MAX_LINE_BYTES {
+                return Err(protocol(
+                    "The AI server sent a malformed stream",
+                    "line too long",
+                ));
+            }
             let line: Vec<u8> = self.buf.drain(..=pos).collect();
             out.push(utf8(&line[..line.len() - 1])?);
         }
@@ -368,15 +507,68 @@ struct Accumulator {
     out: Completion,
     /// Anthropic: (content block index, tool call position) of each `tool_use` block.
     tool_blocks: Vec<(u64, usize)>,
+    response_data: String,
+    response_bytes: usize,
+    responses: responses::Stream,
+    http_status: Option<u16>,
+    request_id: Option<String>,
 }
 
 impl Accumulator {
-    /// Handles one line. `Ok(true)` at `[DONE]` (OpenAI) or `message_stop` (Anthropic).
     fn line(
         &mut self,
         line: &str,
         on_text: &mut impl FnMut(&str) -> bool,
     ) -> Result<bool, AppError> {
+        self.line_inner(line, on_text).map_err(|mut error| {
+            if self.api == Api::ChatGpt {
+                error.http_status = self.http_status;
+                error.request_id = self.request_id.clone();
+            }
+            error
+        })
+    }
+
+    /// Handles one line. `Ok(true)` only at the transport's successful terminal event.
+    fn line_inner(
+        &mut self,
+        line: &str,
+        on_text: &mut impl FnMut(&str) -> bool,
+    ) -> Result<bool, AppError> {
+        if self.api == Api::ChatGpt {
+            if line.is_empty() {
+                if self.response_data.is_empty() {
+                    return Ok(false);
+                }
+                let data = std::mem::take(&mut self.response_data);
+                let event: Value = serde_json::from_str(&data).map_err(|_| {
+                    protocol(
+                        "ChatGPT sent a malformed stream event",
+                        "invalid event JSON",
+                    )
+                })?;
+                return self.responses.event(&mut self.out, &event, on_text);
+            }
+            if let Some(data) = line.strip_prefix("data:") {
+                self.response_bytes += data.len() + 1;
+                if self.response_bytes > 32 * 1024 * 1024 {
+                    return Err(protocol(
+                        "ChatGPT response exceeded the stream limit",
+                        "response too long",
+                    ));
+                }
+                if self.response_data.len() + data.len() + 1 > MAX_LINE_BYTES {
+                    return Err(protocol(
+                        "ChatGPT sent an oversized stream event",
+                        "event too long",
+                    ));
+                }
+                self.response_data
+                    .push_str(data.strip_prefix(' ').unwrap_or(data));
+                self.response_data.push('\n');
+            }
+            return Ok(false);
+        }
         // Other SSE fields (`event:`, `id:`, `retry:`) and `:` comments carry nothing we use.
         let Some(data) = line.strip_prefix("data:") else {
             return Ok(false);
@@ -1155,7 +1347,12 @@ pub(crate) mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let e = run(&format!("http://{addr}/v1"), None).await.0.unwrap_err();
+        // Windows refusal may outlast the streaming test helper's 500 ms idle limit.
+        let client = AiClient::new(Api::OpenAi, &format!("http://{addr}/v1"), None).unwrap();
+        let e = client
+            .chat_stream(&body(), &CancellationToken::new(), |_| true)
+            .await
+            .unwrap_err();
         assert_eq!(e.code, ErrorCode::ConnectFailed);
         assert!(
             e.message

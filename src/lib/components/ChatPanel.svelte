@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ArrowUp, Square, ShieldCheck, ShieldOff, Ban, LoaderCircle, Clock, Check, X, Copy, Sparkles, History, SquarePen, Trash2, MessageCircleQuestion, TriangleAlert, ArrowLeft, ChevronRight, RotateCw, Table2, FileCode, FileSpreadsheet, Braces, ChartColumn, FileDown, ListCollapse, ListTree, Info, Play, SquarePlus } from '@lucide/svelte';
+  import { ArrowUp, Square, ShieldCheck, ShieldOff, Ban, LoaderCircle, Clock, Check, X, Copy, Sparkles, History, SquarePen, Trash2, MessageCircleQuestion, TriangleAlert, ArrowLeft, ChevronRight, RotateCw, Table2, FileCode, FileSpreadsheet, Braces, ChartColumn, FileDown, ListCollapse, ListTree, Info, Play, SquarePlus, ExternalLink } from '@lucide/svelte';
   import Markdown from './Markdown.svelte';
   import ChartView from './ChartView.svelte';
   import ChatScope from './ChatScope.svelte';
@@ -10,7 +10,7 @@
   import { statementRanges } from '../sql/text';
   import { api, ApiError } from '../api';
   import { replyPdf, pdfName } from '../report';
-  import { ui, ai, engines, envTag, type Conn } from '../state.svelte';
+  import { ui, ai, chatgpt, canUseChatGpt, manageChatGptUsage, resumeChatGptUsage, engines, envTag, type Conn } from '../state.svelte';
   import { csvCell, formatCell } from '../results';
   import { statementKind, type Row } from '../mock';
 
@@ -24,6 +24,7 @@
   const many = $derived(scope.length > 1);
   /** At least one database of the chat still has its connection. */
   const ready = $derived(scopeConns.length > 0);
+  const providerReady = $derived(ai.provider !== 'chatgpt' || canUseChatGpt());
   /** "Connection / database", or the connection name alone for SQLite. */
   function sourceLabel(s: Source) {
     const c = connOf(s);
@@ -281,6 +282,7 @@
   }
 
   function retry(mi: number) {
+    if (ai.provider === 'chatgpt') resumeChatGptUsage();
     const q = messages[mi - 1];
     if (q?.role === 'user' && q.parts[0]?.kind === 'text') submit(q.parts[0].text);
   }
@@ -314,7 +316,7 @@
       answer(text.trim());
       return;
     }
-    if (chat.live || !ready) return;
+    if (chat.live || !ready || !providerReady) return;
     input = '';
     showHistory = false;
     send(text);
@@ -484,7 +486,22 @@
                 </div>
               {/if}
             {:else if p.kind === 'error'}
-              <p class="flex items-start gap-2 leading-relaxed text-red-700 dark:text-red-400"><TriangleAlert size={13} class="mt-1 shrink-0" /><span class="min-w-0 break-words">{p.text}</span></p>
+              <div class="space-y-2" role="alert">
+                <p class="flex items-start gap-2 leading-relaxed text-red-700 dark:text-red-400"><TriangleAlert size={13} class="mt-1 shrink-0" /><span class="min-w-0 break-words">{#if p.action}<b class="font-semibold">ChatGPT · </b>{/if}{p.text}</span></p>
+                {#if p.diagnostic || p.requestId}<p class="text-[11px] break-all text-muted">{p.diagnostic}{#if p.requestId} · Request ID: {p.requestId}{/if}</p>{/if}
+                {#if p.action}
+                  <div class="flex flex-wrap gap-2">
+                    {#if p.action === 'usage'}
+                      <button class="btn btn-primary" onclick={manageChatGptUsage}>Manage usage</button>
+                      <button class="btn btn-secondary" disabled={!!chat.live} onclick={() => retry(mi)}>Try again</button>
+                    {:else if p.action === 'retry'}
+                      <button class="btn btn-secondary" disabled={!!chat.live} onclick={() => retry(mi)}>Try again</button>
+                    {:else}
+                      <button class="btn btn-secondary" onclick={() => { ui.settingsSection = 'ai'; ui.page = 'settings'; }}>{p.action === 'signin' ? 'Continue with ChatGPT in Settings' : 'Review AI settings'}</button>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
             {/if}
             {:else}
               {@const running = b.steps.some((s) => s.p.status === 'running')}
@@ -671,6 +688,13 @@
   </div>
   {/if}
 
+  {#if ai.provider === 'chatgpt'}
+    <div class="mx-4 mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted" aria-label="ChatGPT plan status">
+      <span class="flex items-center gap-1.5"><span class="size-1.5 shrink-0 rounded-full {providerReady ? 'bg-emerald-600 dark:bg-emerald-400' : 'bg-faint'}" aria-hidden="true"></span>ChatGPT plan</span>
+      <button class="ml-auto inline-flex items-center gap-1 rounded px-1 py-1 hover:bg-hover hover:text-ink disabled:opacity-50" onclick={manageChatGptUsage} disabled={!chatgpt.supported}>Manage usage <ExternalLink size={11} /></button>
+      {#if !providerReady}<button class="font-medium underline underline-offset-2" onclick={() => { ui.settingsSection = 'ai'; ui.page = 'settings'; }}>{chatgpt.usagePaused ? 'Usage paused — review settings' : 'Set up in Settings'}</button>{/if}
+    </div>
+  {/if}
   <div class="mx-3 mb-3 rounded-xl border border-line bg-field p-2 transition-[border-color,box-shadow] focus-within:border-accent/70 focus-within:ring-3 focus-within:ring-accent/15">
     <ChatScope sources={scope} disabled={!!chat.live} onchange={setScope} />
     <textarea
@@ -725,7 +749,7 @@
           <Square size={11} class="fill-current" />
         </button>
       {:else}
-        <button class="btn btn-primary size-7 shrink-0 rounded-lg p-0" onclick={() => submit()} disabled={chat.question ? !input.trim() : !!chat.live || !input.trim() || !ready} aria-label={chat.question ? 'Send answer' : 'Send'}>
+        <button class="btn btn-primary size-7 shrink-0 rounded-lg p-0" onclick={() => submit()} disabled={chat.question ? !input.trim() : !!chat.live || !input.trim() || !ready || !providerReady} aria-label={chat.question ? 'Send answer' : 'Send'}>
           <ArrowUp size={15} />
         </button>
       {/if}

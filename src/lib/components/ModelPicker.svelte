@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { Check, ChevronDown, ChevronsUpDown, LoaderCircle, RotateCw, Settings } from '@lucide/svelte';
-  import { ui, ai, aiModels, loadAiModels, setAiModel } from '../state.svelte';
+  import { ui, ai, aiModels, chatgpt, modelLabel, loadAiModels, setAiModel } from '../state.svelte';
 
   // One model for every chat. `field`: the Settings input; `chip`: the small button in the chat composer.
   let { variant, placeholder = '', onpick }: { variant: 'field' | 'chip'; placeholder?: string; onpick?: () => void } = $props();
@@ -12,19 +12,24 @@
   let listEl = $state<HTMLDivElement>();
 
   const query = $derived(filter.trim());
+  const plan = $derived(ai.provider === 'chatgpt');
+  const available = $derived(!plan || (chatgpt.supported && chatgpt.signedIn && chatgpt.usageEnabled && !chatgpt.pending && !chatgpt.loading && !chatgpt.signingOut));
+  const selectedLabel = $derived(modelLabel(ai.model));
   // "Not listed" only means something once the server has answered with a list.
   const known = $derived(!aiModels.loading && !aiModels.error && aiModels.list.length > 0);
   // The chosen model stays at the top when the server does not list it, so the user sees what is set.
   // A typed name that is not listed comes last, so Enter takes the first listed match.
   const rows = $derived.by(() => {
     const q = query.toLowerCase();
-    const listed = aiModels.list.filter((m) => m.toLowerCase().includes(q));
+    const listed = aiModels.list.filter((m) => m.toLowerCase().includes(q) || modelLabel(m).toLowerCase().includes(q));
+    if (plan) return listed.map((id) => ({ id, custom: false }));
     const all = !q && ai.model && !aiModels.list.includes(ai.model) ? [ai.model, ...listed] : listed;
     const shown = all.map((id) => ({ id, custom: false }));
     return query && !aiModels.list.includes(query) ? [...shown, { id: query, custom: true }] : shown;
   });
 
   async function open() {
+    if (!available) return;
     menu = !menu;
     if (!menu) return;
     filter = '';
@@ -35,6 +40,7 @@
   }
 
   function choose(id: string) {
+    if (plan && !aiModels.list.includes(id)) return;
     menu = false;
     if (id !== ai.model) setAiModel(id);
     onpick?.();
@@ -62,13 +68,13 @@
 <!-- The chip menu opens upward and takes the width of the nearest positioned parent (the composer row), so a narrow panel does not cut it. -->
 <div class={variant === 'field' ? 'relative w-full' : 'min-w-0 max-w-44'}>
   {#if variant === 'field'}
-    <button type="button" class="input flex w-full items-center gap-2 text-left font-mono text-[12.5px]" aria-haspopup="listbox" aria-expanded={menu} onclick={open}>
-      <span class="min-w-0 flex-1 truncate {ai.model ? '' : 'text-faint'}">{ai.model || placeholder || 'Choose a model'}</span>
+    <button type="button" class="input flex w-full items-center gap-2 text-left font-mono text-[12.5px]" aria-haspopup="listbox" aria-expanded={menu} disabled={!available} onclick={open}>
+      <span class="min-w-0 flex-1 truncate {ai.model ? '' : 'text-faint'}">{selectedLabel || placeholder || 'Choose a model'}</span>
       <ChevronsUpDown size={13} class="shrink-0 text-faint" />
     </button>
   {:else}
-    <button type="button" class="flex h-6 max-w-full min-w-0 items-center gap-1 rounded-md px-1.5 font-mono text-[11.5px] text-muted hover:bg-hover hover:text-ink {menu ? 'bg-hover text-ink' : ''}" aria-haspopup="listbox" aria-expanded={menu} title="Model: {ai.model || 'none'}. Click to change." onclick={open}>
-      <span class="min-w-0 truncate">{ai.model || 'Choose a model'}</span>
+    <button type="button" class="flex h-6 max-w-full min-w-0 items-center gap-1 rounded-md px-1.5 font-mono text-[11.5px] text-muted hover:bg-hover hover:text-ink {menu ? 'bg-hover text-ink' : ''}" aria-haspopup="listbox" aria-expanded={menu} title={available ? `Model: ${ai.model || 'none'}. Click to change.` : 'Continue with ChatGPT and enable plan usage in Settings first.'} disabled={!available} onclick={open}>
+      <span class="min-w-0 truncate">{selectedLabel || 'Choose a model'}</span>
       <ChevronDown size={11} class="shrink-0" />
     </button>
   {/if}
@@ -79,8 +85,8 @@
         <!-- svelte-ignore a11y_autofocus -->
         <input
           class="input h-7 min-w-0 flex-1 font-mono text-[12px]"
-          placeholder="Search or type a model name"
-          aria-label="Search or type a model name"
+          placeholder={plan ? 'Search account models' : 'Search or type a model name'}
+          aria-label={plan ? 'Search account models' : 'Search or type a model name'}
           bind:value={filter}
           oninput={() => (hi = 0)}
           onkeydown={key}
@@ -110,7 +116,7 @@
               <span class="min-w-0 flex-1 truncate font-mono text-ink">{r.id}</span>
               {#if known}<span class="shrink-0 text-[11px] text-faint">not listed</span>{/if}
             {:else}
-              <span class="min-w-0 flex-1 truncate font-mono text-ink">{r.id}</span>
+              <span class="min-w-0 flex-1 truncate text-ink" title={r.id}>{modelLabel(r.id)}</span>
               {#if known && !aiModels.list.includes(r.id)}<span class="shrink-0 text-[11px] text-faint">not listed</span>{/if}
               {#if r.id === ai.model}<Check size={12} class="shrink-0 text-accent" />{/if}
             {/if}
@@ -120,9 +126,9 @@
           <p class="flex items-center gap-1.5 px-2 py-1.5 text-[12px] text-muted"><LoaderCircle size={12} class="animate-spin" /> Loading models…</p>
         {:else if aiModels.error}
           <p class="px-2 py-1.5 text-[12px] break-words text-red-700 dark:text-red-400" role="alert">Could not load the models: {aiModels.error}</p>
-          <p class="px-2 pb-1.5 text-[11.5px] text-faint">You can still type a model name above and press Enter.</p>
+          {#if !plan}<p class="px-2 pb-1.5 text-[11.5px] text-faint">You can still type a model name above and press Enter.</p>{/if}
         {:else if !rows.length}
-          <p class="px-2 py-1.5 text-[12px] text-muted">{aiModels.list.length ? 'No model matches.' : 'The server lists no models. Type a model name above.'}</p>
+          <p class="px-2 py-1.5 text-[12px] text-muted">{aiModels.list.length ? 'No model matches.' : plan ? 'No displayable models are available for this ChatGPT account.' : 'The server lists no models. Type a model name above.'}</p>
         {/if}
       </div>
       {#if variant === 'chip'}

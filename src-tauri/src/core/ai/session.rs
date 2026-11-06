@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::core::ai::client::{AiClient, Completion};
+use crate::core::ai::client::{Api, Completion};
 use crate::core::ai::prompt::{self, PromptInput};
+use crate::core::ai::responses;
 use crate::core::ai::settings;
 use crate::core::ai::tools::{self, ToolContext};
 use crate::core::connections;
@@ -218,7 +219,12 @@ fn receiver_gone() -> AppError {
 }
 
 fn push_message(body: &mut Value, message: Value) {
-    if let Some(list) = body["messages"].as_array_mut() {
+    let key = if body.get("input").is_some() {
+        "input"
+    } else {
+        "messages"
+    };
+    if let Some(list) = body[key].as_array_mut() {
         list.push(message);
     }
 }
@@ -262,11 +268,8 @@ async fn converse(
     if settings.model.trim().is_empty() {
         return Err(AppError::invalid("Choose an AI model in Settings first"));
     }
-    let client = AiClient::new(
-        settings.api(),
-        &settings.base_url,
-        settings::stored_key(state)?,
-    )?;
+    let is_chatgpt = settings.api() == Api::ChatGpt;
+    let mut client = settings::client(state, &settings, None, token).await?;
 
     // The summaries are a help, not a need: on an error or a slow server the model uses the tools.
     let limit = Duration::from_secs(settings.timeout_sec);
@@ -282,6 +285,7 @@ async fn converse(
     let snapshots = tokio::select! {
         biased;
         _ = token.cancelled() => return Err(cancelled()),
+        _ = client.session_cancelled() => return Err(cancelled()),
         r = futures_util::future::join_all(reads) => r,
     };
     let today = chrono::Local::now()
@@ -295,13 +299,19 @@ async fn converse(
     });
 
     let ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
-    let mut body = json!({
-        "model": settings.model,
-        "messages": [{"role": "system", "content": system}],
-        "stream": true,
-        "tools": tools::definitions(&ids),
-        "tool_choice": "auto",
-    });
+    let definitions = tools::definitions(&ids);
+    let mut body = if is_chatgpt {
+        responses::body(&settings.model, &system, &definitions)
+    } else {
+        json!({
+            "model": settings.model,
+            "messages": [{"role": "system", "content": system}],
+            "stream": true,
+            "tools": definitions,
+            "tool_choice": "auto",
+        })
+    };
+    // shortcut: older turns carry visible text only, persist opaque items if cross-turn reasoning continuity is requested.
     for turn in &req.history {
         push_message(
             &mut body,
@@ -315,7 +325,14 @@ async fn converse(
         sources: &sources,
         settings: &settings,
     };
-    for _ in 0..MAX_STEPS {
+    for step in 0..MAX_STEPS {
+        client.check_session()?;
+        if token.is_cancelled() {
+            return Err(cancelled());
+        }
+        if is_chatgpt && step > 0 {
+            client = settings::client(state, &settings, None, token).await?;
+        }
         let answer: Completion = client
             .chat_stream(&body, token, |delta| {
                 emit(ChatEvent::Text {
@@ -323,26 +340,41 @@ async fn converse(
                 })
             })
             .await?;
+        client.check_session()?;
+        if token.is_cancelled() {
+            return Err(cancelled());
+        }
         if answer.tool_calls.is_empty() {
             return Ok(());
         }
-        let calls: Vec<Value> = answer
-            .tool_calls
-            .iter()
-            .map(|c| {
-                json!({
-                    "id": c.id,
-                    "type": "function",
-                    "function": {"name": c.name, "arguments": c.arguments},
+        if is_chatgpt {
+            body["input"]
+                .as_array_mut()
+                .expect("Responses input array")
+                .extend(answer.output);
+        } else {
+            let calls: Vec<Value> = answer
+                .tool_calls
+                .iter()
+                .map(|c| {
+                    json!({
+                        "id": c.id,
+                        "type": "function",
+                        "function": {"name": c.name, "arguments": c.arguments},
+                    })
                 })
-            })
-            .collect();
-        let text = (!answer.text.is_empty()).then_some(answer.text.as_str());
-        push_message(
-            &mut body,
-            json!({"role": "assistant", "content": text, "tool_calls": calls}),
-        );
+                .collect();
+            let text = (!answer.text.is_empty()).then_some(answer.text.as_str());
+            push_message(
+                &mut body,
+                json!({"role": "assistant", "content": text, "tool_calls": calls}),
+            );
+        }
         for call in &answer.tool_calls {
+            client.check_session()?;
+            if token.is_cancelled() {
+                return Err(cancelled());
+            }
             let args = tools::parse_args(&call.arguments)
                 .map(Value::Object)
                 .unwrap_or_else(|| json!({}));
@@ -356,16 +388,25 @@ async fn converse(
             let out = tokio::select! {
                 biased;
                 _ = token.cancelled() => return Err(cancelled()),
+                _ = client.session_cancelled() => return Err(cancelled()),
                 out = tools::execute(&ctx, &call.id, &call.name, &call.arguments) => out,
             };
             for ev in out.events {
+                client.check_session()?;
+                if token.is_cancelled() {
+                    return Err(cancelled());
+                }
                 if !emit(ev) {
                     return Err(receiver_gone());
                 }
             }
             push_message(
                 &mut body,
-                json!({"role": "tool", "tool_call_id": call.id, "content": out.content}),
+                if is_chatgpt {
+                    json!({"type": "function_call_output", "call_id": call.id, "output": out.content})
+                } else {
+                    json!({"role": "tool", "tool_call_id": call.id, "content": out.content})
+                },
             );
         }
     }

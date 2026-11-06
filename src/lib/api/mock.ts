@@ -153,6 +153,7 @@ function mockEditable(c: Connection, sql: string): EditableResult {
 // The demo build keeps the AI settings in memory and never calls a model.
 let aiSettings: AiSettings = { provider: 'openai', baseUrl: 'http://localhost:11434/v1', model: 'llama3.1:8b', privacy: 'results', maxRows: 500, timeoutSec: 15 };
 let aiKey = '';
+const noChatGpt = () => new ApiError({ code: 'invalid_input', message: 'ChatGPT sign-in and plan usage require the native desktop app.' });
 const noAi = () => new ApiError({ code: 'invalid_input', message: 'The demo build has no AI backend. Use the desktop app or the dev bridge.' });
 
 export const mockBackend: Backend = {
@@ -370,6 +371,12 @@ export const mockBackend: Backend = {
     const s = run.statements[0];
     return { columns: s.columns, rows: s.rows, truncated: s.truncated, elapsedMs: s.elapsedMs };
   },
+  async chatgptStatus() { return { signedIn: false, accountLabel: null, usageEnabled: false }; },
+  async chatgptSignIn() { throw noChatGpt(); },
+  async chatgptCancelSignIn() { throw noChatGpt(); },
+  async chatgptLogout() { throw noChatGpt(); },
+  async chatgptModels() { throw noChatGpt(); },
+  async chatgptManageUsage() { throw noChatGpt(); },
   async getAiSettings() {
     return { ...aiSettings, hasKey: !!aiKey };
   },
