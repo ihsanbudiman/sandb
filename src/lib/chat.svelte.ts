@@ -1,7 +1,7 @@
 import { schemas, tableData, nsOf, type Row, type Cell } from './mock';
-import { active, ui, db, canWrite, flushAi, type Conn } from './state.svelte';
+import { active, ui, ai, db, canWrite, canUseChatGpt, reportChatGptError, flushAi, type Conn } from './state.svelte';
 import { activeTab, defaultDb } from './tabs.svelte';
-import { api, ApiError, type CellValue, type ChartSpec, type ChatEvent, type ChatRequest, type ErrorCode } from './api';
+import { api, ApiError, type CellValue, type ChartSpec, type ChatEvent, type ChatRequest, type ErrorCode, type AppErrorBody } from './api';
 import { logQuery, type AuditResult } from './audit.svelte';
 
 export type ToolStatus = 'running' | 'done' | 'blocked' | 'awaiting' | 'approved' | 'denied';
@@ -28,7 +28,7 @@ export type ToolPart = {
 /** `answer`: missing while the question is open, null when the user skipped it. */
 export type QuestionPart = { kind: 'question'; text: string; options: string[]; answer?: string | null };
 /** The reply stopped: an error, or the user pressed Stop. */
-export type ErrorPart = { kind: 'error'; text: string };
+export type ErrorPart = { kind: 'error'; text: string; action?: 'usage' | 'signin' | 'settings' | 'retry'; diagnostic?: string; requestId?: string };
 /** A chart of a `render_chart` read. `rows` are arrays in `columns` order. `truncated`: the read had more rows than the chart keeps. */
 export type ChartPart = { kind: 'chart'; spec: ChartSpec; columns: string[]; rows: CellValue[][]; truncated: boolean };
 export type Part = { kind: 'text'; text: string } | ToolPart | QuestionPart | ErrorPart | ChartPart;
@@ -235,6 +235,10 @@ async function ask(msg: Msg, text: string, options: string[]) {
 
 export async function send(text: string) {
   if (!text.trim() || chat.live) return;
+  if (ai.provider === 'chatgpt' && !canUseChatGpt()) {
+    ui.settingsSection = 'ai'; ui.page = 'settings';
+    return;
+  }
   let s = current();
   const sources = scopeOf(s).filter((x) => connOf(x));
   if (!sources.length) return;
@@ -288,8 +292,10 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
     stopped = true;
     api.chatCancel(chatId).catch((e) => console.warn('The reply was not stopped.', ApiError.from(e).message));
   };
-  const fail = (code: string, message: string) => {
-    msg.parts.push({ kind: 'error', text: code === 'cancelled' ? 'Stopped.' : message });
+  const plan = ai.provider === 'chatgpt';
+  const fail = (code: string, message: string, error?: AppErrorBody) => {
+    const issue = plan && error && code !== 'cancelled' ? reportChatGptError(error) : { text: code === 'cancelled' ? 'Stopped.' : message };
+    msg.parts.push({ kind: 'error', ...issue });
   };
 
   try {
@@ -375,7 +381,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
       }
       case 'error':
         ended = true;
-        fail(e.error.code, e.error.message);
+        fail(e.error.code, e.error.message, e.error);
         break;
       case 'done':
         ended = true;
@@ -388,7 +394,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
   } catch (e) {
     if (!ended) {
       const err = ApiError.from(e);
-      fail(err.code, err.message);
+      fail(err.code, err.message, err);
     }
   } finally {
     // Steps without a result can never finish now.

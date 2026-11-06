@@ -8,6 +8,7 @@ use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
 
 use crate::core::ai::settings::AI_KEY_ACCOUNT;
+use crate::core::instance::InstanceLock;
 use crate::core::secrets::{self, KeychainStore, VaultStore};
 use crate::core::state::AppState;
 
@@ -87,6 +88,7 @@ pub fn run() {
                 }
                 None => (app.path().app_data_dir()?, app.config().identifier.clone()),
             };
+            app.manage(InstanceLock::acquire(&dir)?);
             let vault = VaultStore::new(&dir, Box::new(KeychainStore::new(service.clone())));
             // Not fatal: the file stays and the next start tries again. Until then, the passwords
             // that were not moved are missing and those connections fail to log in.
@@ -186,6 +188,12 @@ pub fn run() {
             commands::guard_check,
             commands::classify_write,
             commands::run_ai_read,
+            commands::chatgpt_sign_in,
+            commands::chatgpt_cancel_sign_in,
+            commands::chatgpt_logout,
+            commands::chatgpt_status,
+            commands::chatgpt_models,
+            commands::chatgpt_manage_usage,
             commands::get_ai_settings,
             commands::save_ai_settings,
             commands::set_ai_key,

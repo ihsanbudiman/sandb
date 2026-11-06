@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::core::ai::oauth::OAuthSession;
 use crate::core::ai::session::ChatRegistry;
 use crate::core::connections::Connection;
 use crate::core::db::pool::PoolCache;
@@ -24,6 +25,7 @@ pub struct AppState {
     pub sessions: SessionRegistry,
     /// Running AI chats, for `chat_cancel`.
     pub chats: ChatRegistry,
+    pub chatgpt: OAuthSession,
 }
 
 impl AppState {
@@ -41,6 +43,7 @@ impl AppState {
             queries: QueryRegistry::default(),
             sessions: SessionRegistry::default(),
             chats: ChatRegistry::default(),
+            chatgpt: OAuthSession::default(),
         })
     }
 }

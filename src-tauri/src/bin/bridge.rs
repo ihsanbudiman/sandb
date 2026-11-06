@@ -483,6 +483,18 @@ async fn dispatch(
             }
             .await,
         ),
+        "chatgpt_status" => reply(Ok::<_, AppError>(sandb_lib::core::ai::oauth::SessionView {
+            signed_in: false,
+            account_label: None,
+            usage_enabled: false,
+        })),
+        "chatgpt_sign_in"
+        | "chatgpt_cancel_sign_in"
+        | "chatgpt_logout"
+        | "chatgpt_models"
+        | "chatgpt_manage_usage" => reply::<()>(Err(AppError::invalid(
+            "ChatGPT sign-in and plan usage require the native desktop app",
+        ))),
         "get_ai_settings" => reply(ai_settings::get(st)),
         "save_ai_settings" => {
             reply(args::<AiSettingsArgs>(body).and_then(|a| ai_settings::save(st, a.settings)))
@@ -514,5 +526,44 @@ async fn dispatch(
         _ => reply::<()>(Err(AppError::not_found(format!(
             "Unknown command {command}"
         )))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chatgpt_rpc_is_explicitly_unavailable_without_native_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(Ctx {
+            state: AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap(),
+            token: "dummy-bridge-token".into(),
+        });
+        let status = dispatch(State(ctx.clone()), Path("chatgpt_status".into()), None).await;
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(status.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            serde_json::json!({
+                "signedIn": false, "accountLabel": null, "usageEnabled": false
+            })
+        );
+        for command in [
+            "chatgpt_sign_in",
+            "chatgpt_cancel_sign_in",
+            "chatgpt_logout",
+            "chatgpt_models",
+            "chatgpt_manage_usage",
+        ] {
+            let response = dispatch(State(ctx.clone()), Path(command.into()), None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("native desktop app"));
+        }
     }
 }
