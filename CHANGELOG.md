@@ -4,6 +4,9 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+- Fixed: the editor line-number gutter now has an opaque background. SQL text no longer shows through the numbers when the editor is scrolled horizontally.
+- Fixed: the assistant chat follows new output only while you are at the bottom. Scrolling up stops the list from jumping down on every streamed word, and the follow scroll now does one layout write per frame instead of one per token.
+
 ## [0.11.0] - 2026-11-09
 
 - The editor gutter now has a fold arrow at the first line of each statement that uses more than one line, as in VS Code. It replaces the Run button. Click the arrow to fold the statement to its first line. Click it again to unfold the statement. To run a statement, use ⌘↵.

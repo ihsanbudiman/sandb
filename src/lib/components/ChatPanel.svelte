@@ -155,6 +155,54 @@
   let showHistory = $state(false);
   let list = $state<HTMLDivElement>();
   let composer = $state<HTMLTextAreaElement>();
+  /** Follow new content only while the reader is at the bottom; scrolling up stops the pin. */
+  let follow = $state(true);
+  /** A wheel/pointer gesture in the list, not a layout-driven scroll event. */
+  let userScrolled = $state(false);
+  let bottomFrame = 0;
+  let bottomTimer = 0;
+
+  function onListWheel(e: WheelEvent) {
+    userScrolled = true;
+    // Do not wait for the scroll event: a new token can arrive first and pull the list down.
+    if (e.deltaY < 0) follow = false;
+    else if (list && list.scrollHeight - list.scrollTop - list.clientHeight < 24) follow = true;
+  }
+
+  /** A scrollbar drag starts with a pointer down, not a wheel event. */
+  function markUserScroll() {
+    userScrolled = true;
+  }
+
+  function onListScroll() {
+    const el = list;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+    if (atBottom) {
+      follow = true;
+      userScrolled = false;
+    } else if (userScrolled) {
+      follow = false;
+    }
+  }
+
+  /** One layout write per frame; a streamed token must not force a reflow for every word. */
+  function scrollToBottomSoon() {
+    if (!list || bottomFrame) return;
+    const finish = () => {
+      if (bottomTimer) clearTimeout(bottomTimer);
+      bottomTimer = 0;
+      bottomFrame = 0;
+      if (list && follow) list.scrollTop = list.scrollHeight;
+    };
+    bottomFrame = requestAnimationFrame(finish);
+    // A hidden/throttled WebView can pause rAF; a timer keeps the pin from getting stuck.
+    bottomTimer = window.setTimeout(() => {
+      if (!bottomFrame) return;
+      cancelAnimationFrame(bottomFrame);
+      finish();
+    }, 50);
+  }
 
   // The scripted demo flows talk about orders; real connections get prompts for their own tables.
   // `write`: the prompt asks for a change, so it shows only while writes are on.
@@ -329,12 +377,14 @@
     if (!text.trim()) return;
     if (chat.question) {
       input = '';
+      follow = true;
       answer(text.trim());
       return;
     }
     if (chat.live || !ready) return;
     input = '';
     showHistory = false;
+    follow = true;
     send(text);
   }
 
@@ -350,18 +400,36 @@
   function newChat() {
     openSession('');
     showHistory = false;
+    follow = true;
     composer?.focus();
   }
 
   function pick(id: string) {
     openSession(id);
     showHistory = false;
+    follow = true;
   }
 
   $effect(() => {
+    // Track the growing reply, not the whole transcript: JSON.stringify here re-ran on every
+    // streamed word and made the list do layout work for content the reader may not be watching.
+    void session?.id;
+    void showHistory;
     void messages.length;
-    void JSON.stringify(messages.at(-1)?.parts);
-    list?.scrollTo({ top: list.scrollHeight });
+    const last = messages.at(-1);
+    void last?.parts.length;
+    for (const p of last?.parts ?? []) {
+      if (p.kind === 'text') void p.text.length;
+      else if (p.kind === 'tool') {
+        void p.status;
+        void p.sql;
+        void p.rows;
+        void p.ms;
+      } else if (p.kind === 'question') void p.answer;
+      else if (p.kind === 'error') void p.text;
+    }
+    if (showHistory || !follow) return;
+    scrollToBottomSoon();
   });
 
   // Puts focus on the safe default of an approval card, so Enter does not run a destructive statement.
@@ -435,7 +503,7 @@
       {/each}
     </div>
   {:else}
-  <div bind:this={list} class="flex-1 space-y-4 overflow-auto px-4 pt-3 pb-4">
+  <div bind:this={list} onscroll={onListScroll} onwheel={onListWheel} onpointerdown={markUserScroll} role="log" aria-live="off" aria-label="Conversation" class="flex-1 space-y-4 overflow-auto overscroll-contain px-4 pt-3 pb-4 [overflow-anchor:none]">
     {#if messages.length === 0}
       <div class="pt-8">
         <div class="grid size-8 place-items-center rounded-lg bg-accent/12 text-accent"><Sparkles size={15} /></div>
