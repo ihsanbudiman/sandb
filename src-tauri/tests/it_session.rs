@@ -5,12 +5,14 @@
 //! sandb-test stack (`pnpm db:up`); unreachable databases FAIL, nothing is skipped.
 #![cfg(feature = "it")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde_json::json;
+use sqlx::Connection as _;
 
 use sandb_lib::core::connections::{self, Connection, ConnectionInput, Engine, Env, SslMode};
+use sandb_lib::core::db::edit::{self, ApplyEditsRequest, EditKind, EditOperation};
 use sandb_lib::core::db::export::{self, ExportRequest};
 use sandb_lib::core::db::query::{self, QueryRun, RunRequest};
 use sandb_lib::core::db::session::{self, TabStatus};
@@ -81,6 +83,9 @@ fn input(engine: Engine, port: u16, env: Env, file: &std::path::Path) -> Connect
         ai_write: false,
         read_only: false,
         version: None,
+        uri: String::new(),
+        auth_source: String::new(),
+        topology: None,
     }
 }
 
@@ -257,6 +262,7 @@ async fn session_survives_several_runs() {
                 Engine::Mysql => "SELECT CAST(CONNECTION_ID() AS SIGNED) AS b",
                 // SQLite has no backend id; a temp table lives on the connection itself.
                 Engine::Sqlite => "CREATE TEMP TABLE it_keep (a int)",
+                Engine::Mongo => unreachable!("SQL engines only"),
             };
             // The write opens the transaction (and the session); a plain read alone would not.
             run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
@@ -394,6 +400,7 @@ async fn clean_runs_leave_no_transaction() {
             // write-capable statement (even `SET @x`) counts as pending there.
             Engine::Mysql => "START TRANSACTION; SELECT 1",
             Engine::Sqlite => "PRAGMA user_version; SELECT 1",
+            Engine::Mongo => unreachable!("SQL engines only"),
         };
         for sql in ["SELECT 1", not_plain] {
             run_tab_ok(&c, sql, "tab").await;
@@ -913,4 +920,241 @@ async fn many_open_transactions_do_not_exhaust_the_pool() {
         })
         .await;
     }
+}
+
+/// A Local connection on `engine`; the save runs in autocommit, no tab session.
+fn local_ctx(label: &str, engine: Engine, port: u16) -> Ctx {
+    let (dir, st) = state();
+    let (_, pw) = rw();
+    let conn = connections::create(
+        &st,
+        input(engine, port, Env::Local, &PathBuf::new()),
+        Some(pw),
+    )
+    .unwrap();
+    Ctx {
+        _dir: dir,
+        st,
+        conn,
+        label: label.into(),
+    }
+}
+
+/// A direct PG connection that holds a row lock, so a save's statement waits for it.
+async fn locker() -> sqlx::PgConnection {
+    let (user, pw) = rw();
+    let opts = sqlx::postgres::PgConnectOptions::new()
+        .host("127.0.0.1")
+        .port(PG16)
+        .username(&user)
+        .password(&pw)
+        .database("shop");
+    sqlx::PgConnection::connect_with(&opts)
+        .await
+        .expect("direct PG connection for the row lock")
+}
+
+/// A direct SQLite connection to the same file, for holding the write lock.
+async fn sqlite_locker(c: &Ctx) -> sqlx::SqliteConnection {
+    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&c.conn.file);
+    sqlx::SqliteConnection::connect_with(&opts)
+        .await
+        .expect("direct SQLite connection for the write lock")
+}
+
+/// One `v` update 'a' -> `new` on row 1, saved through the editor's id and tab.
+fn save(c: &Ctx, table: &str, new: &str, id: Option<&str>, tab: Option<&str>) -> ApplyEditsRequest {
+    ApplyEditsRequest {
+        conn_id: c.conn.id.clone(),
+        database: "shop".into(),
+        sql: format!("SELECT id, v FROM {table}"),
+        tab_id: tab.map(str::to_string),
+        query_id: id.map(str::to_string),
+        operations: vec![EditOperation {
+            key: "0".into(),
+            kind: EditKind::Update,
+            pk: BTreeMap::from([("id".into(), json!(1))]),
+            set: BTreeMap::from([("v".into(), json!(new))]),
+            old: BTreeMap::from([("v".into(), json!("a"))]),
+            document: None,
+        }],
+    }
+}
+
+fn value_of(r: &QueryRun) -> serde_json::Value {
+    cell(r, 0, 0)
+}
+
+#[tokio::test]
+async fn a_cancelled_save_rolls_back_and_needs_no_reconnect() {
+    let c = local_ctx("pg16", Engine::Pg, PG16);
+    let t = scratch();
+    run_other(
+        &c,
+        &format!("CREATE TABLE {t} (id int PRIMARY KEY, v text)"),
+    )
+    .await;
+    run_other(&c, &format!("INSERT INTO {t} VALUES (1, 'a')")).await;
+
+    let mut lock = locker().await;
+    sqlx::query("BEGIN").execute(&mut lock).await.unwrap();
+    sqlx::query(&format!("UPDATE {t} SET v = 'locked' WHERE id = 1"))
+        .execute(&mut lock)
+        .await
+        .unwrap();
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let saving = edit::apply_edits(&c.st, save(&c, &t, "b", Some(&id), None));
+    let cancelling = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        query::cancel(&c.st, &id).await.expect("cancel the save");
+    };
+    let (r, ()) = tokio::join!(saving, cancelling);
+    let e = r.expect_err("the blocked save must be cancelled");
+    assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
+
+    sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+    assert_eq!(
+        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        json!("a"),
+        "a cancelled save leaves no change"
+    );
+
+    // The cancelled statement's connection was closed, not returned: the pool opens a new one.
+    let ok = edit::apply_edits(&c.st, save(&c, &t, "b", None, None))
+        .await
+        .expect("the next save works");
+    assert!(ok.failed.is_none(), "{ok:?}");
+    assert_eq!(
+        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        json!("b")
+    );
+    run_other(&c, &format!("DROP TABLE {t}")).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_save_keeps_the_tab_transaction() {
+    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let t = scratch();
+    run_other(
+        &c,
+        &format!("CREATE TABLE {t} (id int PRIMARY KEY, v text)"),
+    )
+    .await;
+    run_other(&c, &format!("INSERT INTO {t} VALUES (1, 'a')")).await;
+
+    let mut lock = locker().await;
+    sqlx::query("BEGIN").execute(&mut lock).await.unwrap();
+    sqlx::query(&format!("UPDATE {t} SET v = 'locked' WHERE id = 1"))
+        .execute(&mut lock)
+        .await
+        .unwrap();
+
+    let tab = scratch();
+    // The user has uncommitted work in the tab: the cancelled save must not lose it.
+    run_tab_ok(&c, &format!("INSERT INTO {t} VALUES (2, 'tab')"), &tab).await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let saving = edit::apply_edits(&c.st, save(&c, &t, "b", Some(&id), Some(&tab)));
+    let cancelling = async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        query::cancel(&c.st, &id).await.expect("cancel the save");
+    };
+    let (r, ()) = tokio::join!(saving, cancelling);
+    let e = r.expect_err("the blocked save must be cancelled");
+    assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
+
+    // The savepoint rolled back; the user's transaction and its insert stay open and usable.
+    let st = status(&c, &tab).await.expect("the tab session");
+    assert!(st.open && st.tx_open && st.pending && !st.aborted, "{st:?}");
+    let inside = run_tab_ok(&c, &format!("SELECT v FROM {t} WHERE id = 2"), &tab).await;
+    assert_eq!(
+        value_of(&inside),
+        json!("tab"),
+        "the tab's own write survives"
+    );
+
+    sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+    assert_eq!(
+        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        json!("a"),
+        "a cancelled save leaves no change"
+    );
+
+    let ok = edit::apply_edits(&c.st, save(&c, &t, "c", None, Some(&tab)))
+        .await
+        .expect("the next save in the tab works");
+    assert!(ok.failed.is_none(), "{ok:?}");
+    commit(&c, &tab).await.expect("commit the tab");
+    assert_eq!(
+        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        json!("c")
+    );
+    assert_eq!(
+        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 2")).await),
+        json!("tab")
+    );
+    run_other(&c, &format!("DROP TABLE {t}")).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_save_keeps_a_sqlite_tab_transaction() {
+    let c = prod_ctx("sqlite", Engine::Sqlite, 0);
+    let t = scratch();
+    run_other(
+        &c,
+        &format!("CREATE TABLE {t} (id int PRIMARY KEY, v text)"),
+    )
+    .await;
+    run_other(&c, &format!("INSERT INTO {t} VALUES (1, 'a')")).await;
+
+    // The tab's own write goes to a TEMP table: it keeps the transaction non-empty without
+    // holding the main database's write lock.
+    let work = scratch();
+    let tab = scratch();
+    run_tab_ok(&c, &format!("CREATE TEMP TABLE {work} (x int)"), &tab).await;
+    run_tab_ok(&c, &format!("INSERT INTO {work} VALUES (1)"), &tab).await;
+
+    // Another connection holds the main database's write lock, so the save's UPDATE waits out
+    // SQLite's busy timeout.
+    let mut lock = sqlite_locker(&c).await;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut lock)
+        .await
+        .unwrap();
+    sqlx::query(&format!("UPDATE {t} SET v = 'locked' WHERE id = 1"))
+        .execute(&mut lock)
+        .await
+        .unwrap();
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let saving = edit::apply_edits(&c.st, save(&c, &t, "b", Some(&id), Some(&tab)));
+    let cancelling = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        query::cancel(&c.st, &id).await.expect("cancel the save");
+    };
+    let (r, ()) = tokio::join!(saving, cancelling);
+    let e = r.expect_err("the blocked save must be cancelled");
+    assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
+
+    // Attaching the session would have let `sqlite3_interrupt` roll the whole transaction back.
+    let st = status(&c, &tab).await.expect("the tab session");
+    assert!(st.open && st.tx_open && st.pending && !st.aborted, "{st:?}");
+    let inside = run_tab_ok(&c, &format!("SELECT count(*) FROM {work}"), &tab).await;
+    assert_eq!(value_of(&inside), json!(1), "the tab's own write survives");
+
+    sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+    assert_eq!(
+        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        json!("a"),
+        "a cancelled save leaves no change"
+    );
+    edit::apply_edits(&c.st, save(&c, &t, "c", None, Some(&tab)))
+        .await
+        .expect("the next save in the tab works");
+    commit(&c, &tab).await.expect("commit the tab");
+    assert_eq!(
+        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        json!("c")
+    );
+    run_other(&c, &format!("DROP TABLE {t}")).await;
 }

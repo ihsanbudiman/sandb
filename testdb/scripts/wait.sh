@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TIMEOUT="${TIMEOUT:-180}"
-SERVICES=(pg16 pg13 mysql mariadb mock-llm)
+SERVICES=(pg16 pg13 mysql mariadb mongo-rs mongo-standalone mock-llm)
 dc() { docker compose -p sandb-test -f compose.yaml --env-file .env.test "$@"; }
 
 start=$(date +%s)

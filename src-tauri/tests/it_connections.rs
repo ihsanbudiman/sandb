@@ -55,6 +55,9 @@ fn net(engine: Engine, port: u16) -> ConnectionInput {
         ai_write: false,
         read_only: false,
         version: None,
+        uri: String::new(),
+        auth_source: String::new(),
+        topology: None,
     }
 }
 
@@ -114,6 +117,9 @@ async fn sqlite_fixture_ok_and_unchanged() {
         ai_write: false,
         read_only: false,
         version: None,
+        uri: String::new(),
+        auth_source: String::new(),
+        topology: None,
     };
     let (_d, st) = state();
     let r = connections::test(&st, input, None, None)

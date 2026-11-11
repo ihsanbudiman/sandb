@@ -100,6 +100,8 @@ pub async fn columns(p: &PgPool, schema: &str, table: &str) -> Result<Vec<Column
             default,
             is_pk: pk.is_some(),
             pk_ordinal: pk.map(|o| o as u32),
+            frequency: None,
+            sample_size: None,
         })
         .collect())
 }
@@ -225,6 +227,7 @@ pub async fn properties(
                     primary,
                     method: Some(method),
                     definition: Some(definition),
+                    mongo: None,
                 },
             )
             .collect(),

@@ -40,11 +40,14 @@
   // The chosen databases and the connection's own one stay in the list when the server list leaves them out or is not loaded.
   function dbList(c: Conn) {
     const chosen = sources.filter((s) => s.connId === c.id).map((s) => dbOf(s, c));
-    const all = [...new Set([defaultDb(c), ...(dbs[c.id] ?? []), ...chosen])];
+    // An empty connection database (possible on MongoDB) is not a choice.
+    const all = [...new Set([defaultDb(c), ...(dbs[c.id] ?? []), ...chosen])].filter((n) => n !== '');
     return query && !c.name.toLowerCase().includes(query) ? all.filter((n) => n.toLowerCase().includes(query)) : all;
   }
 
-  const shown = $derived(query ? db.connections.filter((c) => c.name.toLowerCase().includes(query) || dbList(c).length > 0) : db.connections);
+  // SQL and MongoDB databases; the engine badge tells them apart. A Mongo source always names a database.
+  const conns = $derived(db.connections);
+  const shown = $derived(query ? conns.filter((c) => c.name.toLowerCase().includes(query) || dbList(c).length > 0) : conns);
 
   const has = (c: Conn, name: string) => sources.some((s) => sameSource(s, { connId: c.id, database: name }));
   const chosenIn = (c: Conn) => sources.filter((s) => s.connId === c.id).length;
@@ -59,7 +62,7 @@
     menu = !menu;
     filter = '';
     // Connections that already have a chosen database open with it, so the user sees the choice.
-    if (menu) for (const c of db.connections) if (c.engine !== 'sqlite' && chosenIn(c) && expanded[c.id] === undefined) toggleConn(c);
+    if (menu) for (const c of conns) if (c.engine !== 'sqlite' && chosenIn(c) && expanded[c.id] === undefined) toggleConn(c);
   }
 </script>
 
@@ -119,7 +122,7 @@
             {/if}
           {/if}
         {:else}
-          <p class="px-2 py-1.5 text-[12px] text-muted">{db.connections.length ? 'Nothing matches the filter.' : 'Add a connection first.'}</p>
+          <p class="px-2 py-1.5 text-[12px] text-muted">{conns.length ? 'Nothing matches the filter.' : 'Add a connection first.'}</p>
         {/each}
       </div>
       <p class="shrink-0 border-t border-line px-2 pt-1.5 pb-1 text-[11px] text-faint">{sources.length} of {MAX_SOURCES} databases. A change applies from the next question.</p>

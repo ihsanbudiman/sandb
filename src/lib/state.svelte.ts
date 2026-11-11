@@ -12,14 +12,19 @@ export interface Conn extends Connection {
   copyOf?: string;
 }
 
-const mockSchemaOf: Record<Engine, string> = { pg: 'prod', mysql: 'shop', sqlite: 'notes' };
+// MongoDB has no mock schema: no SQL view opens on it.
+const mockSchemaOf: Record<Engine, string> = { pg: 'prod', mysql: 'shop', sqlite: 'notes', mongo: '' };
 export const toConn = (c: Connection): Conn => ({ ...c, schema: mockSchemaOf[c.engine] });
 
 export const engines: Record<Engine, { label: string; short: string; badge: string; port: number }> = {
   pg: { label: 'PostgreSQL', short: 'PG', badge: 'text-sky-700 dark:text-sky-400', port: 5432 },
   mysql: { label: 'MySQL / MariaDB', short: 'MY', badge: 'text-orange-800 dark:text-orange-400', port: 3306 },
   sqlite: { label: 'SQLite', short: 'SL', badge: 'text-violet-700 dark:text-violet-400', port: 0 },
+  mongo: { label: 'MongoDB', short: 'MG', badge: 'text-emerald-700 dark:text-emerald-400', port: 27017 },
 };
+
+/** True for the SQL engines. MongoDB connections open the editor and the chat too, but stay out of the SQL-only features (schema views, per-statement write previews, AI write settings). */
+export const isSql = (c: { engine: Engine }) => c.engine !== 'mongo';
 
 export const envDot: Record<Env, string> = {
   // The ring tells production from staging without relying on hue.
@@ -33,6 +38,10 @@ export const envTag: Record<Env, string> = {
   staging: 'text-amber-700 dark:text-amber-400',
   local: 'text-muted',
 };
+
+/** Bumped after a structure change (DDL, an index/collection change), so open Properties views reload. */
+export const structure = $state({ rev: 0 });
+export const structureChanged = () => structure.rev++;
 
 export const ui = $state({
   dark: false,
@@ -226,8 +235,9 @@ export function setAiModel(model: string) {
 }
 
 // Stands in while there are no connections, so views that read active() keep working.
-const placeholder: Conn = { id: '', name: '', engine: 'pg', version: '', env: 'local', host: '', port: 0, database: '', user: '', ssl: 'prefer', file: '', aiWrite: false, readOnly: false, schema: 'prod' };
+const placeholder: Conn = { id: '', name: '', engine: 'pg', version: '', env: 'local', host: '', port: 0, database: '', user: '', ssl: 'prefer', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, schema: 'prod' };
 
+/** The active tab's connection, whatever its engine. */
 export function active(): Conn {
   const id = activeTab()?.connId;
   return db.connections.find((c) => c.id === id) ?? db.connections[0] ?? placeholder;

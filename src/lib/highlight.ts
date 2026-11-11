@@ -4,7 +4,8 @@ import { PostgreSQL, MySQL, SQLite, StandardSQL, type SQLDialect } from '@codemi
 import type { Engine } from './api';
 
 const byFence: Record<string, SQLDialect> = { sql: StandardSQL, postgres: PostgreSQL, postgresql: PostgreSQL, pgsql: PostgreSQL, psql: PostgreSQL, mysql: MySQL, mariadb: MySQL, sqlite: SQLite };
-const byEngine: Record<Engine, SQLDialect> = { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite };
+// MongoDB text is never highlighted as SQL; the entry only completes the map.
+const byEngine: Record<Engine, SQLDialect> = { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite, mongo: StandardSQL };
 const looksSql = /^\s*(?:--[^\n]*\n\s*)*(?:SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|EXPLAIN|SHOW|DESCRIBE|GRANT|REVOKE|BEGIN|COMMIT|ROLLBACK)\b/i;
 
 const tokens = tagHighlighter([
@@ -24,8 +25,9 @@ export function fenceDialect(lang: string | undefined, code: string): SQLDialect
   return name ? byFence[name] : looksSql.test(code) ? StandardSQL : undefined;
 }
 
-/** Escaped HTML of `code` with a span per colored token. */
+/** Escaped HTML of `code` with a span per colored token. MongoDB text is mongosh, not SQL: it gets the escape only, no token colors. */
 export function sqlHtml(code: string, dialect: SQLDialect | Engine = StandardSQL): string {
+  if (dialect === 'mongo') return escape(code);
   const d = typeof dialect === 'string' ? byEngine[dialect] : dialect;
   let out = '';
   highlightCode(code, d.language.parser.parse(code), tokens, (s, cls) => (out += cls ? `<span class="${cls}">${escape(s)}</span>` : escape(s)), () => (out += '\n'));

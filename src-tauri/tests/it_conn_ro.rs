@@ -67,6 +67,9 @@ fn net_input(label: &str, engine: Engine, port: u16, read_only: bool) -> Connect
         ai_write: false,
         read_only,
         version: None,
+        uri: String::new(),
+        auth_source: String::new(),
+        topology: None,
     }
 }
 
@@ -100,6 +103,9 @@ fn sqlite_input(file: &std::path::Path, read_only: bool) -> ConnectionInput {
         ai_write: false,
         read_only,
         version: None,
+        uri: String::new(),
+        auth_source: String::new(),
+        topology: None,
     }
 }
 
@@ -258,6 +264,7 @@ async fn pre_check_refuses_session_mode_changes() {
                 "SET @@SESSION.tx_read_only = OFF",
             ],
             Engine::Sqlite => &["PRAGMA query_only = 0", "PRAGMA query_only = OFF"],
+            Engine::Mongo => unreachable!("SQL engines only"),
         };
         for sql in escapes {
             let e = must_fail(l, sql, editor(&c, sql).await);
@@ -271,6 +278,7 @@ async fn pre_check_refuses_session_mode_changes() {
             (Engine::Mysql, "mariadb") => "SELECT @@session.tx_read_only AS ro",
             (Engine::Mysql, _) => "SELECT @@session.transaction_read_only AS ro",
             (Engine::Sqlite, _) => "PRAGMA query_only",
+            (Engine::Mongo, _) => unreachable!("SQL engines only"),
         };
         let r = unchecked(&c, probe)
             .await

@@ -7,7 +7,7 @@ export type TableRef = { database: string; schema: string | null; name: string; 
 
 export const kindLabel: Record<TableKind, string> = { table: 'table', view: 'view', matview: 'materialized view' };
 
-export type TableAction = 'view' | 'count' | 'ddl' | 'select' | 'insert' | 'exportDdl' | 'exportSql' | 'exportCsv' | 'truncate' | 'drop';
+export type TableAction = 'view' | 'count' | 'ddl' | 'select' | 'insert' | 'exportDdl' | 'exportSql' | 'exportCsv' | 'exportDocuments' | 'truncate' | 'drop';
 
 /** A Truncate or Drop that waits for the user to confirm it. */
 export type Danger = { action: 'truncate' | 'drop'; c: Conn; t: TableRef };
@@ -37,6 +37,21 @@ function literal(engine: Engine, value: string, dataType: string) {
 
 /** SQL for one table Data view run. Values are literals because the existing query API accepts SQL text. */
 export function tableDataSql(engine: Engine, table: TableRef, filters: TableFilter[], columns: string[] = [], types: string[] = []) {
+  if (engine === 'mongo') {
+    // mongosh: db.<collection>.find({ ... }). Fields with several filters cannot share one key,
+    // so their conditions go through $and; the others merge into one document.
+    const counts = new Map<string, number>();
+    for (const f of filters) counts.set(f.column, (counts.get(f.column) ?? 0) + 1);
+    const plain: string[] = [];
+    const ands: string[] = [];
+    for (const f of filters) {
+      // A sampled field can have several types (`decimal128 | int32 | string`); the most common one types the value.
+      const cond = mongoCondition(f, (types[columns.indexOf(f.column)] ?? '').split(' | ')[0]);
+      (counts.get(f.column) ?? 0) > 1 ? ands.push(`{ ${cond} }`) : plain.push(cond);
+    }
+    const doc = [plain.join(', '), ands.length ? `$and: [${ands.join(', ')}]` : ''].filter(Boolean).join(', ');
+    return `db.${mongoName(table.name)}.find({${doc ? ` ${doc} ` : ''}})`;
+  }
   const where = filters.map((f) => {
     const col = quoteIdent(engine, f.column);
     if (f.operator === 'isNull') return `${col} IS NULL`;
@@ -48,6 +63,84 @@ export function tableDataSql(engine: Engine, table: TableRef, filters: TableFilt
     return `${col} ${f.operator} ${literal(engine, f.value, types[columns.indexOf(f.column)] ?? '')}`;
   });
   return `SELECT *\nFROM ${qualified(engine, table)}${where.length ? `\nWHERE ${where.join(' AND ')}` : ''}`;
+}
+
+// ---- MongoDB: the Data view runs as a mongosh find() ----------------------------------------
+
+/** A plain JS identifier: these keys stay bare in the filter document, anything else gets JSON quotes. */
+export const PLAIN_IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/** Mongo operator of a comparison filter. */
+const MONGO_OP: Partial<Record<TableFilterOperator, string>> = { '>': '$gt', '>=': '$gte', '<': '$lt', '<=': '$lte', '<>': '$ne' };
+
+/**
+ * The collection access after `db.`, always through getCollection(): a bare `db.<name>` can hit a
+ * database method (`db.version`), and a name may hold quotes, dots or non-ASCII text.
+ */
+export function mongoName(name: string) {
+  return `getCollection(${JSON.stringify(name)})`;
+}
+
+const INT64_MIN = -9223372036854775808n;
+const INT64_MAX = 9223372036854775807n;
+
+/**
+ * Exact decimal digits of a numeric string when its value is a whole number (`1e18` gives
+ * `1000000000000000000`, `2.0` gives `2`); null when it has a fraction.
+ */
+function integerDigits(v: string): string | null {
+  const m = /^(-?)(\d*)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(v);
+  if (!m) return null;
+  const [, sign, whole, fraction = '', exponent = '0'] = m;
+  const digits = whole + fraction;
+  if (!digits) return null;
+  // The decimal point of `whole.fraction` sits after `whole`; the exponent moves it.
+  const point = whole.length + Number(exponent);
+  // int64 has at most 19 digits: a longer integer is out of range, and there is no point in building it.
+  if (point > 20) return null;
+  if (point <= 0) return /^0+$/.test(digits) ? '0' : null;
+  if (point < digits.length && !/^0+$/.test(digits.slice(point))) return null;
+  const all = point >= digits.length ? digits + '0'.repeat(point - digits.length) : digits.slice(0, point);
+  const trimmed = all.replace(/^0+(?=\d)/, '');
+  return sign ? `-${trimmed}` : trimmed;
+}
+
+/** Text of one filter value, typed by the column's first data type. */
+function mongoValue(value: string, t: string) {
+  const v = value.trim();
+  // An int64 past 2^53 has no exact double: keep its digits in a NumberLong.
+  if (t === 'int64' && NUMBER.test(v)) {
+    const digits = integerDigits(v);
+    if (digits !== null) {
+      const n = BigInt(digits);
+      if (n < INT64_MIN || n > INT64_MAX) throw new Error(`${v} does not fit in an int64 (${INT64_MIN} to ${INT64_MAX})`);
+      return n > 9007199254740991n || n < -9007199254740991n ? `NumberLong("${digits}")` : digits;
+    }
+  }
+  if (t === 'decimal128' && NUMBER.test(v)) return `NumberDecimal("${v}")`;
+  if (t === 'objectId' && /^[0-9a-f]{24}$/i.test(v)) return `ObjectId("${v}")`;
+  // The value is arbitrary text: quote it, so it cannot end the string or the statement.
+  if (t === 'date') return `ISODate(${JSON.stringify(v)})`;
+  if (t === 'bool' && /^(true|false)$/i.test(v)) return v.toLowerCase();
+  if ((t === 'int32' || t === 'int64' || t === 'double' || t === 'number') && NUMBER.test(v)) return v;
+  return JSON.stringify(v);
+}
+
+/** One filter as a `field: condition` piece of the filter document. */
+function mongoCondition(f: TableFilter, type: string) {
+  const key = PLAIN_IDENT.test(f.column) ? f.column : JSON.stringify(f.column);
+  if (f.operator === 'isNull') return `${key}: null`;
+  if (f.operator === 'isNotNull') return `${key}: { $ne: null }`;
+  if (f.operator === 'contains' || f.operator === 'startsWith' || f.operator === 'endsWith') {
+    // The pattern is a literal: escape the metacharacters, then anchor the ends that mean it.
+    const esc = f.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = f.operator === 'contains' ? esc : f.operator === 'startsWith' ? `^${esc}` : `${esc}$`;
+    return `${key}: { $regex: ${JSON.stringify(pattern)} }`;
+  }
+  const v = mongoValue(f.value, type);
+  if (f.operator === '=') return `${key}: ${v}`;
+  if (f.operator === '<>') return `${key}: { $ne: ${v} }`;
+  return `${key}: { ${MONGO_OP[f.operator]}: ${v} }`;
 }
 
 /** Applies the same operators to mock rows after parsing a generated table query. */
@@ -274,5 +367,71 @@ export function schemaChangeSql(e: Engine, t: TableRef, c: SchemaChange): string
       return `${alter}\n${dropConstraint(c.kind, c.name)};`;
     case 'dropIndex':
       return dropIndex(c.name);
+  }
+}
+
+// ---- MongoDB: structure changes as mongosh text --------------------------------------------
+
+/** One key of an index: a field path, or a special index type written as a string. */
+export type MongoIndexField = { field: string; kind: string };
+
+/** An index the dialog builds. `partial` is mongosh object text and is inserted verbatim. */
+export type MongoIndexDraft = { name: string; fields: MongoIndexField[]; unique: boolean; sparse: boolean; hidden: boolean; ttl: string; partial: string };
+
+/** A validator change: the full validator document as mongosh text, or `{}` to remove it. */
+export type MongoValidatorDraft = { validator: string; level: string; action: string };
+
+/** The special index types; `1` and `-1` are the ordinary ascending and descending keys. */
+export const MONGO_INDEX_KINDS = ['1', '-1', 'text', '2dsphere', '2d', 'hashed'] as const;
+
+/** The validation levels and actions `collMod` takes. */
+export const MONGO_VALIDATION_LEVELS = ['strict', 'moderate', 'off'] as const;
+export const MONGO_VALIDATION_ACTIONS = ['error', 'warn', 'errorAndLog'] as const;
+
+/** One structure change of a collection. MongoDB cannot change an index's keys, so an index is dropped and added. */
+export type MongoChange =
+  | { op: 'createIndex'; index: MongoIndexDraft }
+  | { op: 'dropIndex'; name: string }
+  | { op: 'setValidator'; validator: MongoValidatorDraft }
+  | { op: 'removeValidator'; validator: MongoValidatorDraft };
+
+/** The collection, always through getCollection(): a name is then safe whatever it holds. */
+export const mongoCollection = (name: string) => `db.${mongoName(name)}`;
+
+/** The `createIndex` text of one index: keys first, options only when there are some. */
+function mongoCreateIndex(coll: string, d: MongoIndexDraft): string {
+  const keys = d.fields
+    .filter((f) => f.field.trim())
+    .map((f) => {
+      const field = f.field.trim();
+      return `${PLAIN_IDENT.test(field) ? field : JSON.stringify(field)}: ${f.kind === '1' || f.kind === '-1' ? f.kind : JSON.stringify(f.kind)}`;
+    });
+  const options = [
+    d.name.trim() ? `name: ${JSON.stringify(d.name.trim())}` : '',
+    d.unique ? 'unique: true' : '',
+    d.sparse ? 'sparse: true' : '',
+    d.hidden ? 'hidden: true' : '',
+    d.ttl.trim() ? `expireAfterSeconds: ${d.ttl.trim()}` : '',
+    d.partial.trim() ? `partialFilterExpression: ${d.partial.trim()}` : '',
+  ].filter(Boolean);
+  return `${mongoCollection(coll)}.createIndex({ ${keys.join(', ')} }${options.length ? `, { ${options.join(', ')} }` : ''});`;
+}
+
+/** Mongosh text of one structure change, for the preview and the editor run. */
+export function mongoSchemaText(t: TableRef, c: MongoChange): string {
+  switch (c.op) {
+    case 'createIndex':
+      return mongoCreateIndex(t.name, c.index);
+    // A name is what dropIndex takes: the key document would not say which index.
+    case 'dropIndex':
+      return `${mongoCollection(t.name)}.dropIndex(${JSON.stringify(c.name)});`;
+    case 'setValidator':
+    case 'removeValidator': {
+      const v = c.validator;
+      // collMod carries the validator document itself; `{}` removes an existing one.
+      const doc = c.op === 'setValidator' ? v.validator.trim() : '{}';
+      const rest = [v.level ? `validationLevel: ${JSON.stringify(v.level)}` : '', v.action ? `validationAction: ${JSON.stringify(v.action)}` : ''].filter(Boolean);
+      return `db.runCommand({ collMod: ${JSON.stringify(t.name)}, validator: ${doc}${rest.length ? `, ${rest.join(', ')}` : ''} });`;
+    }
   }
 }

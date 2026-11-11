@@ -29,7 +29,7 @@ use crate::core::state::AppState;
 pub const DEFAULT_MAX_ROWS: usize = 500;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// The outer safety net fires this long after the database's own limit should have.
-const GRACE: Duration = Duration::from_secs(1);
+pub(crate) const GRACE: Duration = Duration::from_secs(1);
 /// Bound for the server-side cancel sent by the safety net.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// PG `lock_timeout`: an AI read never queues long behind another session's lock.
@@ -73,10 +73,14 @@ pub struct AiReadResult {
     /// More rows exist than `max_rows`; they were not fetched.
     pub truncated: bool,
     pub elapsed_ms: u64,
+    /// MongoDB only: each document of the page as relaxed Extended JSON, one per row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<Value>>,
 }
 
 /// Runs AI-written `sql` read-only: the layer 1 guard, then the database-enforced read-only
-/// session with `limits`. `database`: the connection's own when absent.
+/// session with `limits`. `database`: the connection's own when absent. On MongoDB `sql` is one
+/// mongosh read statement.
 pub async fn run_ai_read(
     state: &AppState,
     conn_id: &str,
@@ -85,6 +89,9 @@ pub async fn run_ai_read(
     limits: ReadLimits,
 ) -> Result<AiReadResult, AppError> {
     let conn = connections::get(state, conn_id)?;
+    if conn.engine == Engine::Mongo {
+        return crate::core::mongo::ai::read(state, &conn, database, sql, limits).await;
+    }
     guard::check_ai_read(sql, conn.engine)?;
     execute(state, &conn, database, sql, limits).await
 }
@@ -157,6 +164,7 @@ async fn execute(
         rows: fetched.rows,
         truncated: fetched.truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        documents: None,
     })
 }
 
@@ -250,7 +258,7 @@ async fn server_kill_inner(
     Ok(())
 }
 
-fn timeout_error(limit: Duration) -> AppError {
+pub(crate) fn timeout_error(limit: Duration) -> AppError {
     let shown = if limit < Duration::from_secs(1) {
         format!("{} ms", limit.as_millis())
     } else {
@@ -318,6 +326,7 @@ fn map_read_error(engine: Engine, e: sqlx::Error, sql: &str, limit: Duration) ->
                 Some(9) => Some(Refusal::Timeout),
                 _ => None,
             },
+            Engine::Mongo => None,
         },
         _ => None,
     };
@@ -694,6 +703,9 @@ mod tests {
             ai_write: false,
             read_only: false,
             version: None,
+            uri: String::new(),
+            auth_source: String::new(),
+            topology: None,
         }
     }
 
@@ -877,6 +889,7 @@ mod tests {
             rows: vec![],
             truncated: true,
             elapsed_ms: 3,
+            documents: None,
         })
         .unwrap();
         assert_eq!(

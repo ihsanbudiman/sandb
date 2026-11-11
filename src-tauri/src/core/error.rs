@@ -30,6 +30,10 @@ pub enum ErrorCode {
     AiProtocol,
     /// The assistant proposed a write, but write mode is off or the connection is read-only.
     WriteBlocked,
+    /// The user denied a proposed write, or nobody decided in time. Nothing ran.
+    WriteDenied,
+    /// The feature is not available for this engine yet (MongoDB before its phase lands).
+    Unsupported,
     Internal,
 }
 
@@ -71,6 +75,14 @@ impl AppError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
+    }
+
+    /// A SQL feature used on a MongoDB connection.
+    pub fn unsupported_mongo() -> Self {
+        Self::new(
+            ErrorCode::Unsupported,
+            "This feature is not available for MongoDB connections yet",
+        )
     }
 }
 
@@ -189,6 +201,7 @@ mod tests {
             (ErrorCode::AiUpstream, "ai_upstream"),
             (ErrorCode::AiProtocol, "ai_protocol"),
             (ErrorCode::WriteBlocked, "write_blocked"),
+            (ErrorCode::Unsupported, "unsupported"),
             (ErrorCode::Internal, "internal"),
         ];
         for (c, s) in codes {

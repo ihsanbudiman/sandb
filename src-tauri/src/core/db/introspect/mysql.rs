@@ -101,6 +101,8 @@ pub async fn columns(
                 default: text(r, 3).filter(|d| d != "NULL"),
                 is_pk: pk.is_some(),
                 pk_ordinal: pk,
+                frequency: None,
+                sample_size: None,
             }
         })
         .collect())
@@ -157,6 +159,7 @@ fn group_indexes(parts: Vec<IndexPart>) -> Vec<IndexInfo> {
             unique: !p.non_unique,
             method: (!p.method.is_empty()).then_some(p.method),
             definition: None,
+            mongo: None,
             columns: vec![p.column],
             name: p.name,
         },
@@ -361,6 +364,7 @@ pub async fn properties(
         constraints,
         foreign_keys,
         references,
+        mongo: None,
     }))
 }
 

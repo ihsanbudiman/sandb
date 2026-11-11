@@ -4,6 +4,8 @@ name: sandb-test
 # Healthchecks connect over TCP on purpose: during init the images run a temporary
 # server without TCP, so a TCP login of sandb_ro (created by the last seed script)
 # only passes after all seed scripts have finished.
+# The Mongo services listen on the same port inside and outside the container, so the
+# replica set member address (127.0.0.1:57017) also works from the host.
 
 x-pg: &pg
   env_file: .env.test
@@ -16,6 +18,14 @@ x-pg: &pg
     timeout: 5s
     retries: 90
     start_period: 5s
+
+x-mongo: &mongo
+  image: mongo:8
+  env_file: .env.test
+  networks: [testnet]
+  tmpfs: [/data/db, /data/configdb]
+  volumes:
+    - ./seed/mongo:/docker-entrypoint-initdb.d:ro
 
 services:
   pg16:
@@ -61,6 +71,35 @@ services:
       timeout: 5s
       retries: 90
       start_period: 10s
+
+  # One-node replica set: transactions work. A replica set with auth needs a key file;
+  # the wrapper makes a throwaway one. The healthcheck initiates the set (the init
+  # scripts run on a temporary server without --replSet), then logs in as sandb_ro.
+  mongo-rs:
+    <<: *mongo
+    entrypoint:
+      - bash
+      - -c
+      - openssl rand -base64 756 > /tmp/rs.key && chmod 400 /tmp/rs.key && chown mongodb:mongodb /tmp/rs.key && exec docker-entrypoint.sh mongod --port 57017 --replSet rs0 --keyFile /tmp/rs.key
+    ports: ["127.0.0.1:57017:57017"]
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --port 57017 -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'try { rs.status() } catch (e) { rs.initiate({ _id: \"rs0\", members: [{ _id: 0, host: \"127.0.0.1:57017\" }] }) }' >/dev/null && mongosh --quiet 'mongodb://sandb_ro:'$$SANDB_RO_PASSWORD'@127.0.0.1:57017/analytics?authSource=admin&directConnection=true' --eval 'db.events.countDocuments()' | grep -q 10000"]
+      interval: 2s
+      timeout: 10s
+      retries: 90
+      start_period: 20s
+
+  # Standalone server: no transactions.
+  mongo-standalone:
+    <<: *mongo
+    command: ["mongod", "--port", "57018"]
+    ports: ["127.0.0.1:57018:57018"]
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet 'mongodb://sandb_ro:'$$SANDB_RO_PASSWORD'@127.0.0.1:57018/analytics?authSource=admin' --eval 'db.events.countDocuments()' | grep -q 10000"]
+      interval: 2s
+      timeout: 10s
+      retries: 90
+      start_period: 20s
 
   mock-llm:
     image: node:22-alpine

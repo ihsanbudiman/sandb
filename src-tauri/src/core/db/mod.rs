@@ -8,3 +8,4 @@ pub mod readonly;
 pub mod session;
 pub mod value;
 pub mod wkb;
+pub mod write;

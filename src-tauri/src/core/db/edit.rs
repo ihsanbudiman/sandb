@@ -5,6 +5,8 @@
 //! identifiers from parsed SQL and schema metadata are quoted, never interpolated as values.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -19,13 +21,15 @@ use sqlparser::parser::Parser;
 use sqlx::mysql::{MySqlArguments, MySqlConnection};
 use sqlx::postgres::{PgArguments, PgConnection};
 use sqlx::sqlite::{SqliteArguments, SqliteConnection};
-use sqlx::{Executor as _, MySql, Postgres, Sqlite};
+use sqlx::{Connection as _, Executor as _, MySql, Postgres, Sqlite};
 
 use crate::core::connections::{self, Connection, Engine, Env};
 use crate::core::db::introspect::{self, ColumnInfo};
 use crate::core::db::pool::DbPool;
+use crate::core::db::query::{CLOSE_TIMEOUT, Session, SqliteHandle};
 use crate::core::db::session::{self, Conn};
 use crate::core::error::{AppError, ErrorCode};
+use crate::core::mongo;
 use crate::core::sql::split;
 use crate::core::state::AppState;
 
@@ -49,15 +53,19 @@ pub struct EditableResult {
     pub pk: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// MongoDB only: whether the server has transactions (replica set or sharded cluster).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transactions: Option<bool>,
 }
 
 impl EditableResult {
-    fn not_editable(reason: impl Into<String>) -> Self {
+    pub(crate) fn not_editable(reason: impl Into<String>) -> Self {
         Self {
             table: None,
             schema: None,
             pk: Vec::new(),
             reason: Some(reason.into()),
+            transactions: None,
         }
     }
 }
@@ -70,6 +78,10 @@ pub struct ApplyEditsRequest {
     pub sql: String,
     #[serde(default)]
     pub tab_id: Option<String>,
+    /// The id `cancel_query` uses to stop this save: the save runs in the editor's query
+    /// registry, so the dialog's Cancel reaches it.
+    #[serde(default)]
+    pub query_id: Option<String>,
     pub operations: Vec<EditOperation>,
 }
 
@@ -80,6 +92,12 @@ pub struct EditOperation {
     pub kind: EditKind,
     pub pk: BTreeMap<String, CellValue>,
     pub set: BTreeMap<String, CellValue>,
+    /// MongoDB update: path → typed value of the cell as it was loaded, for the conflict check.
+    #[serde(default)]
+    pub old: BTreeMap<String, CellValue>,
+    /// MongoDB insert: the whole new document as mongosh text.
+    #[serde(default)]
+    pub document: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -95,6 +113,9 @@ pub enum EditKind {
 pub struct ApplyEditsResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failed: Option<EditFailure>,
+    /// MongoDB standalone only: the operations before `failed.index` stay saved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,7 +178,7 @@ fn plain_wildcard(o: &WildcardAdditionalOptions) -> bool {
 fn ident_name(engine: Engine, ident: &Ident) -> String {
     match engine {
         Engine::Pg if ident.quote_style.is_none() => ident.value.to_lowercase(),
-        Engine::Mysql | Engine::Sqlite => ident.value.to_lowercase(),
+        Engine::Mysql | Engine::Sqlite | Engine::Mongo => ident.value.to_lowercase(),
         Engine::Pg => ident.value.clone(),
     }
 }
@@ -167,7 +188,7 @@ fn output_name(engine: Engine, ident: &Ident) -> String {
         Engine::Pg => ident_name(engine, ident),
         // These engines report the projection's original spelling, which must match metadata
         // exactly before it can be used as an edit key.
-        Engine::Mysql | Engine::Sqlite => ident.value.clone(),
+        Engine::Mysql | Engine::Sqlite | Engine::Mongo => ident.value.clone(),
     }
 }
 
@@ -310,7 +331,7 @@ fn simple_query(engine: Engine, query: &Query) -> Option<SimpleQuery> {
                 if plain_wildcard(o) =>
             {
                 let ids = object_idents(n)?;
-                let Some(q) = ids.last() else { return None };
+                let q = ids.last()?;
                 let q = ident_name(engine, q);
                 if q != ident_name(engine, &table)
                     && table_alias.is_none_or(|a| q != ident_name(engine, a))
@@ -353,7 +374,9 @@ fn simple_query(engine: Engine, query: &Query) -> Option<SimpleQuery> {
 fn quote(engine: Engine, ident: &str) -> String {
     match engine {
         Engine::Mysql => format!("`{}`", ident.replace('`', "``")),
-        Engine::Pg | Engine::Sqlite => format!("\"{}\"", ident.replace('"', "\"\"")),
+        Engine::Pg | Engine::Sqlite | Engine::Mongo => {
+            format!("\"{}\"", ident.replace('"', "\"\""))
+        }
     }
 }
 
@@ -383,7 +406,8 @@ fn table_names(q: &SimpleQuery, requested_database: &str) -> (Option<String>, St
             };
             (None, table, relation)
         }
-        Engine::Sqlite => {
+        // No SQL runs on a Mongo connection: its pool refuses to open.
+        Engine::Sqlite | Engine::Mongo => {
             let table = q.table.value.clone();
             let schema = q
                 .qualifier
@@ -504,6 +528,7 @@ async fn resolve(
         schema,
         pk,
         reason: None,
+        transactions: None,
     };
     let mut column_types: BTreeMap<String, String> =
         columns.into_iter().map(|c| (c.name, c.data_type)).collect();
@@ -533,6 +558,9 @@ pub async fn editable_result(
     request: EditableRequest,
 ) -> Result<EditableResult, AppError> {
     let conn = connections::get(state, &request.conn_id)?;
+    if conn.engine == Engine::Mongo {
+        return mongo::edit::editable_result(state, &conn, request).await;
+    }
     let database = connections::target_database(&conn, Some(&request.database));
     match resolve(state, &conn, &database, &request.sql).await? {
         Resolution::NotEditable(reason) => Ok(EditableResult::not_editable(reason)),
@@ -582,7 +610,7 @@ fn placeholder(engine: Engine, index: usize, data_type: &str) -> String {
         // Removing the typmod is important: CAST(x AS varchar(n)) truncates instead of letting
         // assignment to the column report an over-length value.
         Engine::Pg => format!("CAST(${index} AS {})", pg_base_type(data_type)),
-        Engine::Mysql | Engine::Sqlite => "?".into(),
+        Engine::Mysql | Engine::Sqlite | Engine::Mongo => "?".into(),
     }
 }
 
@@ -1060,50 +1088,175 @@ impl EditExecutor for Conn {
     }
 }
 
+/// How long a cancelled save waits for the reply of `COMMIT`, so it can say whether the change
+/// applied. The value `run.rs` gives a cancelled write.
+const COMMIT_REPLY_WAIT: Duration = Duration::from_secs(2);
+
+/// Wakes when the save's `query_id` is cancelled; never without an id.
+async fn until_cancelled(cancelled: Option<&AtomicBool>) {
+    let Some(cancelled) = cancelled else {
+        core::future::pending::<()>().await;
+        return;
+    };
+    while !cancelled.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled.is_some_and(|c| c.load(Ordering::SeqCst))
+}
+
+fn save_cancelled() -> AppError {
+    AppError::new(ErrorCode::Cancelled, "Save cancelled")
+}
+
+/// The local save stopped, but the commit may still have reached the server.
+fn save_maybe_applied() -> AppError {
+    save_cancelled().with_detail("The save may have applied before the cancel. Reload to check.")
+}
+
+/// Rolls the transaction back, best effort: the server may be the reason for the cancel.
+async fn rollback<C: EditExecutor>(c: &mut C) {
+    let _ = tokio::time::timeout(COMMIT_REPLY_WAIT, c.control("ROLLBACK")).await;
+}
+
+/// `Err` is the cancel: the caller rolls back and reports it.
 async fn run_operations<C: EditExecutor>(
     c: &mut C,
     target: &Target,
     engine: Engine,
     operations: &[EditOperation],
-) -> Option<EditFailure> {
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<EditFailure>, AppError> {
     for (index, op) in operations.iter().enumerate() {
+        if is_cancelled(cancelled) {
+            return Err(save_cancelled());
+        }
         let result = match operation_sql(target, engine, op) {
             Ok((sql, binds)) => c.execute(&sql, &binds).await,
-            Err(message) => return Some(EditFailure { index, message }),
+            Err(message) => return Ok(Some(EditFailure { index, message })),
         };
         match result {
             Ok(0) if matches!(op.kind, EditKind::Update | EditKind::Delete) => {
-                return Some(EditFailure {
+                return Ok(Some(EditFailure {
                     index,
                     message: "The row no longer exists or its primary key changed".into(),
-                });
+                }));
             }
             Ok(_) => {}
-            Err(message) => return Some(EditFailure { index, message }),
+            // A statement the server killed fails here; the flag says it was the cancel.
+            Err(_) if is_cancelled(cancelled) => return Err(save_cancelled()),
+            Err(message) => return Ok(Some(EditFailure { index, message })),
         }
     }
-    None
+    if is_cancelled(cancelled) {
+        return Err(save_cancelled());
+    }
+    Ok(None)
 }
 
-async fn apply_autocommit<C: EditExecutor>(
+/// Runs the batch in its own transaction and rolls it back on a failure or cancel.
+/// `Ok(None)` leaves a completed batch for the caller to COMMIT, so the caller detaches the
+/// registry entry first and no cancel kill can land on the COMMIT.
+async fn run_autocommit<C: EditExecutor>(
     c: &mut C,
     target: &Target,
     engine: Engine,
     operations: &[EditOperation],
-) -> Result<ApplyEditsResult, AppError> {
+    cancelled: Option<&AtomicBool>,
+) -> Result<Option<ApplyEditsResult>, AppError> {
+    if is_cancelled(cancelled) {
+        return Err(save_cancelled());
+    }
     c.control("BEGIN").await?;
-    let failed = run_operations(c, target, engine, operations).await;
-    if let Some(failed) = failed {
-        c.control("ROLLBACK").await?;
-        return Ok(ApplyEditsResult {
-            failed: Some(failed),
-        });
+    match run_operations(c, target, engine, operations, cancelled).await {
+        Err(e) => {
+            rollback(c).await;
+            Err(e)
+        }
+        Ok(Some(failed)) => {
+            c.control("ROLLBACK").await?;
+            Ok(Some(ApplyEditsResult {
+                failed: Some(failed),
+                partial: false,
+            }))
+        }
+        Ok(None) => Ok(None),
     }
-    if let Err(e) = c.control("COMMIT").await {
-        let _ = c.control("ROLLBACK").await;
-        return Err(e);
+}
+
+/// The COMMIT, raced with the cancel like the MongoDB save: one already sent gets a moment for
+/// its reply; without one the change may have applied, so it is reported that way.
+async fn commit<C: EditExecutor>(
+    c: &mut C,
+    cancelled: Option<&AtomicBool>,
+) -> Result<ApplyEditsResult, AppError> {
+    if is_cancelled(cancelled) {
+        rollback(c).await;
+        return Err(save_cancelled());
     }
-    Ok(ApplyEditsResult { failed: None })
+    let committed = {
+        let commit = c.control("COMMIT");
+        tokio::pin!(commit);
+        let sent = tokio::select! {
+            r = &mut commit => Some(r),
+            () = until_cancelled(cancelled) => None,
+        };
+        match sent {
+            Some(r) => Some(r),
+            // The commit is in flight: it may apply, and a rollback cannot take it back.
+            None => tokio::time::timeout(COMMIT_REPLY_WAIT, &mut commit)
+                .await
+                .ok(),
+        }
+    };
+    let Some(committed) = committed else {
+        return Err(save_maybe_applied());
+    };
+    match committed {
+        Ok(()) => Ok(ApplyEditsResult {
+            failed: None,
+            partial: false,
+        }),
+        // A COMMIT that failed while the flag was set may still have committed: MySQL's KILL
+        // QUERY repeats, and a deferred constraint can fail after the flag. Never claim a clean
+        // cancel for it.
+        Err(_) if is_cancelled(cancelled) => Err(save_maybe_applied()),
+        Err(e) => {
+            rollback(c).await;
+            Err(e)
+        }
+    }
+}
+
+/// One retry for the savepoint rollback: a cancel kill delivered just as the batch stopped is
+/// queued on the connection and aborts the transaction it lands in; ROLLBACK TO SAVEPOINT is the
+/// one statement that works then, and the retry runs clean.
+async fn rollback_to_savepoint<C: EditExecutor>(c: &mut C, sql: &str) -> Result<(), AppError> {
+    match c.control(sql).await {
+        Err(_) => c.control(sql).await,
+        ok => ok,
+    }
+}
+
+/// The tab connection's server session, so `cancel_query` can stop the save's statements as it
+/// stops a run's. SQLite is never attached: `sqlite3_interrupt` on a write inside an explicit
+/// transaction rolls the whole transaction back, so the flag alone stops a SQLite save.
+async fn session_of(conn: &mut Conn) -> Option<Session> {
+    match conn {
+        Conn::Pg(c) => sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *c)
+            .await
+            .ok()
+            .map(Session::Pg),
+        Conn::MySql(c) => sqlx::query_scalar("SELECT CAST(CONNECTION_ID() AS SIGNED)")
+            .fetch_one(&mut *c)
+            .await
+            .ok()
+            .map(Session::MySql),
+        Conn::Sqlite(_) => None,
+    }
 }
 
 async fn apply_in_session(
@@ -1111,32 +1264,78 @@ async fn apply_in_session(
     conn: &Connection,
     database: &str,
     tab_id: &str,
+    save: Option<(&str, &AtomicBool)>,
     target: &Target,
     operations: &[EditOperation],
 ) -> Result<ApplyEditsResult, AppError> {
+    let cancelled = save.map(|(_, cancelled)| cancelled);
+    let id = save.map(|(id, _)| id);
     let mut s = session::for_tab(state, conn, database, tab_id).await?;
+    let had_tx = s.tx_open;
     let r = async {
         if !s.tx_open {
             session::begin(&mut s).await?;
         }
-        s.conn.control("SAVEPOINT sandb_grid_edit").await?;
-        let failed = run_operations(&mut s.conn, target, conn.engine, operations).await;
-        if let Some(failed) = failed {
-            s.conn
-                .control("ROLLBACK TO SAVEPOINT sandb_grid_edit")
-                .await?;
-            s.conn.control("RELEASE SAVEPOINT sandb_grid_edit").await?;
-            return Ok(ApplyEditsResult {
-                failed: Some(failed),
-            });
+        if is_cancelled(cancelled) {
+            return Err(save_cancelled());
         }
-        s.conn.control("RELEASE SAVEPOINT sandb_grid_edit").await?;
-        s.dirty = true;
-        Ok(ApplyEditsResult { failed: None })
+        s.conn.control("SAVEPOINT sandb_grid_edit").await?;
+        // Attached only while the batch statements run: a cancel that arrives earlier sets the
+        // flag and sends no kill, and one that arrives later leaves no kill queued for the
+        // user's next run in this tab.
+        let attached = match id {
+            Some(id) => session_of(&mut s.conn)
+                .await
+                .map(|session| state.queries.attach(id, session)),
+            None => None,
+        };
+        let result = run_operations(&mut s.conn, target, conn.engine, operations, cancelled).await;
+        drop(attached);
+        match result {
+            // The cancel: undo the batch only, the user's transaction stays open. A kill sent
+            // just as the batch stopped can abort the transaction; the rollback retry repairs
+            // that, and the caller below reports the case where it could not.
+            Err(e) => {
+                let _ = rollback_to_savepoint(&mut s.conn, "ROLLBACK TO SAVEPOINT sandb_grid_edit")
+                    .await;
+                let _ = s.conn.control("RELEASE SAVEPOINT sandb_grid_edit").await;
+                Err(e)
+            }
+            Ok(Some(failed)) => {
+                rollback_to_savepoint(&mut s.conn, "ROLLBACK TO SAVEPOINT sandb_grid_edit").await?;
+                s.conn.control("RELEASE SAVEPOINT sandb_grid_edit").await?;
+                Ok(ApplyEditsResult {
+                    failed: Some(failed),
+                    partial: false,
+                })
+            }
+            Ok(None) => {
+                s.conn.control("RELEASE SAVEPOINT sandb_grid_edit").await?;
+                s.dirty = true;
+                Ok(ApplyEditsResult {
+                    failed: None,
+                    partial: false,
+                })
+            }
+        }
     }
     .await;
     session::refresh(&mut s).await;
     session::end_if_clean(&mut s).await;
+    // A cancel whose kill landed on the transaction can leave it aborted (or, when it was
+    // empty, gone); say so instead of only "Save cancelled".
+    let r = match r {
+        Err(e) if e.code == ErrorCode::Cancelled => {
+            if s.aborted {
+                Err(e.with_detail("The tab's transaction was aborted. Roll it back to continue."))
+            } else if had_tx && !s.tx_open {
+                Err(e.with_detail("The tab's transaction was rolled back."))
+            } else {
+                Err(e)
+            }
+        }
+        r => r,
+    };
     session::settle(state, tab_id, s).await;
     r
 }
@@ -1154,41 +1353,137 @@ pub async fn apply_edits(
             format!("Connection \"{}\" is read-only", conn.name),
         ));
     }
+    if conn.engine == Engine::Mongo {
+        return mongo::edit::apply_edits(state, &conn, request).await;
+    }
     let database = connections::target_database(&conn, Some(&request.database));
     let target = match resolve(state, &conn, &database, &request.sql).await? {
         Resolution::NotEditable(reason) => return Err(AppError::invalid(reason)),
         Resolution::Editable(target) => target,
     };
     if request.operations.is_empty() {
-        return Ok(ApplyEditsResult { failed: None });
+        return Ok(ApplyEditsResult {
+            failed: None,
+            partial: false,
+        });
     }
-    if conn.env == Env::Production
+    // The dialog's id puts the save in the editor's registry, so `cancel_query` reaches it with
+    // the one mechanism the app has: the flag stops the save, and the kill stops its statement.
+    let id = request.query_id.as_deref().filter(|id| !id.is_empty());
+    let run = match id {
+        Some(id) => Some(state.queries.register(
+            id,
+            &conn.id,
+            &database,
+            request.operations.len() + 2,
+        )?),
+        None => None,
+    };
+    let cancelled = run.as_ref().map(|r| r.cancelled.clone());
+    let flag = cancelled.as_deref();
+    if is_cancelled(flag) {
+        return Err(save_cancelled());
+    }
+    let result = if conn.env == Env::Production
         && let Some(tab_id) = request.tab_id.as_deref()
     {
-        return apply_in_session(
+        apply_in_session(
             state,
             &conn,
             &database,
             tab_id,
+            id.zip(flag),
             &target,
             &request.operations,
         )
-        .await;
-    }
-    match connections::pool_for(state, &conn.id, Some(&target.database))? {
-        DbPool::Pg(p) => {
-            let mut c = p.acquire().await?;
-            apply_autocommit(&mut *c, &target, conn.engine, &request.operations).await
+        .await
+    } else {
+        let pool = connections::pool_for(state, &conn.id, Some(&target.database))?;
+        // A cancelled save's statement may still be in flight: close that connection rather than
+        // hand a half-open one back to the pool.
+        let keep = |r: &Result<ApplyEditsResult, AppError>| {
+            !r.as_ref().is_err_and(|e| e.code == ErrorCode::Cancelled)
+        };
+        match pool {
+            DbPool::Pg(p) => {
+                let mut c = p.acquire().await?;
+                let attached = match (id, pg_pid(&mut c).await) {
+                    (Some(id), Some(pid)) => Some(state.queries.attach(id, Session::Pg(pid))),
+                    _ => None,
+                };
+                let done =
+                    run_autocommit(&mut *c, &target, conn.engine, &request.operations, flag).await;
+                drop(attached);
+                let r = match done {
+                    Ok(Some(done)) => Ok(done),
+                    Ok(None) => commit(&mut *c, flag).await,
+                    Err(e) => Err(e),
+                };
+                if !keep(&r) {
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, c.detach().close()).await;
+                }
+                r
+            }
+            DbPool::MySql(p) => {
+                let mut c = p.acquire().await?;
+                let attached = match (id, mysql_id(&mut c).await) {
+                    (Some(id), Some(thread)) => {
+                        Some(state.queries.attach(id, Session::MySql(thread)))
+                    }
+                    _ => None,
+                };
+                let done =
+                    run_autocommit(&mut *c, &target, conn.engine, &request.operations, flag).await;
+                drop(attached);
+                let r = match done {
+                    Ok(Some(done)) => Ok(done),
+                    Ok(None) => commit(&mut *c, flag).await,
+                    Err(e) => Err(e),
+                };
+                if !keep(&r) {
+                    let _ = tokio::time::timeout(CLOSE_TIMEOUT, c.detach().close()).await;
+                }
+                r
+            }
+            DbPool::Sqlite(p) => {
+                let mut c = p.acquire().await?;
+                let handle = match id {
+                    Some(id) => {
+                        let mut locked = c.lock_handle().await?;
+                        Some(state.queries.attach(
+                            id,
+                            Session::Sqlite(SqliteHandle(locked.as_raw_handle().as_ptr())),
+                        ))
+                    }
+                    None => None,
+                };
+                let done =
+                    run_autocommit(&mut *c, &target, conn.engine, &request.operations, flag).await;
+                drop(handle);
+                match done {
+                    Ok(Some(done)) => Ok(done),
+                    Ok(None) => commit(&mut *c, flag).await,
+                    Err(e) => Err(e),
+                }
+            }
         }
-        DbPool::MySql(p) => {
-            let mut c = p.acquire().await?;
-            apply_autocommit(&mut *c, &target, conn.engine, &request.operations).await
-        }
-        DbPool::Sqlite(p) => {
-            let mut c = p.acquire().await?;
-            apply_autocommit(&mut *c, &target, conn.engine, &request.operations).await
-        }
-    }
+    };
+    drop(run);
+    result
+}
+
+async fn pg_pid(c: &mut PgConnection) -> Option<i32> {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *c)
+        .await
+        .ok()
+}
+
+async fn mysql_id(c: &mut MySqlConnection) -> Option<i64> {
+    sqlx::query_scalar("SELECT CAST(CONNECTION_ID() AS SIGNED)")
+        .fetch_one(&mut *c)
+        .await
+        .ok()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1211,6 +1506,9 @@ pub async fn cell_value(
     request: CellValueRequest,
 ) -> Result<Option<String>, AppError> {
     let conn = connections::get(state, &request.conn_id)?;
+    if conn.engine == Engine::Mongo {
+        return mongo::edit::cell_value(state, &conn, request).await;
+    }
     let database = connections::target_database(&conn, Some(&request.database));
     let target = match resolve(state, &conn, &database, &request.sql).await? {
         Resolution::NotEditable(reason) => return Err(AppError::invalid(reason)),
@@ -1254,7 +1552,7 @@ pub async fn cell_value(
     let text = match engine {
         Engine::Pg => "text",
         Engine::Mysql => "CHAR",
-        Engine::Sqlite => "TEXT",
+        Engine::Sqlite | Engine::Mongo => "TEXT",
     };
     let sql = format!(
         "SELECT CAST({} AS {text}) FROM {} WHERE {predicates} LIMIT 1",
@@ -1302,7 +1600,6 @@ mod tests {
     use crate::core::connections::{ConnectionInput, SslMode};
     use crate::core::db::query::{self, RunRequest};
     use crate::core::secrets::MemoryStore;
-    use sqlx::Connection as _;
     use sqlx::sqlite::SqliteConnectOptions;
 
     async fn sqlite_state(env: Env) -> (tempfile::TempDir, AppState, String) {
@@ -1344,6 +1641,9 @@ mod tests {
                 ai_write: false,
                 read_only: false,
                 version: None,
+                uri: String::new(),
+                auth_source: String::new(),
+                topology: None,
             },
             None,
         )
@@ -1363,6 +1663,8 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.clone()))
                 .collect(),
+            old: BTreeMap::new(),
+            document: None,
         }
     }
 
@@ -1379,6 +1681,7 @@ mod tests {
                 database: "main".into(),
                 sql: "SELECT id, name, age FROM users".into(),
                 tab_id: tab_id.map(str::to_string),
+                query_id: None,
                 operations,
             },
         )
@@ -1462,6 +1765,7 @@ mod tests {
                 schema: Some("public".into()),
                 pk: vec!["id".into()],
                 reason: None,
+                transactions: None,
             },
             database: "db".into(),
             relation: "\"public\".\"user\"".into(),
@@ -1478,6 +1782,8 @@ mod tests {
                 "name".into(),
                 Value::String("x'; DROP TABLE user; --".into()),
             )]),
+            old: BTreeMap::new(),
+            document: None,
         };
         let (sql, binds) = operation_sql(&target, Engine::Pg, &op).unwrap();
         assert_eq!(
@@ -1502,6 +1808,7 @@ mod tests {
                     schema: Some("public".into()),
                     pk: vec!["id".into()],
                     reason: None,
+                    transactions: None,
                 },
                 database: "db".into(),
                 relation: "\"public\".\"t\"".into(),
@@ -1515,6 +1822,8 @@ mod tests {
                 kind: EditKind::Update,
                 pk: BTreeMap::from([("id".into(), Value::from("key"))]),
                 set: BTreeMap::from([("value".into(), Value::from("new"))]),
+                old: BTreeMap::new(),
+                document: None,
             };
             operation_sql(&target, Engine::Pg, &op).unwrap().0
         };
@@ -1580,6 +1889,7 @@ mod tests {
                 schema: None,
                 pk: vec!["id".into()],
                 reason: None,
+                transactions: None,
             },
             database: "main".into(),
             relation: "\"main\".\"t\"".into(),
@@ -1590,6 +1900,8 @@ mod tests {
             kind: EditKind::Insert,
             pk: BTreeMap::new(),
             set: BTreeMap::new(),
+            old: BTreeMap::new(),
+            document: None,
         };
         let (sql, binds) = operation_sql(&target, Engine::Sqlite, &op).unwrap();
         assert_eq!(sql, "INSERT INTO \"main\".\"t\" DEFAULT VALUES");
@@ -1731,6 +2043,7 @@ mod tests {
                 database: "main".into(),
                 sql: "SELECT id, payload FROM docs".into(),
                 tab_id: None,
+                query_id: None,
                 operations: vec![
                     op(
                         EditKind::Insert,
@@ -1844,7 +2157,11 @@ mod tests {
         .unwrap();
         assert_eq!(request.tab_id.as_deref(), Some("tab"));
         assert_eq!(
-            serde_json::to_value(ApplyEditsResult { failed: None }).unwrap(),
+            serde_json::to_value(ApplyEditsResult {
+                failed: None,
+                partial: false
+            })
+            .unwrap(),
             serde_json::json!({})
         );
         assert_eq!(
@@ -1853,6 +2170,7 @@ mod tests {
                 schema: None,
                 pk: vec!["id".into()],
                 reason: None,
+                transactions: None,
             })
             .unwrap(),
             serde_json::json!({"table": "t", "pk": ["id"]})

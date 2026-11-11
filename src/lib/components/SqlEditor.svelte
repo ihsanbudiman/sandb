@@ -3,18 +3,23 @@
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
   import { EditorState, Compartment, type Text } from '@codemirror/state';
   import { defaultKeymap, history, historyKeymap, selectAll as selectAllCmd } from '@codemirror/commands';
-  import { sql, PostgreSQL, MySQL, SQLite } from '@codemirror/lang-sql';
+  import { sql, PostgreSQL, MySQL, SQLite, StandardSQL } from '@codemirror/lang-sql';
+  import { javascript } from '@codemirror/lang-javascript';
   import { syntaxHighlighting, HighlightStyle, syntaxTree, foldService, foldGutter, foldedRanges, foldEffect, unfoldEffect, foldAll, unfoldAll, codeFolding } from '@codemirror/language';
   import { autocompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
   import { tags as t } from '@lezer/highlight';
   import { columnCompletion } from '../sql/columns';
   import { statementRanges, maskLiterals, type Dialect } from '../sql/text';
+  import { mongoStatementRanges } from '../mongo/text';
+  import { formatSql } from '../sql/format';
+  import { formatMongo } from '../mongo/format';
 
   let {
     value = $bindable(''),
     onrun,
     onrunnew,
     onrunall,
+    onformat,
     schema = {},
     dialect = 'pg',
     columnsOf,
@@ -26,18 +31,33 @@
     onrunnew?: () => void;
     /** Runs every statement in the editor (Alt+X, as in DBeaver). */
     onrunall?: () => void;
+    /** Formats the selection, or all the text (⇧⌘F). */
+    onformat?: () => void;
     schema?: Record<string, string[]>;
-    dialect?: 'pg' | 'mysql' | 'sqlite';
+    dialect?: Dialect;
     /** Columns of a table that `schema` holds without columns (or not under this name); [] when unknown. */
     columnsOf?: (path: string[]) => Promise<string[]>;
   } = $props();
 
   const lang = new Compartment();
-  const langExt = () => sql({ dialect: { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite }[dialect], schema, upperCaseKeywords: true });
+  // A mongo tab speaks mongosh (JavaScript with `db.` calls), not SQL.
+  const langExt = () =>
+    dialect === 'mongo'
+      ? javascript()
+      : sql({ dialect: { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite, mongo: StandardSQL }[dialect], schema, upperCaseKeywords: true });
 
   // Fetched columns per `schema` object; a new snapshot clears them.
   let fetched = new Map<string, Promise<string[]>>();
   let fetchedFor: Record<string, string[]> | undefined;
+
+  /** Methods of `db.<coll>` that the backend parses; the plan's list. */
+  const mongoMethods = ['find', 'findOne', 'aggregate', 'countDocuments', 'estimatedDocumentCount', 'distinct', 'getIndexes', 'stats', 'insertOne', 'insertMany', 'updateOne', 'updateMany', 'replaceOne', 'deleteOne', 'deleteMany', 'findOneAndUpdate', 'findOneAndReplace', 'findOneAndDelete', 'bulkWrite', 'createIndex', 'createIndexes', 'dropIndex', 'dropIndexes', 'drop', 'renameCollection', 'createCollection'];
+  /** Cursor methods after `find(...)`. */
+  const mongoCursorMethods = ['sort', 'limit', 'skip', 'project', 'hint', 'collation', 'count', 'toArray'];
+  /** Helpers directly on `db` besides the collections. */
+  const mongoDbHelpers = ['getCollection', 'runCommand', 'adminCommand', 'createCollection', 'dropDatabase'];
+  /** Query, update and aggregation operators. */
+  const mongoOps = ['$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin', '$and', '$or', '$nor', '$not', '$exists', '$type', '$regex', '$elemMatch', '$size', '$all', '$set', '$unset', '$inc', '$push', '$pull', '$addToSet', '$match', '$group', '$project', '$sort', '$limit', '$skip', '$lookup', '$unwind', '$addFields', '$count', '$facet', '$sum', '$avg', '$min', '$max', '$first', '$last'];
 
   /** `FROM t a` / `FROM t AS a` aliases of the statement at `pos` → table path. Same scan as lang-sql. */
   function aliasesAt(state: EditorState, pos: number): Record<string, string[]> {
@@ -108,6 +128,45 @@
   /** Columns of the tables in the statement at the cursor, so a plain `SELECT col…` lists them. */
   const columnsInScope = (ctx: CompletionContext) => columnCompletion(ctx, { dialect, schema, load: loadColumns });
 
+  /** Statement ranges of the editor text: mongosh splitting for mongo, SQL splitting otherwise. */
+  const rangesOf = (doc: string, blankLines = false): { from: number; to: number }[] =>
+    dialect === 'mongo' ? mongoStatementRanges(doc) : statementRanges(doc, dialect, blankLines).map(([from, to]) => ({ from, to }));
+
+  /** The collection a `db.<coll>.` / `db.getCollection("<coll>").` call before `pos` targets, or ''. */
+  function mongoCollectionBefore(state: EditorState, pos: number): string {
+    const before = state.sliceDoc(0, pos);
+    const m = /\bdb\.(?:getCollection\(\s*(['"])([^'"]+)\1\s*\)|([\w$]+))\.[\w$]*\([^()]*$/.exec(before);
+    return m ? m[2] ?? m[3] : '';
+  }
+
+  /** Mongosh completions: collections after `db.`, methods after `db.<coll>.`, `$` operators in args. */
+  function mongoCompletions(ctx: CompletionContext): CompletionResult | null {
+    const line = ctx.state.sliceDoc(ctx.state.doc.lineAt(ctx.pos).from, ctx.pos);
+    const word = /\w*$/.exec(line)?.[0] ?? '';
+    // `$` operators inside filter/update documents.
+    if (word.startsWith('$')) return { from: ctx.pos - word.length, options: mongoOps.map((label) => ({ label, type: 'keyword' })), validFor: /^[\w$]*$/ };
+    // Methods after `db.<coll>.` or `db.getCollection("<coll>").`.
+    if (/\bdb\.(?:[\w$]+|getCollection\(\s*(['"])[^'"]+\1\s*\))\.[\w$]*$/.test(line))
+      return { from: ctx.pos - word.length, options: mongoMethods.map((label) => ({ label, type: 'method' })), validFor: /^[\w$]*$/ };
+    // Cursor methods after a `find(...)` call, possibly chained.
+    if (/\bfind\([^()]*\)\s*(?:\.\w+\(\)\s*)*\.$/.test(line))
+      return { from: ctx.pos - word.length, options: mongoCursorMethods.map((label) => ({ label, type: 'method' })), validFor: /^[\w$]*$/ };
+    // Collections after `db.`, plus the shell helpers that take one further step.
+    if (/\bdb\.[\w$]*$/.test(line)) {
+      const cols = Object.keys(schema).map((k) => k.split('.').at(-1)!);
+      const opts = [...new Set([...cols, ...mongoDbHelpers])].map((label) => ({ label, type: 'property' }));
+      return { from: ctx.pos - word.length, options: opts, validFor: /^[\w$]*$/ };
+    }
+    // Field paths inside the argument braces of a `db.<coll>.<method>(` call.
+    const coll = mongoCollectionBefore(ctx.state, ctx.pos);
+    if (coll) {
+      const fields = schema[coll] ?? [];
+      const opts = fields.map((f) => (f.includes('.') ? { label: f, apply: `"${f}"`, type: 'property' } : { label: f, type: 'property' }));
+      if (opts.length) return { from: ctx.pos - word.length, options: opts, validFor: /^[\w$]*$/ };
+    }
+    return null;
+  }
+
   export function focus() {
     view?.focus();
   }
@@ -130,6 +189,21 @@
     view?.focus();
   }
 
+  /**
+   * Formats the selection, or all the text when nothing is selected, as one undo step. The
+   * formatted selection stays selected. Throws when the text cannot be read (unbalanced brackets,
+   * an unclosed string, SQL that the formatter does not know).
+   */
+  export function format() {
+    if (!view) return;
+    const r = view.state.selection.main;
+    const [from, to] = r.empty ? [0, view.state.doc.length] : [r.from, r.to];
+    const text = view.state.sliceDoc(from, to);
+    const out = dialect === 'mongo' ? formatMongo(text) : formatSql(text, dialect);
+    if (out !== text) view.dispatch({ changes: { from, to, insert: out }, selection: r.empty ? undefined : { anchor: from, head: from + out.length }, scrollIntoView: true });
+    view.focus();
+  }
+
   /** A right-click outside the selection puts the cursor there, so "statement at cursor" is the clicked one. */
   export function pointAt(x: number, y: number) {
     const pos = view?.posAtCoords({ x, y });
@@ -146,8 +220,8 @@
     if (!view) return '';
     const doc = view.state.doc.toString();
     const head = view.state.selection.main.head;
-    const parts = statementRanges(doc, dialect, true)
-      .map(([from, to]) => ({ to, text: doc.slice(from, to).trim() }))
+    const parts = rangesOf(doc, true)
+      .map(({ from, to }) => ({ to, text: doc.slice(from, to).trim() }))
       .filter((p) => p.text && p.text !== ';');
     return (parts.find((p) => head <= p.to) ?? parts.at(-1))?.text ?? '';
   }
@@ -162,7 +236,7 @@
     if (state.doc === foldDoc && dialect === foldDialect) return folds;
     const doc = state.doc.toString();
     const out: Fold[] = [];
-    for (const [from, to] of statementRanges(doc, dialect, true)) {
+    for (const { from, to } of rangesOf(doc, true)) {
       const raw = doc.slice(from, to);
       // Comments and strings are blanked; a comments-only range gets nothing.
       const masked = maskLiterals(raw, dialect);
@@ -220,7 +294,8 @@
     '&.cm-focused': { outline: 'none' },
     '.cm-scroller': { fontFamily: "'JetBrains Mono Variable', ui-monospace, monospace", lineHeight: '1.6' },
     '.cm-content': { padding: '2px 0 8px' },
-    '.cm-gutters': { backgroundColor: 'transparent', border: 'none', color: 'var(--c-faint)', paddingLeft: '10px', paddingRight: '4px' },
+    // Opaque: the gutter is sticky, and code scrolled sideways under a transparent gutter shows through the line numbers.
+    '.cm-gutters': { backgroundColor: 'var(--c-surface)', border: 'none', color: 'var(--c-faint)', paddingLeft: '10px', paddingRight: '4px' },
     '.cm-foldGutter .cm-gutterElement': { display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '0 2px' },
     '.cm-fold-chevron': { display: 'grid', placeItems: 'center', width: '14px', height: '18px', color: 'var(--c-faint)', cursor: 'pointer' },
     '.cm-fold-chevron:hover': { color: 'var(--c-ink)' },
@@ -252,6 +327,7 @@
             { key: 'Mod-Enter', run: () => (onrun?.(), true) },
             { key: 'Mod-Shift-Enter', run: () => (onrunnew?.(), true) },
             { key: 'Alt-x', run: () => (onrunall?.(), true) },
+            { key: 'Mod-Shift-f', run: () => (onformat?.(), true) },
             { key: 'Mod-Alt-[', run: toggleStatementFold },
             { key: 'Ctrl-Alt-[', run: foldAll },
             { key: 'Ctrl-Alt-]', run: unfoldAll },
@@ -260,7 +336,9 @@
           ]),
           lang.of(langExt()),
           autocompletion(),
-          EditorState.languageData.of(() => [{ autocomplete: columnsInScope }, { autocomplete: lazyColumns }]),
+          EditorState.languageData.of(() =>
+            dialect === 'mongo' ? [{ autocomplete: mongoCompletions }] : [{ autocomplete: columnsInScope }, { autocomplete: lazyColumns }],
+          ),
           syntaxHighlighting(hl),
           theme,
           EditorView.updateListener.of((u) => {

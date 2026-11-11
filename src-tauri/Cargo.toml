@@ -55,6 +55,14 @@ tokio-util = { version = "0.7", default-features = false }
 keyring = "4.2"
 # Local date of the machine for the AI prompt ("today", "last month").
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# MongoDB engine. Default features: rustls with ring (as above) and the DNS resolver for `mongodb+srv://`.
+mongodb = "3.10"
 
 [dev-dependencies]
 tempfile = "3"
+
+# mongodb 3.10.0 with one change in `src/client/auth/scram.rs`: when the server ignores
+# `skipEmptyExchange` (Azure Cosmos DB for MongoDB) and its final SCRAM reply has `done: false`,
+# the driver sends the empty `saslContinue` the server waits for. Remove when upstream has it.
+[patch.crates-io]
+mongodb = { path = "vendor/mongodb" }

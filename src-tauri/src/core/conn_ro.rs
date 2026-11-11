@@ -140,6 +140,8 @@ fn escapes(engine: Engine, s: &[String]) -> bool {
                 || (starts(s, &["BEGIN"]) && read_write_in(s))
         }
         Engine::Sqlite => is(s, 0, "PRAGMA") && s.iter().skip(1).any(|w| w == "QUERY_ONLY"),
+        // No SQL runs on a Mongo connection; refuse everything if text ever gets here.
+        Engine::Mongo => true,
     }
 }
 
@@ -265,6 +267,9 @@ mod tests {
             file: String::new(),
             ai_write: false,
             read_only: true,
+            uri: String::new(),
+            auth_source: String::new(),
+            topology: None,
         }
     }
 

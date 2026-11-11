@@ -25,7 +25,8 @@
   ];
 
   const control = 'h-7 rounded-md border border-line bg-field px-2 text-[12px] text-ink outline-none focus:border-accent/70 focus:ring-2 focus:ring-accent/15';
-  const isText = (column: string) => /char|text|uuid|json|xml|citext/i.test(types[columns.indexOf(column)] ?? 'text');
+  // Mongo columns type their fields `string` (or a union containing it); SQL uses char/text/...
+  const isText = (column: string) => /char|text|uuid|json|xml|citext|string/i.test(types[columns.indexOf(column)] ?? 'text');
 
   function addFilter() {
     if (!columns.length) return;

@@ -6,6 +6,7 @@ pub mod connections;
 pub mod db;
 pub mod error;
 pub mod guard;
+pub mod mongo;
 pub mod secrets;
 pub mod sql;
 pub mod state;

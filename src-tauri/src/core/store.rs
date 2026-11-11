@@ -126,6 +126,9 @@ mod tests {
             file: String::new(),
             ai_write: false,
             read_only: false,
+            uri: String::new(),
+            auth_source: String::new(),
+            topology: None,
         }
     }
 

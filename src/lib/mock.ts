@@ -1,4 +1,4 @@
-import type { CellValue, EditableResult, ResultSort } from './api';
+import type { CellValue, EditableResult, ResultSort, TypedValue } from './api';
 import { filterRows, type TableFilter } from './tableActions';
 
 export type Cell = CellValue;
@@ -34,6 +34,12 @@ export interface QueryResult {
   notices?: string[];
   /** From a real database (not the in-memory mock). */
   live?: boolean;
+  /** MongoDB only: each document of the page as relaxed Extended JSON, one per row; the JSON view and Copy value read them. */
+  documents?: unknown[];
+  /** MongoDB only: BSON type of each cell, same shape as `rows`; "missing" when the document has no such field. */
+  cellTypes?: string[][];
+  /** MongoDB edits: full cell values loaded with `cellValue`, by row index and path; an update uses them as its old values. */
+  loaded?: Record<number, Record<string, TypedValue>>;
 }
 
 export type Schema = Record<string, string[]>;
@@ -64,7 +70,8 @@ export const schemas: Record<string, Schema> = {
 
 // Tables outside the engine's default schema. Table names are unique across the mock data.
 const tableNs: Record<string, string> = { daily_revenue: 'analytics', events: 'analytics' };
-const defaultNs = { pg: 'public', mysql: 'shop', sqlite: 'main' } as const;
+// MongoDB has no SQL namespace; no SQL view opens on it.
+const defaultNs = { pg: 'public', mysql: 'shop', sqlite: 'main', mongo: '' } as const;
 export const nsOf = (engine: keyof typeof defaultNs, table: string) => tableNs[table] ?? defaultNs[engine];
 
 const names = ['Livia Saris', 'Jaydon Aminoff', 'Maria Lubin', 'Ann Press', 'John Clarkson', 'Aspen Lubin', 'Kierra Gouse', 'Omar Dias', 'Mila Novak', 'Theo Grant'];

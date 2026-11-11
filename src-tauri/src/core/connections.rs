@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::db::pool::{self, DbPool};
 use crate::core::error::AppError;
+use crate::core::mongo;
 use crate::core::secrets::password_account;
 use crate::core::state::AppState;
 
@@ -18,6 +19,7 @@ pub enum Engine {
     Pg,
     Mysql,
     Sqlite,
+    Mongo,
 }
 
 impl Engine {
@@ -26,6 +28,7 @@ impl Engine {
             Engine::Pg => 5432,
             Engine::Mysql => 3306,
             Engine::Sqlite => 0,
+            Engine::Mongo => 27017,
         }
     }
 }
@@ -46,6 +49,16 @@ pub enum SslMode {
     #[default]
     Prefer,
     Require,
+}
+
+/// The kind of MongoDB deployment, from the last successful test. Later phases need it: only a
+/// replica set or a sharded cluster has transactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Topology {
+    Standalone,
+    ReplicaSet,
+    Sharded,
 }
 
 /// A saved connection. The password is never part of it: it lives in the secret store only.
@@ -80,6 +93,16 @@ pub struct Connection {
     /// before phase 3b, so `false`.
     #[serde(default)]
     pub read_only: bool,
+    /// MongoDB connection string WITHOUT the password; empty when the fields are used. The
+    /// password of the string lives in the secret store, like every other password.
+    #[serde(default)]
+    pub uri: String,
+    /// MongoDB `authSource` for the fields; empty is the driver default.
+    #[serde(default)]
+    pub auth_source: String,
+    /// MongoDB only, from the last successful test.
+    #[serde(default)]
+    pub topology: Option<Topology>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +128,14 @@ pub struct ConnectionInput {
     pub ai_write: bool,
     #[serde(default)]
     pub read_only: bool,
+    /// MongoDB connection string as typed, password included: `normalize` takes the password out.
+    #[serde(default)]
+    pub uri: String,
+    #[serde(default)]
+    pub auth_source: String,
+    /// Topology reported by a test run in the dialog. `None` keeps the stored one.
+    #[serde(default)]
+    pub topology: Option<Topology>,
     /// Version reported by a test run in the dialog. `None` keeps the stored one.
     #[serde(default)]
     pub version: Option<String>,
@@ -115,6 +146,8 @@ pub struct ConnectionInput {
 pub struct TestResult {
     pub server_version: String,
     pub latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<Topology>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -122,13 +155,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Trims fields and fills engine defaults. `require_name` is off for a test run from an unnamed form.
-fn normalize(input: ConnectionInput, require_name: bool) -> Result<ConnectionInput, AppError> {
+/// The second value is the password of a MongoDB connection string; it overrides the password
+/// argument of the caller.
+fn normalize(
+    input: ConnectionInput,
+    require_name: bool,
+) -> Result<(ConnectionInput, Option<String>), AppError> {
     let mut i = input;
     i.name = i.name.trim().to_string();
     i.host = i.host.trim().to_string();
     i.database = i.database.trim().to_string();
     i.user = i.user.trim().to_string();
     i.file = i.file.trim().to_string();
+    i.uri = i.uri.trim().to_string();
+    i.auth_source = i.auth_source.trim().to_string();
     if require_name && i.name.is_empty() {
         return Err(AppError::invalid("Name is required"));
     }
@@ -136,6 +176,7 @@ fn normalize(input: ConnectionInput, require_name: bool) -> Result<ConnectionInp
     if i.read_only {
         i.ai_write = false;
     }
+    let mut uri_password = None;
     match i.engine {
         Engine::Sqlite => {
             if i.file.is_empty() {
@@ -161,11 +202,47 @@ fn normalize(input: ConnectionInput, require_name: bool) -> Result<ConnectionInp
             }
             i.file.clear();
         }
+        // The database and the user are optional: a server can run without auth, and the
+        // databases are listed from the server.
+        Engine::Mongo => {
+            i.file.clear();
+            if !i.uri.is_empty() {
+                // The string decides; the fields only show what it says.
+                let p = mongo::conn::parse_uri(&i.uri)?;
+                i.uri = p.redacted;
+                i.host = p.host;
+                i.port = p.port;
+                i.user = p.user;
+                i.database = p.database;
+                i.auth_source = p.auth_source;
+                i.ssl = p.ssl;
+                uri_password = p.password;
+            } else if i.host.is_empty() {
+                return Err(AppError::invalid("Host is required"));
+            } else if i.ssl == SslMode::Prefer {
+                return Err(AppError::invalid(
+                    "MongoDB has no Prefer TLS mode. Choose Disable or Require.",
+                ));
+            }
+            if i.port == 0 {
+                i.port = i.engine.default_port();
+            }
+        }
     }
-    Ok(i)
+    if i.engine != Engine::Mongo {
+        i.uri.clear();
+        i.auth_source.clear();
+        i.topology = None;
+    }
+    Ok((i, uri_password))
 }
 
-fn build(id: String, i: ConnectionInput, prev_version: &str) -> Connection {
+fn build(
+    id: String,
+    i: ConnectionInput,
+    prev_version: &str,
+    prev_topology: Option<Topology>,
+) -> Connection {
     Connection {
         id,
         name: i.name,
@@ -180,6 +257,12 @@ fn build(id: String, i: ConnectionInput, prev_version: &str) -> Connection {
         file: i.file,
         ai_write: i.ai_write,
         read_only: i.read_only,
+        topology: match i.engine {
+            Engine::Mongo => i.topology.or(prev_topology),
+            _ => None,
+        },
+        uri: i.uri,
+        auth_source: i.auth_source,
     }
 }
 
@@ -197,6 +280,9 @@ fn input_of(c: &Connection) -> ConnectionInput {
         ai_write: c.ai_write,
         read_only: c.read_only,
         version: Some(c.version.clone()),
+        uri: c.uri.clone(),
+        auth_source: c.auth_source.clone(),
+        topology: c.topology,
     }
 }
 
@@ -216,11 +302,13 @@ fn reuse_secret(
     src: &Connection,
     target: &ConnectionInput,
 ) -> Result<Option<String>, AppError> {
+    // `uri` is saved without the password, so a changed host list or SRV host shows here.
     let same = src.engine == target.engine
         && src.host == target.host
         && src.port == target.port
         && src.user == target.user
-        && src.file == target.file;
+        && src.file == target.file
+        && src.uri == target.uri;
     if !same {
         return Err(AppError::invalid(
             "Enter the password to test changed connection settings",
@@ -266,9 +354,9 @@ pub fn create(
     input: ConnectionInput,
     password: Option<String>,
 ) -> Result<Connection, AppError> {
-    let i = normalize(input, true)?;
-    let conn = build(uuid::Uuid::new_v4().to_string(), i, "");
-    insert(state, conn, password.as_deref())
+    let (i, uri_password) = normalize(input, true)?;
+    let conn = build(uuid::Uuid::new_v4().to_string(), i, "", None);
+    insert(state, conn, uri_password.or(password).as_deref())
 }
 
 /// `password: None` keeps the stored secret; `Some("")` clears it.
@@ -278,7 +366,8 @@ pub async fn update(
     input: ConnectionInput,
     password: Option<String>,
 ) -> Result<Connection, AppError> {
-    let i = normalize(input, true)?;
+    let (i, uri_password) = normalize(input, true)?;
+    let password = uri_password.or(password);
     let updated = {
         let mut list = lock(&state.connections);
         let pos = list
@@ -290,7 +379,7 @@ pub async fn update(
                 "The engine of a saved connection cannot change",
             ));
         }
-        let updated = build(id.to_string(), i, &list[pos].version);
+        let updated = build(id.to_string(), i, &list[pos].version, list[pos].topology);
         let mut next = list.clone();
         next[pos] = updated.clone();
         // Secret first, so the JSON never points at settings whose password was not saved.
@@ -317,6 +406,7 @@ pub async fn update(
     state.sessions.close_conn(id).await;
     // After the new secret is stored, so a pool reopened right away cannot pick up the old one.
     state.pools.close(id).await;
+    state.mongo.close(id).await;
     Ok(updated)
 }
 
@@ -330,7 +420,7 @@ pub fn duplicate(
     password: Option<String>,
 ) -> Result<Connection, AppError> {
     let src = find(state, id)?;
-    let i = match input {
+    let (i, uri_password) = match input {
         Some(i) => {
             if i.engine != src.engine {
                 return Err(AppError::invalid(
@@ -343,14 +433,19 @@ pub fn duplicate(
             let mut i = input_of(&src);
             i.name = format!("{} (copy)", src.name);
             i.ai_write = false;
-            i
+            (i, None)
         }
     };
-    let password = match password {
+    let password = match uri_password.or(password) {
         Some(p) => Some(p),
         None => reuse_secret(state, &src, &i)?,
     };
-    let conn = build(uuid::Uuid::new_v4().to_string(), i, &src.version);
+    let conn = build(
+        uuid::Uuid::new_v4().to_string(),
+        i,
+        &src.version,
+        src.topology,
+    );
     insert(state, conn, password.as_deref())
 }
 
@@ -372,7 +467,27 @@ pub async fn delete(state: &AppState, id: &str) -> Result<(), AppError> {
     }
     state.sessions.close_conn(id).await;
     state.pools.close(id).await;
+    state.mongo.close(id).await;
     Ok(())
+}
+
+/// Saves the list in the order of `ids`. `ids` must name every saved connection once, so a stale
+/// order (a connection added or deleted in between) is rejected instead of dropping one.
+pub fn reorder(state: &AppState, ids: &[String]) -> Result<Vec<Connection>, AppError> {
+    let mut list = lock(&state.connections);
+    let mut next = Vec::with_capacity(list.len());
+    for id in ids {
+        match list.iter().find(|c| &c.id == id) {
+            Some(c) if !next.iter().any(|n: &Connection| n.id == c.id) => next.push(c.clone()),
+            _ => return Err(AppError::invalid("The connection order is out of date")),
+        }
+    }
+    if next.len() != list.len() {
+        return Err(AppError::invalid("The connection order is out of date"));
+    }
+    state.store.save_connections(&next)?;
+    *list = next.clone();
+    Ok(next)
 }
 
 /// Tests the settings in `input` (saved or not). Password: the given one, else the stored one of `id`.
@@ -382,18 +497,19 @@ pub async fn test(
     password: Option<String>,
     id: Option<&str>,
 ) -> Result<TestResult, AppError> {
-    let i = normalize(input, false)?;
-    let password = match (password, id) {
+    let (i, uri_password) = normalize(input, false)?;
+    let password = match (uri_password.or(password), id) {
         (Some(p), _) => Some(p),
         (None, Some(id)) => reuse_secret(state, &find(state, id)?, &i)?,
         (None, None) => None,
     };
-    let conn = build(String::new(), i, "");
+    let conn = build(String::new(), i, "", None);
     let started = Instant::now();
-    let server_version = pool::probe(&conn, password.as_deref()).await?;
+    let info = pool::probe(&conn, password.as_deref()).await?;
     Ok(TestResult {
-        server_version,
+        server_version: info.version,
         latency_ms: started.elapsed().as_millis() as u64,
+        topology: info.topology,
     })
 }
 
@@ -474,6 +590,9 @@ mod tests {
             ai_write: false,
             read_only: false,
             version: None,
+            uri: String::new(),
+            auth_source: String::new(),
+            topology: None,
         }
     }
 
@@ -491,6 +610,9 @@ mod tests {
             ai_write: false,
             read_only: false,
             version: None,
+            uri: String::new(),
+            auth_source: String::new(),
+            topology: None,
         }
     }
 
@@ -623,6 +745,30 @@ mod tests {
             ),
             ("main", "", "", 0)
         );
+    }
+
+    #[test]
+    fn reorder_persists_and_rejects_stale_orders() {
+        let (dir, st) = state();
+        let a = create(&st, pg_input("a"), None).unwrap();
+        let b = create(&st, pg_input("b"), None).unwrap();
+        let c = create(&st, pg_input("c"), None).unwrap();
+        let ids = |v: &[&Connection]| v.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+        reorder(&st, &ids(&[&c, &a, &b])).unwrap();
+        let reloaded = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
+        assert_eq!(list(&reloaded), vec![c.clone(), a.clone(), b.clone()]);
+        // Missing, duplicated or unknown ids would drop or invent a connection: the order is kept.
+        for bad in [
+            ids(&[&a, &b]),
+            ids(&[&a, &a, &b]),
+            vec![a.id.clone(), b.id.clone(), "x".into()],
+        ] {
+            assert_eq!(
+                reorder(&st, &bad).unwrap_err().code,
+                ErrorCode::InvalidInput
+            );
+        }
+        assert_eq!(list(&st), vec![c, a, b]);
     }
 
     #[tokio::test]
@@ -840,6 +986,127 @@ mod tests {
         assert_eq!(secret(&st, &d.id).as_deref(), Some("typed"));
     }
 
+    fn mongo_input(name: &str, uri: &str) -> ConnectionInput {
+        ConnectionInput {
+            engine: Engine::Mongo,
+            database: String::new(),
+            user: String::new(),
+            ssl: SslMode::Disable,
+            uri: uri.into(),
+            ..pg_input(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn mongo_string_password_lives_in_the_secret_store_only() {
+        let (dir, st) = state();
+        let typed = format!("mongodb://ann:{PW}@db1:27018,db2/shop?authSource=admin");
+        let c = create(&st, mongo_input("m", &typed), None).unwrap();
+        assert_eq!(c.uri, "mongodb://ann@db1:27018,db2/shop?authSource=admin");
+        assert_eq!(
+            (
+                c.host.as_str(),
+                c.port,
+                c.user.as_str(),
+                c.database.as_str()
+            ),
+            ("db1,db2", 27018, "ann", "shop")
+        );
+        assert_eq!(c.auth_source, "admin");
+        assert_eq!(secret(&st, &c.id).as_deref(), Some(PW));
+        let raw = std::fs::read_to_string(dir.path().join(CONNECTIONS_FILE)).unwrap();
+        assert!(!raw.contains(PW), "password leaked into connections.json");
+
+        // The dialog sends back the saved string: the stored password stays.
+        let same = mongo_input("renamed", &c.uri);
+        update(&st, &c.id, same, None).await.unwrap();
+        assert_eq!(secret(&st, &c.id).as_deref(), Some(PW));
+        // A password typed into the string replaces it, even over the password argument.
+        let new = mongo_input("m", "mongodb://ann:n3w@db1:27018,db2/shop?authSource=admin");
+        update(&st, &c.id, new, Some("ignored".into()))
+            .await
+            .unwrap();
+        assert_eq!(secret(&st, &c.id).as_deref(), Some("n3w"));
+    }
+
+    #[tokio::test]
+    async fn mongo_secret_never_follows_a_changed_host_list_or_srv_host() {
+        let (_d, st, spy) = spy_state();
+        let list_conn = create(
+            &st,
+            mongo_input("a", &format!("mongodb://ann:{PW}@db1,db2/shop")),
+            None,
+        )
+        .unwrap();
+        let srv_conn = create(
+            &st,
+            mongo_input(
+                "b",
+                &format!("mongodb+srv://ann:{PW}@cluster0.example.net/shop"),
+            ),
+            None,
+        )
+        .unwrap();
+        for (id, uri) in [
+            (&list_conn.id, "mongodb://ann@db1,attacker.example/shop"),
+            (&list_conn.id, "mongodb://ann@db1/shop"),
+            (&srv_conn.id, "mongodb+srv://ann@attacker.example/shop"),
+            (&srv_conn.id, "mongodb://ann@cluster0.example.net/shop"),
+        ] {
+            let e = test(&st, mongo_input("x", uri), None, Some(id))
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidInput, "{uri}: {e:?}");
+            let e = duplicate(&st, id, Some(mongo_input("x", uri)), None).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidInput, "{uri}: {e:?}");
+        }
+        assert!(spy.gets().is_empty(), "stored secret must not be read");
+        assert_eq!(list(&st).len(), 2);
+        // The same target gets the copy.
+        let d = duplicate(&st, &srv_conn.id, None, None).unwrap();
+        assert_eq!(secret(&st, &d.id).as_deref(), Some(PW));
+    }
+
+    #[test]
+    fn mongo_fields_rules() {
+        let (_d, st) = state();
+        let mut i = mongo_input("m", "");
+        i.host = "127.0.0.1".into();
+        // Database and user are optional; the port gets the Mongo default.
+        let c = create(&st, i.clone(), None).unwrap();
+        assert_eq!(
+            (c.port, c.database.as_str(), c.user.as_str()),
+            (27017, "", "")
+        );
+        let mut prefer = i.clone();
+        prefer.ssl = SslMode::Prefer;
+        assert_eq!(
+            create(&st, prefer, None).unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
+        let mut no_host = i.clone();
+        no_host.host.clear();
+        assert_eq!(
+            create(&st, no_host, None).unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
+        let bad = mongo_input("m", "mongodb://h:notaport");
+        assert_eq!(
+            create(&st, bad, None).unwrap_err().code,
+            ErrorCode::InvalidInput
+        );
+        // Mongo-only fields never stick to a SQL connection.
+        let mut pg = pg_input("p");
+        pg.uri = "mongodb://h".into();
+        pg.auth_source = "admin".into();
+        pg.topology = Some(Topology::ReplicaSet);
+        let p = create(&st, pg, None).unwrap();
+        assert_eq!(
+            (p.uri.as_str(), p.auth_source.as_str(), p.topology),
+            ("", "", None)
+        );
+    }
+
     #[tokio::test]
     async fn delete_keeps_connection_when_secret_delete_fails() {
         let (dir, st, spy) = spy_state();
@@ -922,8 +1189,22 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "aiWrite", "database", "engine", "env", "file", "host", "id", "name", "port",
-                "readOnly", "ssl", "user", "version"
+                "aiWrite",
+                "authSource",
+                "database",
+                "engine",
+                "env",
+                "file",
+                "host",
+                "id",
+                "name",
+                "port",
+                "readOnly",
+                "ssl",
+                "topology",
+                "uri",
+                "user",
+                "version"
             ]
         );
         assert_eq!(v["engine"], "pg");

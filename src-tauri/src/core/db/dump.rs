@@ -17,6 +17,7 @@ use crate::core::db::introspect::not_found_table;
 use crate::core::db::pool::DbPool;
 use crate::core::db::value::SqliteRaw;
 use crate::core::error::AppError;
+use crate::core::mongo;
 use crate::core::state::AppState;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -35,7 +36,8 @@ pub struct TableExportRequest {
 /// Rows per INSERT statement.
 const BATCH: usize = 100;
 
-/// The DDL of one table or view, as statements that each end with `;`.
+/// The DDL of one table or view, as statements that each end with `;`. On MongoDB: the mongosh
+/// text that creates the collection with its options, validator and indexes.
 pub async fn table_ddl(
     state: &AppState,
     conn_id: &str,
@@ -43,6 +45,14 @@ pub async fn table_ddl(
     schema: Option<&str>,
     table: &str,
 ) -> Result<String, AppError> {
+    if connections::get(state, conn_id)?.engine == Engine::Mongo {
+        return mongo::dump::collection_ddl(
+            &mongo::client::client(state, conn_id).await?,
+            database,
+            table,
+        )
+        .await;
+    }
     let ddl = match connections::pool_for(state, conn_id, Some(database))? {
         DbPool::Pg(p) => pg_ddl(&p, schema.unwrap_or("public"), table).await?.ddl,
         DbPool::MySql(p) => mysql_ddl(&p, database, table).await?.ddl,
@@ -62,6 +72,9 @@ pub async fn export_table_sql(
         return Err(AppError::invalid("Choose a file to export to"));
     }
     let conn = connections::get(state, &req.conn_id)?;
+    if conn.engine == Engine::Mongo {
+        return mongo::dump::export_collection(state, &conn, req, path).await;
+    }
     let pool = connections::pool_for(state, &conn.id, Some(&req.database))?;
     let tmp = export::temp_path(path);
     let file = tokio::fs::File::create(&tmp).await?;
@@ -283,6 +296,7 @@ pub(crate) fn header(conn: &Connection, table: &str) -> String {
             Engine::Pg => "PostgreSQL",
             Engine::Mysql => "MySQL",
             Engine::Sqlite => "SQLite",
+            Engine::Mongo => "MongoDB",
         }
     } else {
         conn.version.as_str()
@@ -1069,6 +1083,9 @@ mod tests {
             ai_write: false,
             read_only: true,
             version: None,
+            uri: String::new(),
+            auth_source: String::new(),
+            topology: None,
         }
     }
 

@@ -15,9 +15,12 @@ export interface SqlExportOptions {
   header: boolean;
 }
 
-export type Engine = 'pg' | 'mysql' | 'sqlite';
+export type Engine = 'pg' | 'mysql' | 'sqlite' | 'mongo';
 export type Env = 'production' | 'staging' | 'local';
+/** MongoDB takes `disable` or `require` only. */
 export type SslMode = 'disable' | 'prefer' | 'require';
+/** MongoDB deployment kind, from the last successful test. */
+export type Topology = 'standalone' | 'replica_set' | 'sharded';
 
 /** A saved connection. Never contains the password; that lives in the encrypted credentials file. */
 export interface Connection {
@@ -39,6 +42,12 @@ export interface Connection {
   aiWrite: boolean;
   /** Blocks every write on this connection, the user's own queries included. */
   readOnly: boolean;
+  /** MongoDB connection string without its password; `''` when the connection uses the fields. */
+  uri: string;
+  /** MongoDB `authSource` of the fields mode; `''` = driver default. */
+  authSource: string;
+  /** MongoDB topology from the last successful test; null for other engines or if never tested. */
+  topology: Topology | null;
 }
 
 export interface ConnectionInput {
@@ -53,13 +62,20 @@ export interface ConnectionInput {
   file: string;
   aiWrite: boolean;
   readOnly: boolean;
+  /** MongoDB connection string exactly as typed, password included; `''` or absent = fields mode. */
+  uri?: string;
+  authSource?: string;
   /** Version reported by a test in the dialog; null keeps the stored one. */
   version?: string | null;
+  /** Topology reported by a test in the dialog; null keeps the stored one. */
+  topology?: Topology | null;
 }
 
 export interface TestResult {
   serverVersion: string;
   latencyMs: number;
+  /** MongoDB only. */
+  topology?: Topology;
 }
 
 /** `matview`: a PG materialized view. */
@@ -84,6 +100,10 @@ export interface ColumnInfo {
   isPk: boolean;
   /** 1-based position in the primary key. */
   pkOrdinal?: number;
+  /** MongoDB only: share of sampled documents that have this field, 0 to 1. */
+  frequency?: number;
+  /** MongoDB only: number of documents in the sample the fields come from. */
+  sampleSize?: number;
 }
 
 export interface IndexInfo {
@@ -97,6 +117,22 @@ export interface IndexInfo {
   method?: string;
   /** Full CREATE INDEX text when the engine gives it (PG pg_get_indexdef, SQLite sqlite_master.sql); absent otherwise. */
   definition?: string;
+  /** MongoDB only. */
+  mongo?: MongoIndexInfo;
+}
+
+/** MongoDB index details; `columns` and `definition` repeat the key fields and the createIndex text. */
+export interface MongoIndexInfo {
+  /** Compact relaxed Extended JSON of the key document, e.g. `{"status":1,"createdAt":-1}`. */
+  keys: string;
+  sparse: boolean;
+  hidden: boolean;
+  /** `expireAfterSeconds`. */
+  ttlSeconds?: number;
+  /** Compact relaxed Extended JSON of the partial filter. */
+  partialFilter?: string;
+  /** Other options (collation, weights, default_language, ...) as compact relaxed Extended JSON; absent when none. */
+  options?: string;
 }
 
 export interface ConstraintInfo {
@@ -129,6 +165,30 @@ export interface TableProperties {
   foreignKeys: ForeignKeyInfo[];
   /** Foreign keys in other tables that point at this table (refTable = this table). */
   references: ForeignKeyInfo[];
+  /** MongoDB only: the collection itself. Constraints, foreign keys and references are empty. */
+  mongo?: MongoCollectionInfo;
+}
+
+/** A MongoDB collection's kind, validator and options, plus its stats when the server gives them. */
+export interface MongoCollectionInfo {
+  kind: 'collection' | 'view' | 'timeseries';
+  /** The full validator document as pretty (2-space) relaxed Extended JSON; absent when none. */
+  validator?: string;
+  validationLevel?: string;
+  validationAction?: string;
+  /** Pretty relaxed Extended JSON of the collection options without the validator; `{}` when empty. */
+  options: string;
+  /** Absent for views, or when the user may not read stats. */
+  stats?: MongoCollectionStats;
+}
+
+export interface MongoCollectionStats {
+  count: number;
+  size: number;
+  avgObjSize: number;
+  storageSize: number;
+  totalIndexSize: number;
+  nindexes: number;
 }
 
 export interface SnapshotTable {
@@ -169,6 +229,12 @@ export interface StatementResult {
   /** The lone read is a query (not EXPLAIN / SHOW), so the grid may sort it server-side. */
   sortable: boolean;
   elapsedMs: number;
+  /** MongoDB only: each document of the page as relaxed Extended JSON, for the JSON view and full cell values. */
+  documents?: unknown[];
+  /** MongoDB only: BSON type name of each cell, same shape as `rows`; `missing` when the document has no such field. */
+  cellTypes?: string[][];
+  /** MongoDB only: the database the statement ran in, after any `use` before it. */
+  database?: string;
   /** Mock only: the table the prototype's edit mode works on. */
   table?: string;
 }
@@ -192,6 +258,15 @@ export interface ExportResult {
   rows: number;
   path: string;
 }
+
+/** MongoDB document export: a JSON array, one JSON document per line, or CSV of the flattened cells. */
+export type DocumentFormat = 'json' | 'ndjson' | 'csv';
+
+/** The document formats `exportDocuments` writes; CSV goes through `exportCsv`. */
+export type EjsonFormat = 'json' | 'ndjson';
+
+/** Extended JSON of the document exports. `canonical` keeps every BSON type; `relaxed` is easier to read. */
+export type EjsonMode = 'relaxed' | 'canonical';
 
 export interface RunRequest {
   connId: string;
@@ -224,17 +299,31 @@ export interface EditableResult {
   schema?: string;
   pk: string[];
   reason?: string;
+  /** MongoDB only: the server has transactions (replica set or sharded); false on a standalone server. */
+  transactions?: boolean;
 }
+
+/** MongoDB: one BSON value as the grid sends it. The type decides how the backend reads `value`; `null` and `missing` have no value. */
+export type TypedValue = { type: string; value: string | null };
 
 export interface EditOperation {
   key: string;
   kind: 'update' | 'insert' | 'delete';
   pk: Record<string, CellValue>;
   set: Record<string, CellValue>;
+  /** MongoDB update: path → the cell as it was loaded; the update only matches a document that still has these values. */
+  old?: Record<string, TypedValue>;
+  /** MongoDB insert: the whole new document as mongosh text. */
+  document?: string;
 }
 
 export interface ApplyEditsRequest extends EditableRequest {
   tabId?: string;
+  /**
+   * The id `cancelQuery` cancels this save with. MongoDB saves run under it; the SQL save
+   * accepts it and has no cancel.
+   */
+  queryId?: string;
   operations: EditOperation[];
 }
 
@@ -247,6 +336,8 @@ export interface CellValueRequest extends EditableRequest {
 
 export interface ApplyEditsResult {
   failed?: { index: number; message: string };
+  /** MongoDB standalone only: the operations before `failed.index` stay saved (no transaction). */
+  partial?: boolean;
 }
 
 /** A tab's session on its connection. Only writable Production connections open one. */
@@ -278,11 +369,13 @@ export type WriteWarningCode =
   | 'alter_drop'
   | 'multiple_statements'
   | 'unparsable'
-  | 'executable_comment';
+  | 'executable_comment'
+  | 'rename'
+  | 'unknown_command';
 
 export interface WriteInfo {
-  /** `kind`: `INSERT`, `UPDATE`, `DROP TABLE`, …; `table`: the target as written. */
-  statements: { kind: string; table?: string }[];
+  /** `kind`: `INSERT`, `UPDATE`, `DROP TABLE`, …; `table`: the target as written. MongoDB: `kind` is the method (`updateMany`), `table` the collection, `database` the database the statement runs on (`use` included), `read` true for a statement that only reads. */
+  statements: { kind: string; table?: string; database?: string; read?: boolean }[];
   /** `statement`: 0-based index of the statement; absent for the whole text. */
   warnings: { code: WriteWarningCode; message: string; statement?: number }[];
 }
@@ -294,6 +387,8 @@ export interface AiReadResult {
   /** More rows exist than the cap; they were not fetched. */
   truncated: boolean;
   elapsedMs: number;
+  /** MongoDB only: each document of the page as relaxed Extended JSON (absent for SQL). */
+  documents?: unknown[];
 }
 
 /** AI provider settings, stored in `settings.json`. The API key is stored apart, in the secret store. */
@@ -403,7 +498,11 @@ export type ErrorCode =
   /** The AI server sent a reply that is not valid, or the reply used too many steps (HTTP 502 in the bridge). */
   | 'ai_protocol'
   /** `propose_write` was refused: write mode is off or the connection is read-only (HTTP 403 in the bridge). */
-  | 'write_blocked';
+  | 'write_blocked'
+  /** The user denied a proposed write, or nobody decided in time. Nothing ran. */
+  | 'write_denied'
+  /** The feature does not work on MongoDB connections yet. */
+  | 'unsupported';
 
 export interface AppErrorBody {
   code: ErrorCode;
@@ -417,6 +516,7 @@ export class ApiError extends Error {
 
   constructor(body: AppErrorBody) {
     super(body.message);
+    // `Error` subclasses break as invoke errors; a subclass must name its own type.
     this.name = 'ApiError';
     this.code = body.code;
     this.detail = body.detail;
@@ -441,6 +541,8 @@ export interface Backend {
   /** `input` overrides the copied fields; `password: null` copies the source secret. */
   duplicateConnection(id: string, input: ConnectionInput | null, password: string | null): Promise<Connection>;
   deleteConnection(id: string): Promise<void>;
+  /** Saves the list in the order of `ids`, which must name every saved connection once. */
+  reorderConnections(ids: string[]): Promise<Connection[]>;
   /** Tests `input`. Without a password, the stored secret of `id` is used. */
   testConnection(input: ConnectionInput, password: string | null, id: string | null): Promise<TestResult>;
   listDatabases(connId: string): Promise<string[]>;
@@ -472,10 +574,14 @@ export interface Backend {
   closeTabSession(tabId: string): Promise<void>;
   /** Closes the app. Pending transactions are rolled back, so commit or roll back each tab first. */
   quitApp(): Promise<void>;
+  /** Tauri only: tells the window-close decision that grid edits are unsaved, so it asks before quitting. */
+  setUnsavedEdits?(value: boolean): Promise<void>;
   /** Tauri only: asks for a file in a native save dialog and streams the full result of one read to it. Other transports export in the browser. `tabId` reads inside the tab's open transaction, as `runQuery` does. */
   exportCsv(connId: string, database: string, sql: string, tabId?: string): Promise<ExportResult>;
   /** Tauri only: as `exportCsv`, but writes INSERT statements into `table` (in `schema`, the PG schema or MySQL database, when not null), for copying the rows to another environment. */
   exportResultSql(connId: string, database: string, sql: string, schema: string | null, table: string, options: SqlExportOptions, tabId?: string): Promise<ExportResult>;
+  /** Tauri only, MongoDB: asks for a file in a native save dialog and writes the documents of one read to it as a JSON array or NDJSON (`ejson` picks the Extended JSON). */
+  exportDocuments(connId: string, database: string, sql: string, format: EjsonFormat, ejson: EjsonMode): Promise<ExportResult>;
   /** `CREATE` statement(s) of one table or view: the table, then its indexes (and triggers on SQLite). */
   tableDdl(connId: string, database: string, schema: string | null, table: string): Promise<string>;
   /** Tauri only: asks for a file in a native save dialog and writes the table's DDL to it; with `data`, INSERT statements for every row follow. */
@@ -484,8 +590,8 @@ export interface Backend {
   savePdf(name: string, pdf: Uint8Array): Promise<string | null>;
   /** Checks SQL against the AI read guard without running it. */
   guardCheck(engine: Engine, sql: string): Promise<GuardCheck>;
-  /** Describes a proposed write for the approval preview. Never runs it. */
-  classifyWrite(engine: Engine, sql: string): Promise<WriteInfo>;
+  /** Describes a proposed write for the approval preview. Never runs it. On MongoDB `database` is the tab's database, and `use` in the text changes it. */
+  classifyWrite(engine: Engine, sql: string, database?: string | null): Promise<WriteInfo>;
   /** AI read path: guard, then a read-only session with the default limits. Fails with `guard_rejected`, `read_only_violation` or `timeout`. */
   runAiRead(connId: string, database: string | null, sql: string): Promise<AiReadResult>;
   getAiSettings(): Promise<AiSettingsView>;
@@ -501,4 +607,8 @@ export interface Backend {
   chatSend(request: ChatRequest, onEvent: (e: ChatEvent) => void): Promise<void>;
   /** Stops a running reply; it then ends with an `error` event of code `cancelled`. An unknown id is not an error. */
   chatCancel(chatId: string): Promise<void>;
+  /** Approves the write of a `write_preview`; the reply then runs it in one transaction and sends its `tool_result`. Fails with `not_found` when the write no longer waits. */
+  approveWrite(chatId: string, id: string): Promise<void>;
+  /** Denies the write of a `write_preview`; nothing runs. Fails with `not_found` when the write no longer waits. */
+  denyWrite(chatId: string, id: string): Promise<void>;
 }

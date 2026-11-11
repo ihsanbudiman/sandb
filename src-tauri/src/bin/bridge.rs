@@ -121,7 +121,7 @@ async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response
 fn status_of(e: &AppError) -> StatusCode {
     match e.code {
         ErrorCode::NotFound => StatusCode::NOT_FOUND,
-        ErrorCode::InvalidInput => StatusCode::BAD_REQUEST,
+        ErrorCode::InvalidInput | ErrorCode::Unsupported => StatusCode::BAD_REQUEST,
         ErrorCode::AuthFailed | ErrorCode::Database | ErrorCode::ModelNotFound => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
@@ -129,7 +129,7 @@ fn status_of(e: &AppError) -> StatusCode {
             StatusCode::BAD_GATEWAY
         }
         ErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        ErrorCode::Cancelled => StatusCode::CONFLICT,
+        ErrorCode::Cancelled | ErrorCode::WriteDenied => StatusCode::CONFLICT,
         ErrorCode::GuardRejected
         | ErrorCode::ReadOnlyViolation
         | ErrorCode::ConnectionReadOnly
@@ -175,6 +175,11 @@ struct Duplicate {
 #[derive(Deserialize)]
 struct Id {
     id: String,
+}
+
+#[derive(Deserialize)]
+struct Ids {
+    ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +237,8 @@ struct CancelArgs {
 struct SqlArgs {
     engine: Engine,
     sql: String,
+    #[serde(default)]
+    database: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -270,6 +277,13 @@ struct ChatArgs {
 #[serde(rename_all = "camelCase")]
 struct ChatCancelArgs {
     chat_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WriteDecisionArgs {
+    chat_id: String,
+    id: String,
 }
 
 /// `chat_send` as `text/event-stream`: one `data: <ChatEvent JSON>` per event. The chat runs in
@@ -326,6 +340,9 @@ async fn dispatch(
             }
             .await,
         ),
+        "reorder_connections" => {
+            reply(args::<Ids>(body).and_then(|a| connections::reorder(st, &a.ids)))
+        }
         "test_connection" => reply(
             async {
                 let a: Test = args(body)?;
@@ -466,9 +483,10 @@ async fn dispatch(
             reply(Ok::<_, AppError>(()))
         }
         "guard_check" => reply(args::<SqlArgs>(body).map(|a| guard::guard_check(&a.sql, a.engine))),
-        "classify_write" => {
-            reply(args::<SqlArgs>(body).map(|a| guard::classify_write(&a.sql, a.engine)))
-        }
+        "classify_write" => reply(
+            args::<SqlArgs>(body)
+                .map(|a| guard::classify_write(&a.sql, a.engine, a.database.as_deref())),
+        ),
         "run_ai_read" => reply(
             async {
                 let a: AiReadArgs = args(body)?;
@@ -509,7 +527,15 @@ async fn dispatch(
             Err(e) => reply::<()>(Err(e)),
         },
         "chat_cancel" => reply(args::<ChatCancelArgs>(body).map(|a| chat::cancel(st, &a.chat_id))),
-        // No export_csv, export_result_sql, export_table_sql or save_pdf: the bridge never writes files on request;
+        "approve_write" => reply(
+            args::<WriteDecisionArgs>(body)
+                .and_then(|a| st.approvals.decide(&a.chat_id, &a.id, true)),
+        ),
+        "deny_write" => reply(
+            args::<WriteDecisionArgs>(body)
+                .and_then(|a| st.approvals.decide(&a.chat_id, &a.id, false)),
+        ),
+        // No export_csv, export_result_sql, export_documents, export_table_sql or save_pdf: the bridge never writes files on request;
         // the browser UI downloads the file client-side instead.
         _ => reply::<()>(Err(AppError::not_found(format!(
             "Unknown command {command}"

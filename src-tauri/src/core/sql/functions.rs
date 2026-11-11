@@ -445,6 +445,7 @@ pub fn is_pure(engine: Engine, name: &str) -> bool {
         Engine::Pg => PG,
         Engine::Mysql => MYSQL,
         Engine::Sqlite => SQLITE,
+        Engine::Mongo => &[],
     };
     COMMON.contains(&name) || specific.contains(&name)
 }

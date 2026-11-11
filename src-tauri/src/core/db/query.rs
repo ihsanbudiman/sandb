@@ -24,6 +24,7 @@ use crate::core::db::pool::DbPool;
 use crate::core::db::session::{self, Conn};
 use crate::core::db::value::{self, PREVIEW_BYTES, SqliteRaw};
 use crate::core::error::{AppError, ErrorCode};
+use crate::core::mongo;
 use crate::core::sql::{facts, split};
 use crate::core::state::AppState;
 
@@ -38,6 +39,8 @@ pub const OPEN_TX_NOTICE: &str =
 const EARLY_CANCEL_TTL: Duration = Duration::from_secs(30);
 /// Bound for opening the extra connection that sends a cancel.
 const CANCEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest wait of a cancel for the MongoDB server kill.
+const MONGO_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bound for closing a connection whose session state must not be reused.
 pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -75,6 +78,9 @@ pub struct RunRequest {
 pub struct ColumnMeta {
     pub name: String,
     pub data_type: String,
+    /// MongoDB only: the column's cells hold several BSON types.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mixed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -96,6 +102,18 @@ pub struct StatementResult {
     /// may add ORDER BY to it. EXPLAIN and SHOW are reads that cannot be sorted.
     pub sortable: bool,
     pub elapsed_ms: u64,
+    /// MongoDB only: each document of the page as relaxed Extended JSON, for the JSON view and the
+    /// full value of a cell that the grid shows as a summary (`[3 items]`) or cut text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<Value>>,
+    /// MongoDB only: the BSON type name of each cell (`rows` shape), `"missing"` when the document
+    /// has no such field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cell_types: Option<Vec<Vec<&'static str>>>,
+    /// MongoDB only: the database the statement ran in. A `use` earlier in the same run makes it
+    /// differ from the tab's database, and reruns and grid edits must go to this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -133,6 +151,8 @@ pub enum Session {
     Pg(i32),
     MySql(i64),
     Sqlite(SqliteHandle),
+    /// A MongoDB run: its operations carry the query id as `comment`, which `$currentOp` finds.
+    Mongo,
 }
 
 struct Running {
@@ -168,7 +188,7 @@ impl QueryRegistry {
 
     /// The returned guard's `cancelled` is already set when a cancel for `query_id` came first.
     /// `total` is the run's statement count, known before the run registers.
-    fn register(
+    pub(crate) fn register(
         &self,
         query_id: &str,
         conn_id: &str,
@@ -206,7 +226,7 @@ impl QueryRegistry {
         })
     }
 
-    fn attach(&self, query_id: &str, session: Session) -> SessionGuard<'_> {
+    pub(crate) fn attach(&self, query_id: &str, session: Session) -> SessionGuard<'_> {
         if let Some(r) = self.lock().running.get_mut(query_id) {
             r.session = session;
         }
@@ -228,11 +248,11 @@ impl QueryRegistry {
 }
 
 /// Removes the run from the registry when the run ends or its future is dropped.
-struct RunGuard<'a> {
+pub(crate) struct RunGuard<'a> {
     reg: &'a QueryRegistry,
     id: String,
-    cancelled: Arc<AtomicBool>,
-    done: Arc<AtomicUsize>,
+    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) done: Arc<AtomicUsize>,
 }
 
 impl Drop for RunGuard<'_> {
@@ -243,7 +263,7 @@ impl Drop for RunGuard<'_> {
 
 /// Clears the session so no cancel targets the connection any more. Drop it before reading
 /// `cancelled` for the last time: a cancel that saw the session set the flag first.
-struct SessionGuard<'a> {
+pub(crate) struct SessionGuard<'a> {
     reg: &'a QueryRegistry,
     id: String,
 }
@@ -277,6 +297,7 @@ pub async fn cancel(state: &AppState, query_id: &str) -> Result<(), AppError> {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        let mut mongo = None;
         let target = {
             let mut reg = state.queries.lock();
             let Some(r) = reg.running.get(query_id) else {
@@ -294,20 +315,34 @@ pub async fn cancel(state: &AppState, query_id: &str) -> Result<(), AppError> {
                     unsafe { libsqlite3_sys::sqlite3_interrupt(h.0) };
                     None
                 }
+                Session::Mongo => {
+                    mongo = Some(r.conn_id.clone());
+                    None
+                }
                 Session::Pg(pid) => Some((r.conn_id.clone(), r.database.clone(), Kill::Pg(pid))),
                 Session::MySql(id) => {
                     Some((r.conn_id.clone(), r.database.clone(), Kill::MySql(id)))
                 }
             }
         };
-        let Some((conn_id, database, kill)) = target else {
+        let sent = if let Some(conn_id) = mongo {
+            // The run already stopped on the flag; the server kill is best effort, and a server
+            // that does not answer must not hold the cancel for the driver's monitor timeout.
+            tokio::time::timeout(
+                MONGO_KILL_TIMEOUT,
+                mongo::run::kill(state, &conn_id, query_id),
+            )
+            .await
+            .unwrap_or(Ok(()))
+        } else if let Some((conn_id, database, kill)) = target {
+            async {
+                let pool = connections::pool_for(state, &conn_id, Some(&database))?;
+                send_kill(pool, kill).await
+            }
+            .await
+        } else {
             continue;
         };
-        let sent = async {
-            let pool = connections::pool_for(state, &conn_id, Some(&database))?;
-            send_kill(pool, kill).await
-        }
-        .await;
         // A kill that races with the end of the query fails harmlessly (e.g. MySQL "unknown thread").
         if let Err(e) = sent
             && attempt == 0
@@ -383,8 +418,12 @@ pub(crate) async fn send_kill(pool: DbPool, kill: Kill) -> Result<(), AppError> 
 
 // ---- running ----
 
-fn cancelled_error() -> AppError {
+pub(crate) fn cancelled_error() -> AppError {
     AppError::new(ErrorCode::Cancelled, "Query cancelled")
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 pub(crate) fn meta<C: Column>(c: &C) -> ColumnMeta {
@@ -397,6 +436,7 @@ pub(crate) fn meta<C: Column>(c: &C) -> ColumnMeta {
         } else {
             t.to_string()
         },
+        mixed: false,
     }
 }
 
@@ -457,6 +497,8 @@ struct ResultSet {
 /// several for text the splitter could not split. The `bool` is true when a read stopped
 /// mid-result at `limit` and left the connection unusable; `in_session` holds the run's
 /// connection, so a session-mode read drains like a write instead (it never sets the flag).
+// `affected` is the eighth argument; a struct for one private caller set adds nothing.
+#[allow(clippy::too_many_arguments)]
 async fn run_one<DB>(
     conn: &mut DB::Connection,
     source_sql: &str,
@@ -541,6 +583,9 @@ where
             is_read: read,
             sortable: false,
             elapsed_ms,
+            documents: None,
+            cell_types: None,
+            database: None,
         });
     }
     Ok((out, cut_off))
@@ -831,7 +876,7 @@ fn mysql_binary_time(raw: &[u8]) -> Option<String> {
     }
     Some(s)
 }
-fn clamp_limit(limit: Option<usize>) -> usize {
+pub(crate) fn clamp_limit(limit: Option<usize>) -> usize {
     limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
@@ -951,6 +996,9 @@ pub async fn run_editor_unchecked(state: &AppState, req: RunRequest) -> Result<Q
 
 async fn run_inner(state: &AppState, req: RunRequest, check: bool) -> Result<QueryRun, AppError> {
     let conn = connections::get(state, &req.conn_id)?;
+    if conn.engine == Engine::Mongo {
+        return mongo::run::run(state, &conn, req, check).await;
+    }
     let stmts = split::split(conn.engine, &req.sql);
     if stmts.is_empty() {
         return Err(AppError::invalid("Nothing to run"));
@@ -1123,6 +1171,7 @@ fn is_lost(e: &AppError) -> bool {
 /// opened before it when none is open. Statements that may end the transaction (a typed
 /// COMMIT, MySQL's implicit commits) are followed by a probe, so a statement after them opens
 /// a new one instead of autocommitting.
+#[allow(clippy::too_many_arguments)]
 async fn run_in_session(
     state: &AppState,
     conn: &connections::Connection,
@@ -1536,6 +1585,9 @@ mod tests {
             is_read,
             sortable: false,
             elapsed_ms: 0,
+            documents: None,
+            cell_types: None,
+            database: None,
         };
         let mut results = vec![result("SELECT 1", true), result("SELECT 2", true)];
         mark_sortable(
@@ -1580,6 +1632,7 @@ mod tests {
                 columns: vec![ColumnMeta {
                     name: "a".into(),
                     data_type: "INT4".into(),
+                    mixed: false,
                 }],
                 rows: vec![vec![Value::from(1)]],
                 row_count: 1,
@@ -1588,6 +1641,9 @@ mod tests {
                 is_read: true,
                 sortable: true,
                 elapsed_ms: 3,
+                documents: None,
+                cell_types: None,
+                database: None,
             }],
             notices: vec![],
             elapsed_ms: 4,

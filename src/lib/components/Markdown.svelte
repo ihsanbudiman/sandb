@@ -3,14 +3,18 @@
   import { Marked, type Tokens } from 'marked';
   import { fenceDialect, sqlHtml } from '../highlight';
 
-  let { text, onrunsql }: { text: string; onrunsql?: (sql: string, anchor: HTMLElement) => void } = $props();
+  let { text, onrunsql, mongo = false }: { text: string; onrunsql?: (code: string, anchor: HTMLElement, mongo: boolean) => void; mongo?: boolean } = $props();
 
-  // SQL code blocks are colored like the editor. Other languages stay plain.
+  // SQL code blocks are colored like the editor; mongosh fences stay plain but get the same Run menu on a Mongo source.
+  const mongoFence = new Set(['javascript', 'js', 'mongodb', 'mongosh', 'mongo']);
   const md = new Marked({
     gfm: true,
     breaks: true,
     renderer: {
       code({ text: code, lang }: Tokens.Code) {
+        const name = lang?.trim().split(/\s/)[0].toLowerCase();
+        // Mongosh fences (the prompt puts mongosh in ```javascript) stay plain but get the Run menu when the reply has a Mongo source.
+        if (mongo && name && mongoFence.has(name)) return `<pre class="mongo-code code-mongo"><code>${code.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}\n</code></pre>\n`;
         const dialect = fenceDialect(lang, code);
         return dialect ? `<pre class="sql-code"><code class="language-sql">${sqlHtml(code, dialect)}\n</code></pre>\n` : false;
       },
@@ -23,13 +27,14 @@
   const copyIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
   const checkIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
   const playIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
-  /** A code block with its actions. The SQL action set adds Run; other languages only copy. SQL wraps, so its `pre` is marked. */
-  const codeBox = (sql: boolean, run: boolean) =>
+  /** A code block with its actions. Runnable blocks (SQL, and mongosh on a Mongo reply) add Run; others only copy. Both wrap, so their `pre` is marked; `code-mongo` tells mongosh from SQL. */
+  const codeBox = (sql: boolean, run: boolean, mongoBlock = false) =>
     `<div class="code-box${run ? ' code-box-run' : ''}"><span class="code-actions"><button type="button" class="code-copy" title="Copy code" aria-label="Copy code">${copyIcon}</button>` +
     (run ? `<button type="button" class="code-run" title="Run query" aria-label="Run query" aria-haspopup="menu">${playIcon}</button>` : '') +
-    `</span><pre${sql ? ' class="code-sql"' : ''}>`;
+    `</span><pre${sql ? ` class="code-sql${mongoBlock ? ' code-mongo' : ''}"` : ''}>`;
   // Placeholders keep the second replaceAll from wrapping the <pre> of the first one.
   const SQL_PRE = '\u0001sql-pre\u0001';
+  const MONGO_PRE = '\u0001mongo-pre\u0001';
   const CODE_PRE = '\u0001code-pre\u0001';
   const html = $derived(
     DOMPurify.sanitize(md.parse(text, { async: false }), {
@@ -39,21 +44,24 @@
       .replaceAll('<table>', '<div class="table-box"><table>')
       .replaceAll('</table>', '</table></div>')
       .replaceAll('<pre class="sql-code">', SQL_PRE)
+      .replaceAll('<pre class="mongo-code code-mongo">', MONGO_PRE)
       .replaceAll('<pre>', CODE_PRE)
       .replaceAll(SQL_PRE, codeBox(true, !!onrunsql))
+      .replaceAll(MONGO_PRE, codeBox(true, !!onrunsql, true))
       .replaceAll(CODE_PRE, codeBox(false, false))
       .replaceAll('</pre>', '</pre></div>'),
   );
 
-  /** One listener for all code blocks: copy, or run the SQL next to the clicked button. */
+  /** One listener for all code blocks: copy, or open the Run menu for the code next to the clicked button. */
   function codeActions(node: HTMLElement) {
     const onClick = async (ev: MouseEvent) => {
       const btn = (ev.target as Element).closest<HTMLButtonElement>('button');
       if (!btn) return;
-      const code = btn.closest('.code-box')?.querySelector('pre')?.textContent?.trimEnd();
+      const pre = btn.closest('.code-box')?.querySelector('pre');
+      const code = pre?.textContent?.trimEnd();
       if (code == null) return;
       if (btn.classList.contains('code-run')) {
-        onrunsql?.(code, btn);
+        onrunsql?.(code, btn, !!pre?.classList.contains('code-mongo'));
         return;
       }
       if (!btn.classList.contains('code-copy')) return;

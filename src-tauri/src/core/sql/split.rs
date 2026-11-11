@@ -2,7 +2,7 @@
 //! If the text does not parse, it runs as one statement and the server decides.
 
 use sqlparser::ast::Statement;
-use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Token, Tokenizer};
 
@@ -13,6 +13,9 @@ pub(crate) fn dialect(engine: Engine) -> Box<dyn Dialect> {
         Engine::Pg => Box::new(PostgreSqlDialect {}),
         Engine::Mysql => Box::new(MySqlDialect {}),
         Engine::Sqlite => Box::new(SQLiteDialect {}),
+        // No SQL runs on a Mongo connection (its pool refuses to open); the generic dialect
+        // only keeps the SQL helpers total.
+        Engine::Mongo => Box::new(GenericDialect {}),
     }
 }
 

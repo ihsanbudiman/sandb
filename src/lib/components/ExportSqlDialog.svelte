@@ -55,7 +55,8 @@
     }
     return null;
   });
-  const skipText = $derived({ pg: 'ON CONFLICT DO NOTHING', mysql: 'INSERT IGNORE', sqlite: 'INSERT OR IGNORE' }[engine]);
+  // MongoDB results never open this dialog; its entry only completes the map.
+  const skipText = $derived({ pg: 'ON CONFLICT DO NOTHING', mysql: 'INSERT IGNORE', sqlite: 'INSERT OR IGNORE', mongo: '' }[engine]);
   const upsertText = $derived(engine === 'mysql' ? 'ON DUPLICATE KEY UPDATE' : 'ON CONFLICT (key) DO UPDATE');
 
   function setAll(on: boolean) {

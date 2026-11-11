@@ -31,7 +31,7 @@ Phase 4 notes:
 - Code: `src-tauri/src/core/ai/` (`settings.rs`, `client.rs`, `tools.rs`, `prompt.rs`, `session.rs`). Commands: `get_ai_settings`, `save_ai_settings`, `set_ai_key`, `test_ai`, `list_ai_models`, `chat_send`, `chat_cancel` (Tauri and bridge; the bridge streams `chat_send` as SSE).
 - `test_ai` calls `GET /models` and fails with `model_not_found` if the model is not in the list (`name:latest` also matches, for Ollama).
 - `list_ai_models` calls `GET /models` for the given (maybe unsaved) settings and key, and returns the ids sorted, without duplicates. The UI model picker (`ModelPicker.svelte`, in Settings and below the chat message box) uses it. The model is one setting for all chats.
-- `propose_write` never runs SQL. It refuses with `write_blocked` when the chat's write mode is off or the connection is read-only. Else it sends `write_preview`. `allowWrites` comes from the chat panel toggle, which is UI-only. `approve_write` (phase 5) must check the saved connection again.
+- `propose_write` never runs SQL itself. It refuses with `write_blocked` when the chat's write mode is off or the connection is read-only. Otherwise it sends `write_preview`, and the tool loop waits (`core/ai/approval.rs`, 10-minute timeout that denies) for `approve_write(chatId, id)` or `deny_write(chatId, id)`. An approved write runs through `core/db/write.rs`: it checks the saved connection again (`writes_allowed`), refuses transaction-control statements, and runs all statements in one transaction that commits at once on a connection that leaves the pool. `allowWrites` comes from the chat panel toggle, which is UI-only.
 - Privacy `schema`: the model gets column names, the row count and the truncated flag. Database error text is replaced by the SQLSTATE or error number.
 - Stop drops the running AI read. The database query stops at its own time limit.
 - The `sandb-test` mock-llm container runs the old `server.mjs` until it restarts. `it_ai` needs the new `GET /_requests` endpoint.
@@ -222,7 +222,7 @@ Table Data views and simple query results support double-click editing. Live sav
 | Info | `.factory/` in the project root holds the `sandb-worker` droid. It is there on purpose. | |
 
 ## 8. Open questions for the user
-1. **AI writes on Production with manual commit.** Should an approved AI write on Production go into the open tab transaction, so that the user must still Commit? Or should it run in its own transaction and commit at once after approval? Recommendation: its own transaction, because the user already approved it in the preview dialog.
+1. **AI writes on Production with manual commit.** Decided for now: an approved AI write runs in its own transaction and commits at once (`core/db/write.rs`), because the user already approved it in the preview. Change this only if the user asks for the tab transaction instead.
 2. **Edit-mode Save on Production with manual commit.** Should Save run inside the tab transaction, so that it is pending until Commit? Or should it commit at once after the extra confirmation? Recommendation: inside the tab transaction, so that one Commit button controls all changes on Production.
 3. **Tab persistence.** Should tabs and their SQL text be kept after the app restarts? Open transactions cannot be kept. Recommendation: keep the text, not the sessions.
 
@@ -231,5 +231,5 @@ Table Data views and simple query results support double-click editing. Live sav
 2. Start the dev bridge with a new token: `SANDB_BRIDGE_TOKEN=<token> pnpm bridge` (port 58123).
 3. Start Vite in bridge mode: `VITE_BACKEND=bridge VITE_BRIDGE_TOKEN=<token> pnpm dev` (port 5199).
 4. Restart the bridge after each Rust change, because it runs a compiled binary.
-5. Next task: section 4 (phase 5). Settings save and Test, the live chat and Stop are done. Write approval (`approve_write`, `deny_write`), the saved safeguard toggle, cancel on connection delete and `audit.db` are left.
+5. Next task: section 4 (phase 5). Settings save and Test, the live chat, Stop and write approval (`approve_write`, `deny_write`) are done. The saved safeguard toggle, cancel on connection delete, the real row estimate and red warnings from `classify_write` in the approval card, and `audit.db` are left.
 6. To keep each worker request small, give each worker one section of this file, not the full phase.

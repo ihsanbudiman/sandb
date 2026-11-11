@@ -64,6 +64,9 @@ fn net(label: &str, engine: Engine, port: u16) -> Ctx {
         ai_write: false,
         read_only: false,
         version: None,
+        uri: String::new(),
+        auth_source: String::new(),
+        topology: None,
     };
     let pw = e
         .get("SANDB_RW_PASSWORD")
@@ -103,6 +106,9 @@ fn sqlite() -> Ctx {
         ai_write: false,
         read_only: false,
         version: None,
+        uri: String::new(),
+        auth_source: String::new(),
+        topology: None,
     };
     let conn = connections::create(&st, input, None).unwrap();
     Ctx {
@@ -308,6 +314,7 @@ async fn slow_reads_time_out_and_the_next_call_works() {
             (Engine::Sqlite, _) => {
                 "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000000000) SELECT count(*) FROM n"
             }
+            (Engine::Mongo, _) => unreachable!("SQL engines only"),
         };
         let limits = ReadLimits {
             max_rows: 500,
@@ -516,6 +523,7 @@ async fn allowed_kinds_run_prepared() {
                 "EXPLAIN SELECT * FROM orders",
             ],
             Engine::Sqlite => &["SELECT 1 AS one", "PRAGMA table_info(orders)"],
+            Engine::Mongo => unreachable!("SQL engines only"),
         };
         for sql in sqls {
             let r = ai(&c, sql, ReadLimits::default())
@@ -547,6 +555,7 @@ async fn allowed_statement_kinds_run() {
                 "SELECT * FROM pragma_table_info('orders')",
                 "SELECT ';DELETE FROM orders' AS a",
             ],
+            Engine::Mongo => unreachable!("SQL engines only"),
         };
         for sql in sqls {
             let r = ai(&c, sql, ReadLimits::default())

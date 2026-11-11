@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::core::ai::approval::APPROVAL_TIMEOUT;
 use crate::core::ai::client::{AiClient, Completion, StreamEvent};
 use crate::core::ai::prompt::{self, PromptInput};
 use crate::core::ai::settings;
-use crate::core::ai::tools::{self, ToolContext};
-use crate::core::connections;
+use crate::core::ai::tools::{self, Decision, ToolContext};
+use crate::core::connections::{self, Engine};
 use crate::core::db::introspect;
 use crate::core::error::{AppError, ErrorCode};
 use crate::core::guard::WriteInfo;
@@ -102,7 +103,8 @@ pub enum ChatEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<AppError>,
     },
-    /// A proposed write, sent before its `tool_result`. Nothing has run.
+    /// A proposed write, sent before its `tool_result`. Nothing has run: the `tool_result`
+    /// comes after the user approves (`approve_write`) or denies (`deny_write`) it.
     WritePreview {
         id: String,
         sql: String,
@@ -250,9 +252,16 @@ async fn converse(
     let mut sources = Vec::with_capacity(req.sources.len());
     for (i, s) in req.sources.iter().enumerate() {
         let conn = connections::get(state, &s.conn_id)?;
+        let database = connections::target_database(&conn, s.database.as_deref());
+        if conn.engine == Engine::Mongo && database.is_empty() {
+            return Err(AppError::invalid(format!(
+                "Choose a database for {}",
+                conn.name
+            )));
+        }
         sources.push(tools::Source {
             id: format!("db{}", i + 1),
-            database: connections::target_database(&conn, s.database.as_deref()),
+            database,
             schema: s
                 .schema
                 .as_deref()
@@ -299,12 +308,11 @@ async fn converse(
         today: &today,
     });
 
-    let ids: Vec<&str> = sources.iter().map(|s| s.id.as_str()).collect();
     let mut body = json!({
         "model": settings.model,
         "messages": [{"role": "system", "content": system}],
         "stream": true,
-        "tools": tools::definitions(&ids),
+        "tools": tools::definitions(&sources),
         "tool_choice": "auto",
     });
     for turn in &req.history {
@@ -368,14 +376,41 @@ async fn converse(
                 _ = token.cancelled() => return Err(cancelled()),
                 out = tools::execute(&ctx, &call.id, &call.name, &call.arguments) => out,
             };
+            // Registered before the preview goes out, so a fast click finds it.
+            let mut waiting = out
+                .write
+                .as_ref()
+                .map(|_| state.approvals.wait(&req.chat_id, &call.id));
             for ev in out.events {
                 if !emit(ev) {
                     return Err(receiver_gone());
                 }
             }
+            let content = match (out.write, waiting.as_mut()) {
+                (Some(w), Some(waiting)) => {
+                    let decision = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => return Err(cancelled()),
+                        d = tokio::time::timeout(APPROVAL_TIMEOUT, waiting.decision()) => match d {
+                            Ok(true) => Decision::Approved,
+                            Ok(false) => Decision::Denied,
+                            Err(_) => Decision::TimedOut,
+                        },
+                    };
+                    let done = tools::finish_write(&ctx, &call.id, &w, decision, token).await;
+                    for ev in done.events {
+                        if !emit(ev) {
+                            return Err(receiver_gone());
+                        }
+                    }
+                    done.content
+                }
+                _ => out.content,
+            };
+            drop(waiting);
             push_message(
                 &mut body,
-                json!({"role": "tool", "tool_call_id": call.id, "content": out.content}),
+                json!({"role": "tool", "tool_call_id": call.id, "content": content}),
             );
         }
     }
@@ -423,6 +458,9 @@ mod tests {
                 ai_write: false,
                 read_only: false,
                 version: None,
+                uri: String::new(),
+                auth_source: String::new(),
+                topology: None,
             },
             None,
         )
@@ -466,6 +504,9 @@ mod tests {
                 ai_write: false,
                 read_only: false,
                 version: None,
+                uri: String::new(),
+                auth_source: String::new(),
+                topology: None,
             },
             None,
         )
@@ -755,6 +796,106 @@ mod tests {
         assert_eq!(n, 2);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!st.chats.is_running("chat-1"));
+    }
+
+    /// Rows of table `t` in the SQLite file that `sqlite_conn` made.
+    async fn count_rows(dir: &std::path::Path, name: &str) -> i64 {
+        use sqlx::Connection as _;
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+        let mut c = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new().filename(dir.join(format!("{name}.db"))),
+        )
+        .await
+        .unwrap();
+        let n = sqlx::query_scalar("SELECT count(*) FROM t")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        c.close().await.unwrap();
+        n
+    }
+
+    fn propose(sql: &str) -> Vec<crate::core::ai::client::tests::Part> {
+        vec![
+            head("200 OK", "text/event-stream"),
+            sse(json!({"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "w", "function": {"name": "propose_write", "arguments": json!({"sql": sql}).to_string()}}
+            ]}, "finish_reason": "tool_calls"}]})),
+            done(),
+        ]
+    }
+
+    /// The write waits for the user: Deny runs nothing, Approve runs it. The `tool_result`
+    /// comes only after the decision.
+    #[tokio::test]
+    async fn a_proposed_write_runs_only_after_approval() {
+        let (base, _r) = serve(propose("DELETE FROM t WHERE id <= 2")).await;
+        let (dir, st, _) = state_with(&base);
+        let conn = sqlite_conn(&st, dir.path(), "w", 3).await;
+        for (approve, rows_left) in [(false, 3), (true, 1)] {
+            let mut req = request(&conn, "delete");
+            req.sources[0].allow_writes = true;
+            let mut result = None;
+            run(&st, req, |e| {
+                if let ChatEvent::WritePreview { id, .. } = &e {
+                    st.approvals.decide("chat-1", id, approve).unwrap();
+                }
+                if matches!(e, ChatEvent::ToolResult { .. }) {
+                    result = Some(e);
+                    return false;
+                }
+                true
+            })
+            .await;
+            match result.unwrap() {
+                ChatEvent::ToolResult {
+                    ok, summary, error, ..
+                } if approve => {
+                    assert!(ok, "{error:?}");
+                    assert!(
+                        summary.starts_with("2 rows changed · committed"),
+                        "{summary}"
+                    );
+                }
+                ChatEvent::ToolResult { ok, error, .. } => {
+                    assert!(!ok);
+                    assert_eq!(error.unwrap().code, ErrorCode::WriteDenied);
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(count_rows(dir.path(), "w").await, rows_left);
+        }
+    }
+
+    /// Stop while the write waits: nothing runs, and a late Approve finds nothing.
+    #[tokio::test]
+    async fn stop_while_a_write_waits_runs_nothing() {
+        let (base, _r) = serve(propose("DELETE FROM t")).await;
+        let (dir, st, _) = state_with(&base);
+        let conn = sqlite_conn(&st, dir.path(), "w", 3).await;
+        let mut req = request(&conn, "delete");
+        req.sources[0].allow_writes = true;
+        let mut events = Vec::new();
+        run(&st, req, |e| {
+            if matches!(e, ChatEvent::WritePreview { .. }) {
+                st.chats.cancel("chat-1");
+            }
+            events.push(e);
+            true
+        })
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(ChatEvent::Error { error }) if error.code == ErrorCode::Cancelled
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ToolResult { .. }))
+        );
+        let late = st.approvals.decide("chat-1", "w", true).unwrap_err();
+        assert_eq!(late.code, ErrorCode::NotFound);
+        assert_eq!(count_rows(dir.path(), "w").await, 3);
     }
 
     #[test]

@@ -15,9 +15,14 @@ use sandb_lib::core::ai::settings::{self, AiSettings, Privacy};
 use sandb_lib::core::ai::tools;
 use sandb_lib::core::connections::{self, Connection, ConnectionInput, Engine, Env, SslMode};
 use sandb_lib::core::db::readonly::{self, ReadLimits};
+use sandb_lib::core::db::write;
 use sandb_lib::core::error::ErrorCode;
 use sandb_lib::core::secrets::MemoryStore;
 use sandb_lib::core::state::AppState;
+
+/// Tests that read or write `orders` row 1. `an_approved_write_commits` changes the row and puts
+/// it back, so a parallel test that compares the row before and after its run must not overlap it.
+static ORDER_1: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn mock_url() -> String {
     std::env::var("SANDB_MOCK_LLM_URL")
@@ -70,6 +75,9 @@ fn setup(privacy: Privacy, read_only: bool) -> Ctx {
         ai_write: false,
         read_only,
         version: None,
+        uri: String::new(),
+        auth_source: String::new(),
+        topology: None,
     };
     let pw = e
         .get("SANDB_RW_PASSWORD")
@@ -329,6 +337,7 @@ fn assert_write_blocked(events: &[ChatEvent]) {
 
 #[tokio::test]
 async fn write_with_write_mode_off_is_blocked() {
+    let _order_1 = ORDER_1.lock().await;
     let ctx = setup(Privacy::Results, false);
     let before = order_1_status(&ctx).await;
     let events = chat(&ctx, "write the change", false).await;
@@ -343,14 +352,30 @@ async fn write_on_a_read_only_connection_is_blocked() {
     assert_write_blocked(&events);
 }
 
-#[tokio::test]
-async fn write_with_write_mode_on_sends_a_preview_and_runs_nothing() {
-    let ctx = setup(Privacy::Results, false);
-    let before = order_1_status(&ctx).await;
-    let events = chat(&ctx, "write the change", true).await;
-    assert_terminal(&events);
+/// Runs the `write` scenario and answers its approval card with `approve`.
+async fn chat_deciding(ctx: &Ctx, approve: bool) -> Vec<ChatEvent> {
+    let chat_id = uuid::Uuid::new_v4().to_string();
+    let mut events = Vec::new();
+    session::run(
+        &ctx.st,
+        request(ctx, &chat_id, "write the change", true),
+        |e| {
+            if let ChatEvent::WritePreview { id, .. } = &e {
+                ctx.st.approvals.decide(&chat_id, id, approve).unwrap();
+            }
+            events.push(e);
+            true
+        },
+    )
+    .await;
+    events
+}
+
+/// The preview comes first; the result comes only after the user decides.
+fn preview_then_result(events: &[ChatEvent]) -> &ChatEvent {
+    assert_terminal(events);
     assert_eq!(events.last(), Some(&ChatEvent::Done));
-    let (name, _, result) = tool(&events);
+    let (name, _, result) = tool(events);
     assert_eq!(name, "propose_write");
     let preview = events
         .iter()
@@ -365,14 +390,54 @@ async fn write_with_write_mode_on_sends_a_preview_and_runs_nothing() {
         }
         _ => unreachable!(),
     }
-    match result {
-        ChatEvent::ToolResult { ok, summary, .. } => {
-            assert!(ok);
-            assert_eq!(summary, "Waiting for your approval");
+    result
+}
+
+#[tokio::test]
+async fn a_denied_write_runs_nothing() {
+    let _order_1 = ORDER_1.lock().await;
+    let ctx = setup(Privacy::Results, false);
+    let before = order_1_status(&ctx).await;
+    let events = chat_deciding(&ctx, false).await;
+    match preview_then_result(&events) {
+        ChatEvent::ToolResult { ok, error, .. } => {
+            assert!(!ok);
+            assert_eq!(error.as_ref().unwrap().code, ErrorCode::WriteDenied);
         }
         _ => unreachable!(),
     }
-    assert_eq!(order_1_status(&ctx).await, before, "propose_write ran SQL");
+    assert_eq!(order_1_status(&ctx).await, before, "a denied write ran SQL");
+}
+
+#[tokio::test]
+async fn an_approved_write_commits() {
+    let _order_1 = ORDER_1.lock().await;
+    let ctx = setup(Privacy::Results, false);
+    let before = order_1_status(&ctx).await;
+    let events = chat_deciding(&ctx, true).await;
+    let result = preview_then_result(&events).clone();
+    let after = order_1_status(&ctx).await;
+    // Put the row back before any assert, so other tests see the seed data.
+    let restore = format!(
+        "UPDATE orders SET status = '{}' WHERE id = 1",
+        before.as_str().unwrap().replace('\'', "''")
+    );
+    write::run_approved(&ctx.st, &ctx.conn.id, "shop", &restore, &Default::default())
+        .await
+        .unwrap();
+    match result {
+        ChatEvent::ToolResult { ok, summary, .. } => {
+            assert!(ok, "{summary}");
+            assert!(
+                summary.starts_with("1 row changed · committed"),
+                "{summary}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(after, "shipped");
+    // The model hears that the write ran.
+    assert!(text(&events).contains("committed"), "{}", text(&events));
 }
 
 #[tokio::test]

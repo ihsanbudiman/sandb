@@ -4,6 +4,8 @@ use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
+use std::sync::atomic::Ordering;
+
 use crate::core::ai::session::{self as chat, ChatEvent, ChatRequest};
 use crate::core::ai::settings::{self as ai_settings, AiSettings, AiSettingsView, AiTestResult};
 use crate::core::connections::{self, Connection, ConnectionInput, Engine, TestResult};
@@ -11,7 +13,9 @@ use crate::core::db::dump::{self, TableExportRequest};
 use crate::core::db::edit::{
     self, ApplyEditsRequest, ApplyEditsResult, CellValueRequest, EditableRequest, EditableResult,
 };
-use crate::core::db::export::{self, ExportRequest, ExportResult, SqlExportRequest};
+use crate::core::db::export::{
+    self, DocumentExportRequest, DocumentFormat, ExportRequest, ExportResult, SqlExportRequest,
+};
 use crate::core::db::introspect::{self, ColumnInfo, SchemaSnapshot, TableInfo, TableProperties};
 use crate::core::db::query::{self, QueryProgress, QueryRun, RunRequest};
 use crate::core::db::readonly::{self, AiReadResult, ReadLimits};
@@ -59,6 +63,14 @@ pub async fn duplicate_connection(
 #[tauri::command]
 pub async fn delete_connection(state: State<'_, AppState>, id: String) -> Res<()> {
     connections::delete(&state, &id).await
+}
+
+#[tauri::command]
+pub async fn reorder_connections(
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Res<Vec<Connection>> {
+    connections::reorder(&state, &ids)
 }
 
 #[tauri::command]
@@ -218,14 +230,24 @@ pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Res<()> {
     Ok(())
 }
 
+/// The frontend reports unsaved grid edits (live or in an inactive tab), so the window close asks first.
+#[tauri::command]
+pub fn set_unsaved_edits(state: State<'_, AppState>, value: bool) {
+    state.unsaved_edits.store(value, Ordering::Relaxed);
+}
+
 #[tauri::command]
 pub async fn guard_check(engine: Engine, sql: String) -> Res<GuardCheck> {
     Ok(guard::guard_check(&sql, engine))
 }
 
 #[tauri::command]
-pub async fn classify_write(engine: Engine, sql: String) -> Res<WriteInfo> {
-    Ok(guard::classify_write(&sql, engine))
+pub async fn classify_write(
+    engine: Engine,
+    sql: String,
+    database: Option<String>,
+) -> Res<WriteInfo> {
+    Ok(guard::classify_write(&sql, engine, database.as_deref()))
 }
 
 /// AI read path: the guard, then a read-only session with the default row and time limits.
@@ -302,6 +324,17 @@ pub async fn chat_cancel(state: State<'_, AppState>, chat_id: String) -> Res<()>
     Ok(())
 }
 
+/// Approves a write that the chat proposed; the chat then runs it in one transaction.
+#[tauri::command]
+pub async fn approve_write(state: State<'_, AppState>, chat_id: String, id: String) -> Res<()> {
+    state.approvals.decide(&chat_id, &id, true)
+}
+
+#[tauri::command]
+pub async fn deny_write(state: State<'_, AppState>, chat_id: String, id: String) -> Res<()> {
+    state.approvals.decide(&chat_id, &id, false)
+}
+
 /// Asks for the file in a native save dialog here, so the webview never chooses a path.
 #[tauri::command]
 pub async fn export_csv(
@@ -363,6 +396,41 @@ pub async fn export_result_sql(
     export::export_sql(&state, request, &path).await
 }
 
+/// The documents of one MongoDB read as Extended JSON: a JSON array or one document per line.
+/// The file comes from a native save dialog, as for `export_csv`.
+#[tauri::command]
+pub async fn export_documents(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: DocumentExportRequest,
+) -> Res<ExportResult> {
+    export::check_documents(&state, &request)?;
+    let (name, label, extension) = match request.format {
+        DocumentFormat::Json => ("result.json", "JSON", "json"),
+        DocumentFormat::Ndjson => ("result.ndjson", "NDJSON", "ndjson"),
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(name)
+        .add_filter(label, &[extension])
+        .save_file(move |p| {
+            let _ = tx.send(p);
+        });
+    let picked = rx.await.ok().flatten();
+    let Some(path) = picked else {
+        return Ok(ExportResult {
+            cancelled: true,
+            rows: 0,
+            path: String::new(),
+        });
+    };
+    let path = path
+        .into_path()
+        .map_err(|e| AppError::invalid("Choose a file to export to").with_detail(e.to_string()))?;
+    export::export_documents(&state, request, &path).await
+}
+
 /// One table as a `.sql` file: its DDL, plus INSERT statements when `request.data`. The file
 /// comes from a native save dialog, as for `export_csv`.
 #[tauri::command]
@@ -371,12 +439,17 @@ pub async fn export_table_sql(
     state: State<'_, AppState>,
     request: TableExportRequest,
 ) -> Res<ExportResult> {
-    connections::get(&state, &request.conn_id)?;
+    let conn = connections::get(&state, &request.conn_id)?;
+    // A MongoDB export is a mongosh script, not SQL.
+    let (name, label, extension) = match conn.engine {
+        Engine::Mongo => (format!("{}.js", request.table), "JavaScript", "js"),
+        _ => (format!("{}.sql", request.table), "SQL", "sql"),
+    };
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
-        .set_file_name(format!("{}.sql", request.table))
-        .add_filter("SQL", &["sql"])
+        .set_file_name(name)
+        .add_filter(label, &[extension])
         .save_file(move |p| {
             let _ = tx.send(p);
         });

@@ -15,6 +15,7 @@ use crate::core::db::pool::DbPool;
 use crate::core::db::query::{mysql_cell, pg_cell, sqlite_cell};
 use crate::core::db::session::{self, Conn};
 use crate::core::error::AppError;
+use crate::core::mongo;
 use crate::core::sql::{facts, split};
 use crate::core::state::AppState;
 
@@ -42,6 +43,36 @@ pub struct SqlExportRequest {
     pub table: String,
     #[serde(default)]
     pub options: SqlOptions,
+}
+
+/// A MongoDB read as Extended JSON, one document after the other.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocumentExportRequest {
+    #[serde(flatten)]
+    pub query: ExportRequest,
+    pub format: DocumentFormat,
+    pub ejson: EjsonFlavor,
+}
+
+/// How the documents are separated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DocumentFormat {
+    /// One JSON array of documents.
+    Json,
+    /// One document per line (newline-delimited JSON).
+    Ndjson,
+}
+
+/// How BSON values appear in JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EjsonFlavor {
+    /// Numbers as JSON numbers where the type survives, everything else as `{"$type": ...}`.
+    Relaxed,
+    /// Every value keeps its type.
+    Canonical,
 }
 
 /// What a row already in the target does to its INSERT.
@@ -178,15 +209,14 @@ impl SqlPlan {
                 let c = q(i);
                 match self.engine {
                     Engine::Mysql => format!("{c} = VALUES({c})"),
-                    Engine::Pg | Engine::Sqlite => format!("{c} = EXCLUDED.{c}"),
+                    Engine::Pg | Engine::Sqlite | Engine::Mongo => format!("{c} = EXCLUDED.{c}"),
                 }
             })
             .collect();
         let key = o.key.iter().map(q).collect::<Vec<_>>().join(", ");
         let tail = match (o.mode, self.engine) {
-            (InsertMode::Insert, _) | (InsertMode::Skip, Engine::Mysql | Engine::Sqlite) => {
-                String::new()
-            }
+            (InsertMode::Insert, _)
+            | (InsertMode::Skip, Engine::Mysql | Engine::Sqlite | Engine::Mongo) => String::new(),
             (InsertMode::Skip, Engine::Pg) => "\nON CONFLICT DO NOTHING".into(),
             // Every column is in the key: nothing to update.
             (InsertMode::Upsert, Engine::Mysql) if set.is_empty() => {
@@ -209,7 +239,7 @@ impl SqlPlan {
     fn begin(&self) -> &'static str {
         match self.engine {
             Engine::Mysql => "START TRANSACTION;\n\n",
-            Engine::Pg | Engine::Sqlite => "BEGIN;\n\n",
+            Engine::Pg | Engine::Sqlite | Engine::Mongo => "BEGIN;\n\n",
         }
     }
 }
@@ -348,6 +378,9 @@ where
 /// asking the user for a file.
 pub fn check(state: &AppState, req: &ExportRequest) -> Result<(), AppError> {
     let conn = connections::get(state, &req.conn_id)?;
+    if conn.engine == Engine::Mongo {
+        return mongo::export::check(&mongo::parse::parse(&req.sql)?);
+    }
     match split::split(conn.engine, &req.sql).as_slice() {
         [sql] if facts::is_plain_read_sql(conn.engine, sql) => Ok(()),
         _ => Err(AppError::invalid(
@@ -356,10 +389,25 @@ pub fn check(state: &AppState, req: &ExportRequest) -> Result<(), AppError> {
     }
 }
 
+/// `check`, plus a MongoDB connection: Extended JSON is a MongoDB feature. Call it before asking
+/// the user for a file.
+pub fn check_documents(state: &AppState, req: &DocumentExportRequest) -> Result<(), AppError> {
+    let conn = connections::get(state, &req.query.conn_id)?;
+    if conn.engine != Engine::Mongo {
+        return Err(AppError::invalid(
+            "Extended JSON export needs a MongoDB connection",
+        ));
+    }
+    mongo::export::check(&mongo::parse::parse(&req.query.sql)?)
+}
+
 /// `check`, plus a table name and options that make sense for the connection's engine.
 pub fn check_sql(state: &AppState, req: &SqlExportRequest) -> Result<(), AppError> {
     check(state, &req.query)?;
     let engine = connections::get(state, &req.query.conn_id)?.engine;
+    if engine == Engine::Mongo {
+        return Err(AppError::unsupported_mongo());
+    }
     if req.table.trim().is_empty() {
         return Err(AppError::invalid(
             "Name the table for the INSERT statements",
@@ -419,7 +467,21 @@ pub async fn export_csv(
     req: ExportRequest,
     path: &Path,
 ) -> Result<ExportResult, AppError> {
+    let conn = connections::get(state, &req.conn_id)?;
+    if conn.engine == Engine::Mongo {
+        return mongo::export::export_csv(state, &conn, req, path).await;
+    }
     export(state, req, Format::Csv, path).await
+}
+
+/// As `export_csv`, as Extended JSON documents of the read.
+pub async fn export_documents(
+    state: &AppState,
+    req: DocumentExportRequest,
+    path: &Path,
+) -> Result<ExportResult, AppError> {
+    let conn = connections::get(state, &req.query.conn_id)?;
+    mongo::export::export_documents(state, &conn, req, path).await
 }
 
 /// As `export_csv`, as INSERT statements shaped by `req.options`.
@@ -432,7 +494,7 @@ pub async fn export_sql(
     let engine = connections::get(state, &req.query.conn_id)?.engine;
     let quote = match engine {
         Engine::Mysql => dump::quote_bt,
-        Engine::Pg | Engine::Sqlite => dump::quote_dq,
+        Engine::Pg | Engine::Sqlite | Engine::Mongo => dump::quote_dq,
     };
     let table = match req.schema.as_deref().filter(|s| !s.is_empty()) {
         Some(s) => format!("{}.{}", quote(s), quote(&req.table)),
@@ -661,6 +723,9 @@ mod tests {
                 ai_write: false,
                 read_only: true,
                 version: None,
+                uri: String::new(),
+                auth_source: String::new(),
+                topology: None,
             },
             None,
         )

@@ -35,13 +35,21 @@
       {:else}
         <div class="dialog-body">
           <p class="leading-relaxed text-muted">
-            The assistant can then suggest INSERT, UPDATE, DELETE and DDL statements on
+            {#if target.engine === 'mongo'}
+              The assistant can then suggest writes such as insert, update, delete and drop on
+            {:else}
+              The assistant can then suggest INSERT, UPDATE, DELETE and DDL statements on
+            {/if}
             <b class="font-medium text-ink">{target.name}</b>
             <span class="tag {envTag[target.env]}">{target.env}</span>
           </p>
           <ul class="mt-3 space-y-1.5 text-[12.5px]">
             <li class="flex gap-2"><Check size={14} class="mt-px shrink-0 text-emerald-600 dark:text-emerald-400" /> Every write opens a preview. Nothing runs until you approve it.</li>
-            <li class="flex gap-2"><Check size={14} class="mt-px shrink-0 text-emerald-600 dark:text-emerald-400" /> Approved statements run inside a transaction.</li>
+            {#if target.engine === 'mongo'}
+              <li class="flex gap-2"><Check size={14} class="mt-px shrink-0 text-emerald-600 dark:text-emerald-400" /> Each approved write is one mongosh statement and runs alone, not in a transaction.</li>
+            {:else}
+              <li class="flex gap-2"><Check size={14} class="mt-px shrink-0 text-emerald-600 dark:text-emerald-400" /> Approved statements run inside a transaction.</li>
+            {/if}
             <li class="flex gap-2"><Check size={14} class="mt-px shrink-0 text-emerald-600 dark:text-emerald-400" /> Every statement is written to the audit log.</li>
           </ul>
         </div>

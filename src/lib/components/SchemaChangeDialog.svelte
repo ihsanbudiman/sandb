@@ -55,8 +55,10 @@
     pg: ['integer', 'bigint', 'smallint', 'numeric(12,2)', 'text', 'varchar(255)', 'boolean', 'date', 'timestamp', 'timestamptz', 'uuid', 'jsonb', 'bytea'],
     mysql: ['int', 'bigint', 'smallint', 'tinyint(1)', 'decimal(12,2)', 'varchar(255)', 'text', 'date', 'datetime', 'timestamp', 'json', 'blob'],
     sqlite: ['INTEGER', 'REAL', 'TEXT', 'BLOB', 'NUMERIC'],
+    // MongoDB tables never open this dialog; its entries only complete the maps.
+    mongo: [],
   };
-  const methods: Record<typeof e, string[]> = { pg: ['btree', 'hash', 'gin', 'gist', 'brin', 'spgist'], mysql: ['BTREE', 'HASH'], sqlite: [] };
+  const methods: Record<typeof e, string[]> = { pg: ['btree', 'hash', 'gin', 'gist', 'brin', 'spgist'], mysql: ['BTREE', 'HASH'], sqlite: [], mongo: [] };
 
   // Foreign key target: same database; PG may pick another schema.
   let schemas = $state<string[]>([]);

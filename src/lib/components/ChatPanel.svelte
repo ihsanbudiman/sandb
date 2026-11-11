@@ -8,6 +8,7 @@
   import { activeTab } from '../tabs.svelte';
   import { sqlHtml } from '../highlight';
   import { statementRanges } from '../sql/text';
+  import { mongoStatementRanges } from '../mongo/text';
   import { api, ApiError } from '../api';
   import { replyPdf, pdfName } from '../report';
   import { ui, ai, engines, envTag, type Conn } from '../state.svelte';
@@ -35,7 +36,7 @@
 
   const active = $derived(activeTab());
   const activeConn = $derived(active ? connOf({ connId: active.connId, database: active.database }) : undefined);
-  /** A SQL code block in the chat, with the screen position of its Run button. */
+  /** A runnable code block in the chat (SQL or mongosh), with the screen position of its Run button. */
   type RunMenu = { sql: string; source?: Source; kind: 'read' | 'write'; count: number; x: number; y: number; anchor: HTMLElement };
   let runMenu = $state<RunMenu | null>(null);
   const menuConn = $derived(runMenu?.source ? connOf(runMenu.source) : undefined);
@@ -55,26 +56,59 @@
     return active ? { connId: active.connId, database: active.database } : undefined;
   }
 
+  /** True when the source's connection is MongoDB. */
+  const mongoSource = (s: Source | undefined) => (s ? connOf(s)?.engine === 'mongo' : false);
+
+  /** The chat's scope has a Mongo source, so ```javascript fences may hold mongosh even in a reply without Mongo steps. */
+  const scopeMongo = $derived(scope.some((s) => mongoSource(s)));
+
+  /** True when the reply or its chat scope involves MongoDB: ```javascript fences may hold mongosh. */
+  const mongoInReply = (m: Msg) => scopeMongo || m.parts.some((p) => p.kind === 'tool' && (mongoTool(p.name) || mongoSource(p.source)));
+
+  /** The source a code block runs on: the reply's last step of that engine, else a scope connection of it, else the reply's usual source. */
+  function fenceSource(m: Msg, wantMongo: boolean): Source | undefined {
+    for (let i = m.parts.length - 1; i >= 0; i--) {
+      const p = m.parts[i];
+      if (p.kind === 'tool' && p.source && mongoSource(p.source) === wantMongo) return p.source;
+    }
+    const scoped = scope.find((s) => mongoSource(s) === wantMongo);
+    return scoped ?? replySource(m);
+  }
+
   /** Opens the small Run menu under the code block's button; picking an item runs at once. */
-  function openRunMenu(sql: string, anchor: HTMLElement, source?: Source) {
+  async function openRunMenu(sql: string, anchor: HTMLElement, source?: Source) {
     if (runMenu?.anchor === anchor) {
       closeRunMenu();
       return;
     }
-    const kind = statementKind(sql);
-    if (kind === 'empty') return;
     const src = source ?? (active ? { connId: active.connId, database: active.database } : undefined);
     const c = src ? connOf(src) : activeConn;
-    const parts = statementRanges(sql, c?.engine ?? 'pg').filter(([from, to]) => sql.slice(from, to).trim());
-    if (!parts.length) return;
-    const anyWrite = parts.some(([from, to]) => statementKind(sql.slice(from, to)) === 'write');
+    let count = 0;
+    let anyWrite = false;
+    if (c?.engine === 'mongo') {
+      // mongosh text: the editor's splitter counts statements; the guard API says which ones write.
+      count = mongoStatementRanges(sql).length;
+      if (!count) return;
+      const info = await api.classifyWrite('mongo', sql).catch(() => null);
+      // Comment-only text splits as a range but classifies as no statements: nothing to run.
+      // Unparsable text does classify to zero statements plus an `unparsable` warning; it is
+      // treated as a write so it can only be inserted for review, never run blind.
+      if (info && !info.statements.length && !info.warnings.some((w) => w.code === 'unparsable')) return;
+      anyWrite = !info || info.warnings.some((w) => w.code === 'unparsable') || info.statements.some((s) => s.read === false);
+    } else {
+      if (statementKind(sql) === 'empty') return;
+      const parts = statementRanges(sql, c?.engine ?? 'pg').filter(([from, to]) => sql.slice(from, to).trim());
+      if (!parts.length) return;
+      count = parts.length;
+      anyWrite = parts.some(([from, to]) => statementKind(sql.slice(from, to)) === 'write');
+    }
     const r = anchor.getBoundingClientRect();
     const width = 264;
     // A write menu has one warning line and one item instead of two run items.
     const height = anyWrite ? 176 : 132;
     const x = Math.max(8, Math.min(r.right - width, innerWidth - width - 8));
     const y = r.bottom + height + 8 > innerHeight ? Math.max(8, r.top - height - 8) : r.bottom + 8;
-    runMenu = { sql, source: src, kind: anyWrite ? 'write' : 'read', count: parts.length, x, y, anchor };
+    runMenu = { sql, source: src, kind: anyWrite ? 'write' : 'read', count, x, y, anchor };
     requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('.run-menu [role="menuitem"]:not([disabled])')?.focus());
   }
 
@@ -161,7 +195,12 @@
   const suggestions = $derived.by(() => {
     const out: { text: string; write?: boolean }[] = tables.includes('orders') ? [{ text: 'Which order status brings the most revenue?' }, { text: 'Delete cancelled orders older than 90 days', write: true }] : [];
     for (const t of tables.filter((t) => t !== 'orders').slice(0, 2)) out.push({ text: `Show the latest 20 rows of ${t}` });
-    if (tables.length) out.push({ text: 'What tables are in this database, and what do they hold?' });
+    // MongoDB collections are not tables; a mixed chat has both.
+    const mongoCount = scopeConns.filter((c) => c.engine === 'mongo').length;
+    if (tables.length) {
+      const noun = mongoCount === 0 ? 'tables' : mongoCount === scopeConns.length ? 'collections' : 'tables and collections';
+      out.push({ text: `What ${noun} are in this database, and what do they hold?` });
+    }
     return out.filter((s) => writesOn || !s.write).slice(0, 4);
   });
 
@@ -196,12 +235,12 @@
   /** Replies whose steps the user opened while steps are hidden. */
   let revealed = $state<Record<string, boolean>>({});
   /** Steps that read data. A chart step only draws the chart part, so it is not work. */
-  const workSteps = (parts: Part[]) => parts.filter((x): x is ToolPart => x.kind === 'tool' && x.name !== 'render_chart');
+  const workSteps = (parts: Part[]) => parts.filter((x): x is ToolPart => x.kind === 'tool' && !chartTool(x.name));
   /** Index of the last data step; the text before it narrates the work. */
   function workEnd(parts: Part[]) {
     for (let i = parts.length - 1; i >= 0; i--) {
       const x = parts[i];
-      if (x.kind === 'tool' && x.name !== 'render_chart') return i;
+      if (x.kind === 'tool' && !chartTool(x.name)) return i;
     }
     return -1;
   }
@@ -218,7 +257,7 @@
   function isOpen(p: ToolPart, key: string) {
     if (p.status === 'awaiting' && !!chat.pending) return true;
     if (key in opened) return opened[key];
-    return p.status === 'blocked' || p.status === 'denied';
+    return p.status === 'blocked' || p.status === 'denied' || p.status === 'failed';
   }
 
   /** Selected cell of a result table, shown in full under it. */
@@ -248,23 +287,23 @@
   const replyMs = (m: Msg) => (m.started !== undefined && m.ended !== undefined ? m.ended - m.started : undefined);
   /** Time the steps' tools ran; none when no step has finished. */
   const toolMs = (steps: ToolPart[]) => (steps.some((s) => s.ms !== undefined) ? steps.reduce((n, s) => n + (s.ms ?? 0), 0) : undefined);
-  /** The last read that ran without an error; its SQL shows under a reply whose steps are hidden. */
+  /** The last read that ran without an error; its text shows under a reply whose steps are hidden. */
   function lastQuery(parts: Part[]) {
     for (let i = parts.length - 1; i >= 0; i--) {
       const x = parts[i];
-      if (x.kind === 'tool' && x.name === 'run_read_query' && x.status === 'done' && x.sql) return { p: x, sql: x.sql };
+      if (x.kind === 'tool' && readTool(x.name) && x.status === 'done' && x.sql) return { p: x, sql: x.sql };
     }
   }
   /** What the model prepares while the arguments of a tool call still stream. */
   const startingLabel = (name: string) =>
-    name === 'run_read_query' ? 'Writing query…' : name === 'list_tables' || name === 'describe_table' ? 'Reading schema…' : name === 'render_chart' ? 'Preparing chart…' : name === 'propose_write' ? 'Preparing change…' : `Using ${name}…`;
+    readTool(name) ? 'Writing query…' : name === 'list_tables' || name === 'describe_table' ? 'Reading schema…' : chartTool(name) ? 'Preparing chart…' : writeTool(name) ? 'Preparing change…' : `Using ${name}…`;
   /** Columns whose first non-NULL value is a number; they align right, as in the grid. */
   function numeric(rows: Row[]) {
     const out: Record<string, boolean> = {};
     for (const c of Object.keys(rows[0])) out[c] = typeof rows.find((r) => r[c] !== null)?.[c] === 'number';
     return out;
   }
-  /** The model's arguments; steps saved before they were kept fall back to the SQL or table name. */
+  /** The model's arguments; steps saved before they were kept fall back to the query text or table name. */
   const argsOf = (p: ToolPart) => p.args ?? (p.sql === undefined ? {} : p.name === 'describe_table' ? { table: p.sql } : { sql: p.sql });
   /** A step still runs or waits for the user, so the model is not thinking. */
   const busy = (parts: Part[]) => parts.some((x) => x.kind === 'tool' && (x.status === 'running' || (x.status === 'awaiting' && !!chat.pending)));
@@ -358,10 +397,19 @@
     showHistory = false;
   }
 
+  // Follow the stream only while the reader is at the bottom; scrolling up stops it.
+  // A new turn, another chat, or a fresh list (back from history) follows again.
+  let follow = true;
+  let seen: unknown[] = [];
+  function onListScroll() {
+    if (list) follow = list.scrollHeight - list.scrollTop - list.clientHeight < 32;
+  }
+
   $effect(() => {
-    void messages.length;
+    const key = [list, session, messages.length];
     void JSON.stringify(messages.at(-1)?.parts);
-    list?.scrollTo({ top: list.scrollHeight });
+    if (key.some((k, i) => k !== seen[i])) { seen = key; follow = true; }
+    if (follow) list?.scrollTo({ top: list.scrollHeight });
   });
 
   // Puts focus on the safe default of an approval card, so Enter does not run a destructive statement.
@@ -369,12 +417,31 @@
     el.focus({ preventScroll: true });
   }
 
-  const label: Record<string, string> = { list_tables: 'List tables', describe_table: 'Describe table', run_read_query: 'Read query', render_chart: 'Chart', propose_write: 'Proposed write' };
+  const label: Record<string, string> = { list_tables: 'List tables', describe_table: 'Describe table', run_read_query: 'Read query', render_chart: 'Chart', propose_write: 'Proposed write', run_mongo_read: 'Read query', render_mongo_chart: 'Chart', propose_mongo_write: 'Proposed write' };
+  // The Mongo tools take one mongosh statement in `query`; the UI treats them like their SQL twins.
+  const mongoTool = (name: string) => name === 'run_mongo_read' || name === 'render_mongo_chart' || name === 'propose_mongo_write';
+  const readTool = (name: string) => name === 'run_read_query' || name === 'run_mongo_read';
+  const writeTool = (name: string) => name === 'propose_write' || name === 'propose_mongo_write';
+  const chartTool = (name: string) => name === 'render_chart' || name === 'render_mongo_chart';
+  /** "SQL" or "query": what the step's text is, for button labels. */
+  const textNoun = (p: ToolPart) => (mongoTool(p.name) ? 'query' : 'SQL');
   const fmt = (v: unknown) => (typeof v === 'number' ? v.toLocaleString() : v !== null && typeof v === 'object' ? formatCell(v) : String(v));
   /** Full text of a cell for the cell view. */
   const full = (v: unknown) => (v !== null && typeof v === 'object' && !('$bytes' in v) ? JSON.stringify(v, null, 2) : fmt(v));
   const bold = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\*\*(.+?)\*\*/g, '<b class="font-semibold">$1</b>');
-  const destructive = (sql: string) => /^\s*(delete|drop|truncate)/i.test(sql);
+  /** A step that removes data: SQL DDL/DML, or the Mongo delete/drop methods. */
+  const destructive = (p: ToolPart) => {
+    const sql = p.sql ?? '';
+    if (mongoTool(p.name)) return /\.\s*(deleteMany|deleteOne|findOneAndDelete|dropIndexes|dropIndex|dropDatabase|drop|remove)\s*\(/.test(sql);
+    return /^\s*(delete|drop|truncate)/i.test(sql);
+  };
+  /** The write's method for the preview badge: the guard's statement kind when the preview carried it, else the last method call of the mongosh text. */
+  const mongoTag = (p: ToolPart) => {
+    const kind = p.info?.statements[0]?.kind;
+    if (kind) return kind;
+    const calls = [...(p.sql ?? '').matchAll(/\.\s*([A-Za-z_$][\w$]*)\s*\(/g)].map((m) => m[1]);
+    return calls.at(-1) ?? (p.sql ?? '').trim().split(/\s+/)[0]?.toUpperCase() ?? '';
+  };
   const ago = (t: number) => {
     const m = Math.round((Date.now() - t) / 60000);
     if (m < 1) return 'just now';
@@ -384,7 +451,7 @@
   };
 
   // Transcript status word and its text color.
-  const statusText: Record<string, string> = { running: 'RUNNING', done: 'OK', blocked: 'BLOCKED', awaiting: 'NEEDS APPROVAL', approved: 'APPROVED', denied: 'DENIED' };
+  const statusText: Record<string, string> = { running: 'RUNNING', done: 'OK', blocked: 'BLOCKED', awaiting: 'NEEDS APPROVAL', approved: 'APPROVED', denied: 'DENIED', failed: 'FAILED' };
   const statusTone: Record<string, string> = {
     running: 'text-accent',
     done: 'text-emerald-700 dark:text-emerald-400',
@@ -392,16 +459,28 @@
     awaiting: 'text-amber-700 dark:text-amber-400',
     approved: 'text-emerald-700 dark:text-emerald-400',
     denied: 'text-red-700 dark:text-red-400',
+    failed: 'text-red-700 dark:text-red-400',
+  };
+  /** What each status means, for the tooltip and the accessible label. */
+  const statusLabel: Record<string, string> = {
+    running: 'The step is running',
+    done: 'The step finished',
+    blocked: 'The guard rejected the step',
+    awaiting: 'The write needs your approval',
+    approved: 'The write was approved and ran',
+    denied: 'The write was denied',
+    failed: 'The step failed with an error',
   };
 
   const placeholder = $derived(chat.question ? 'Type your own answer…' : chat.pending ? 'Approve or deny the write above…' : ready ? (many ? 'Ask across these databases…' : 'Ask about your data…') : 'Add a database to ask about…');
 </script>
 
-<!-- SQL actions of a read: of a step, and of the "Query used" box under a reply whose steps are hidden. -->
+<!-- Text actions of a read: of a step, and of the "Query used" box under a reply whose steps are hidden. -->
 {#snippet sqlTools(p: ToolPart, key: string)}
-  <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Copy SQL" aria-label="Copy SQL" onclick={() => copy(`${key}:sql`, p.sql!)}>{#if copied === `${key}:sql`}<Check size={13} />{:else}<Copy size={13} />{/if}</button>
-  <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Put the SQL in the editor" aria-label="Put the SQL in the editor" onclick={() => onInsertSql(p.sql!, p.source)}><FileCode size={13} /></button>
-  {#if p.name === 'run_read_query' && p.status === 'done'}
+  {@const noun = textNoun(p)}
+  <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Copy {noun}" aria-label="Copy {noun}" onclick={() => copy(`${key}:sql`, p.sql!)}>{#if copied === `${key}:sql`}<Check size={13} />{:else}<Copy size={13} />{/if}</button>
+  <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Put the {noun} in the editor" aria-label="Put the {noun} in the editor" onclick={() => onInsertSql(p.sql!, p.source)}><FileCode size={13} /></button>
+  {#if readTool(p.name) && p.status === 'done'}
     <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Open in the results grid (new tab)" aria-label="Open in the results grid" onclick={() => onRunSql(p.sql!, p.source)}><Table2 size={13} /></button>
   {/if}
 {/snippet}
@@ -435,7 +514,7 @@
       {/each}
     </div>
   {:else}
-  <div bind:this={list} class="flex-1 space-y-4 overflow-auto px-4 pt-3 pb-4">
+  <div bind:this={list} onscroll={onListScroll} class="flex-1 space-y-4 overflow-auto px-4 pt-3 pb-4">
     {#if messages.length === 0}
       <div class="pt-8">
         <div class="grid size-8 place-items-center rounded-lg bg-accent/12 text-accent"><Sparkles size={15} /></div>
@@ -475,7 +554,7 @@
             {#if b.kind === 'part'}
             {@const p = b.p}
             {#if p.kind === 'text'}
-              <Markdown text={p.text} onrunsql={(sql, anchor) => openRunMenu(sql, anchor, replySource(m))} />
+              <Markdown text={p.text} mongo={mongoInReply(m)} onrunsql={(sql, anchor, mongo) => openRunMenu(sql, anchor, fenceSource(m, mongo))} />
             {:else if p.kind === 'chart'}
               <ChartView part={p} />
             {:else if p.kind === 'question'}
@@ -518,7 +597,7 @@
             {:else}
               {@const running = b.steps.some((s) => s.p.status === 'running')}
               {@const asking = b.steps.some((s) => s.p.status === 'awaiting') && !!chat.pending}
-              {@const danger = asking && b.steps.some((s) => s.p.status === 'awaiting' && !!s.p.sql && destructive(s.p.sql))}
+              {@const danger = asking && b.steps.some((s) => s.p.status === 'awaiting' && !!s.p.sql && destructive(s.p))}
               {@const total = b.steps.reduce((n, s) => n + (s.p.ms ?? 0), 0)}
               <div class="overflow-hidden rounded-lg border {asking ? (danger ? 'border-red-500/50 ring-3 ring-red-500/10' : 'border-amber-500/50 ring-3 ring-amber-500/10') : 'border-line'}">
                 <div class="flex h-7 items-center gap-2 bg-sunken px-2.5 text-[11.5px] text-faint">
@@ -534,22 +613,24 @@
                     {@const key = stepKey(mi, at)}
                     {@const open = isOpen(p, key)}
                     {@const waiting = p.status === 'awaiting' && !!chat.pending}
-                    {@const risky = waiting && !!p.sql && destructive(p.sql)}
-                    {@const failed = p.status === 'blocked' || p.status === 'denied'}
+                    {@const risky = waiting && !!p.sql && destructive(p)}
+                    {@const refused = p.status === 'blocked' || p.status === 'denied'}
+                    {@const failed = refused || p.status === 'failed'}
                     {@const sc = (p.source && connOf(p.source)) || scopeConns[0]}
                     <li class="border-t border-line">
                       <button class="flex h-8 w-full items-center gap-2 px-2.5 text-left text-[12px] hover:bg-hover" aria-expanded={open} onclick={() => (opened[key] = !open)}>
                         <span class="w-3.5 shrink-0 text-center text-[10.5px] text-faint tabular-nums">{si + 1}</span>
                         {#if p.status === 'running'}<LoaderCircle size={13} class="shrink-0 animate-spin text-accent" />
-                        {:else if failed}<Ban size={13} class="shrink-0 text-red-600 dark:text-red-400" />
+                        {:else if refused}<Ban size={13} class="shrink-0 text-red-600 dark:text-red-400" />
+                        {:else if p.status === 'failed'}<TriangleAlert size={13} class="shrink-0 text-red-600 dark:text-red-400" />
                         {:else if p.status === 'awaiting'}<Clock size={13} class="shrink-0 text-amber-600 dark:text-amber-400" />
-                        {:else if p.name === 'render_chart'}<ChartColumn size={13} class="shrink-0 text-emerald-600 dark:text-emerald-400" />
+                        {:else if chartTool(p.name)}<ChartColumn size={13} class="shrink-0 text-emerald-600 dark:text-emerald-400" />
                         {:else}<Check size={13} class="shrink-0 text-emerald-600 dark:text-emerald-400" />{/if}
                         <span class="shrink-0 font-medium text-ink">{label[p.name] ?? p.name}</span>
                         {#if many && p.source}<span class="max-w-24 shrink-0 truncate rounded bg-sunken px-1 font-mono text-[10.5px] text-muted" title={sourceLabel(p.source)}>{dbOf(p.source)}</span>{/if}
                         <span class="min-w-0 flex-1 truncate font-mono text-[11.5px] text-muted">{open && p.name !== 'describe_table' ? '' : target(p)}</span>
                         <span class="shrink-0 text-[11px] text-faint tabular-nums">{duration(p.ms)}</span>
-                        {#if p.status !== 'done'}<span class="shrink-0 text-[11.5px] {statusTone[p.status]}"><span class="sentence">{statusText[p.status] ?? p.status}</span></span>{/if}
+                        {#if p.status !== 'done'}<span class="shrink-0 text-[11.5px] {statusTone[p.status]}" title={statusLabel[p.status] ?? p.status}><span class="sr-only">{statusLabel[p.status] ?? p.status}: </span><span class="sentence">{statusText[p.status] ?? p.status}</span></span>{/if}
                         <ChevronRight size={13} class="shrink-0 text-faint transition-transform {open ? 'rotate-90' : ''}" />
                       </button>
                       {#if open}
@@ -593,7 +674,7 @@
                             </div>
                           {/if}
                           {#if p.truncated}
-                            <div class="border-t border-line px-3 py-1.5 text-[12px] text-amber-700 dark:text-amber-400">More rows exist. The chat shows the first {p.rows.length}.{p.name === 'run_read_query' ? ' Open the query in the grid to see all rows.' : ''}</div>
+                            <div class="border-t border-line px-3 py-1.5 text-[12px] text-amber-700 dark:text-amber-400">More rows exist. The chat shows the first {p.rows.length}.{readTool(p.name) ? ' Open the query in the grid to see all rows.' : ''}</div>
                           {/if}
                         {/if}
                         {#if waiting && p.sql && sc}
@@ -602,13 +683,12 @@
                               <span class="font-mono text-[10.5px] font-semibold {engines[sc.engine].badge}">{engines[sc.engine].short}</span>
                               <span class="min-w-0 truncate font-medium">{p.source ? sourceLabel(p.source) : sc.name}</span>
                               <span class="tag {envTag[sc.env]}">{sc.env}</span>
-                              <span class="tag font-mono text-amber-700 dark:text-amber-400">{p.sql.trim().split(/\s+/)[0].toUpperCase()}</span>
-                              <span class="ml-auto shrink-0 text-faint tabular-nums">≈ 214 rows</span>
+                              <span class="tag font-mono text-amber-700 dark:text-amber-400">{mongoTool(p.name) ? mongoTag(p) : p.sql.trim().split(/\s+/)[0].toUpperCase()}</span>
                             </div>
                             {#if risky}
                               <div class="flex gap-2 rounded-md bg-red-500/8 px-2.5 py-2 text-[12px] leading-relaxed text-red-700 dark:text-red-300">
                                 <TriangleAlert size={13} class="mt-0.5 shrink-0" />
-                                <span>This statement removes data. It runs inside a transaction, but you cannot undo it after it commits.</span>
+                                <span>{sc.engine === 'mongo' ? 'This statement removes data. You cannot undo it after it runs.' : 'This statement removes data. It runs inside a transaction, but you cannot undo it after it commits.'}</span>
                               </div>
                             {:else}
                               <p class="text-[12px] text-muted">It runs only if you approve it.</p>
@@ -631,7 +711,7 @@
                             {#if sqlActions}
                               <span class="flex shrink-0 items-center">
                                 {@render sqlTools(p, key)}
-                                {#if p.name === 'run_read_query' && p.status !== 'blocked'}
+                                {#if readTool(p.name) && p.status !== 'blocked'}
                                   <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink disabled:opacity-40" title="Run again" aria-label="Run again" disabled={p.status === 'running'} onclick={() => rerun(p)}><RotateCw size={13} /></button>
                                 {/if}
                                 {#if p.rows?.length}

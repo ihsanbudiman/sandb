@@ -13,6 +13,7 @@ function bridgeBackend(): Backend {
     updateConnection: (id, input, password) => load.then((b) => b.updateConnection(id, input, password)),
     duplicateConnection: (id, input, password) => load.then((b) => b.duplicateConnection(id, input, password)),
     deleteConnection: (id) => load.then((b) => b.deleteConnection(id)),
+    reorderConnections: (ids) => load.then((b) => b.reorderConnections(ids)),
     testConnection: (input, password, id) => load.then((b) => b.testConnection(input, password, id)),
     listDatabases: (connId) => load.then((b) => b.listDatabases(connId)),
     listSchemas: (connId, database) => load.then((b) => b.listSchemas(connId, database)),
@@ -33,11 +34,12 @@ function bridgeBackend(): Backend {
     quitApp: () => load.then((b) => b.quitApp()),
     exportCsv: (connId, database, sql, tabId) => load.then((b) => b.exportCsv(connId, database, sql, tabId)),
     exportResultSql: (connId, database, sql, schema, table, options, tabId) => load.then((b) => b.exportResultSql(connId, database, sql, schema, table, options, tabId)),
+    exportDocuments: (connId, database, sql, format, ejson) => load.then((b) => b.exportDocuments(connId, database, sql, format, ejson)),
     tableDdl: (connId, database, schema, table) => load.then((b) => b.tableDdl(connId, database, schema, table)),
     exportTableSql: (connId, database, schema, table, data) => load.then((b) => b.exportTableSql(connId, database, schema, table, data)),
     savePdf: (name, pdf) => load.then((b) => b.savePdf(name, pdf)),
     guardCheck: (engine, sql) => load.then((b) => b.guardCheck(engine, sql)),
-    classifyWrite: (engine, sql) => load.then((b) => b.classifyWrite(engine, sql)),
+    classifyWrite: (engine, sql, database) => load.then((b) => b.classifyWrite(engine, sql, database)),
     runAiRead: (connId, database, sql) => load.then((b) => b.runAiRead(connId, database, sql)),
     getAiSettings: () => load.then((b) => b.getAiSettings()),
     saveAiSettings: (settings) => load.then((b) => b.saveAiSettings(settings)),
@@ -46,6 +48,8 @@ function bridgeBackend(): Backend {
     listAiModels: (settings, key) => load.then((b) => b.listAiModels(settings, key)),
     chatSend: (request, onEvent) => load.then((b) => b.chatSend(request, onEvent)),
     chatCancel: (chatId) => load.then((b) => b.chatCancel(chatId)),
+    approveWrite: (chatId, id) => load.then((b) => b.approveWrite(chatId, id)),
+    denyWrite: (chatId, id) => load.then((b) => b.denyWrite(chatId, id)),
   };
 }
 

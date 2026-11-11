@@ -2,10 +2,11 @@ import { untrack } from 'svelte';
 import { schemas, tableData, nsOf, type Row, type Cell } from './mock';
 import { active, ui, db, canWrite, flushAi, type Conn } from './state.svelte';
 import { activeTab, defaultDb } from './tabs.svelte';
-import { api, ApiError, type CellValue, type ChartSpec, type ChatEvent, type ChatRequest, type ErrorCode } from './api';
+import { api, ApiError, type CellValue, type ChartSpec, type ChatEvent, type ChatRequest, type ErrorCode, type WriteInfo } from './api';
 import { logQuery, type AuditResult } from './audit.svelte';
 
-export type ToolStatus = 'running' | 'done' | 'blocked' | 'awaiting' | 'approved' | 'denied';
+/** `denied`: the user denied a proposed write, or the guard refused it. `failed`: the tool or the database returned an error. */
+export type ToolStatus = 'running' | 'done' | 'blocked' | 'awaiting' | 'approved' | 'denied' | 'failed';
 /**
  * `id`: the backend's tool call id (live replies only). `args`: the arguments the model sent.
  * `ms`: time from the call to its result. `truncated`: more rows exist than `rows` holds. `error`: the error code of a failed step.
@@ -24,6 +25,8 @@ export type ToolPart = {
   started?: number;
   ms?: number;
   error?: string;
+  /** `write_preview` info: the guard's per-statement kinds and warnings, kept for the preview badge. */
+  info?: WriteInfo;
   source?: Source;
 };
 /** `answer`: missing while the question is open, null when the user skipped it. */
@@ -71,7 +74,7 @@ function load(): Session[] {
       for (const m of s.messages)
         for (const p of m.parts) {
           if (p.kind === 'tool' && (p.status === 'running' || p.status === 'awaiting')) {
-            p.status = 'denied';
+            p.status = 'failed';
             p.note = 'Stopped: the app closed before this step finished. Nothing ran.';
           }
           if (p.kind === 'question' && p.answer === undefined) p.answer = null;
@@ -137,12 +140,15 @@ export const connOf = (s: Source): Conn | undefined => db.connections.find((c) =
 export const dbOf = (s: Source, c = connOf(s)) => s.database ?? (c ? defaultDb(c) : '');
 export const sameSource = (a: Source, b: Source) => a.connId === b.connId && dbOf(a) === dbOf(b);
 
-/** The active tab's connection and database; null while there is no connection. */
+/** The active tab's connection and database; null while there is no connection, or when a MongoDB
+ * tab has no database to query (the chat needs one). */
 function tabSource(): Source | null {
   const c = active();
   if (!c.id) return null;
   const t = activeTab();
-  return { connId: c.id, database: t?.connId === c.id ? t.database : defaultDb(c) };
+  const database = t?.connId === c.id ? t.database : defaultDb(c);
+  if (c.engine === 'mongo' && !database) return null;
+  return { connId: c.id, database };
 }
 
 /** Databases that `s` uses, or the new chat's databases. */
@@ -224,15 +230,15 @@ function finish(t: ToolPart) {
 /** Rows of a read that the chat keeps; the backend sends the same number (`UI_ROWS`). */
 const CHAT_ROWS = 50;
 
-/** Runs the SQL of a finished read step again on the AI read path and replaces its rows. */
+/** Runs the text of a finished read step again on the AI read path and replaces its rows. */
 export async function rerun(t: ToolPart) {
-  if (t.name !== 'run_read_query' || !t.sql || t.status === 'running') return;
+  if ((t.name !== 'run_read_query' && t.name !== 'run_mongo_read') || !t.sql || t.status === 'running') return;
   // Steps saved before they kept their database run on the active tab, as they did then.
   const conn = t.source ? connOf(t.source) : active();
   const tab = activeTab();
   const database = t.source ? t.source.database : tab?.connId === conn?.id && tab?.database ? tab.database : null;
   if (!conn) {
-    t.status = 'denied';
+    t.status = 'failed';
     t.note = 'The connection of this step was deleted.';
     return;
   }
@@ -249,7 +255,7 @@ export async function rerun(t: ToolPart) {
     logQuery({ conn, kind: 'READ', source: 'AI', sql: t.sql, result: { status: 'ok', rows: r.rows.length }, ms: t.ms ?? 0 });
   } catch (e) {
     const err = ApiError.from(e);
-    t.status = BLOCKED[err.code] ? 'blocked' : 'denied';
+    t.status = BLOCKED[err.code] ? 'blocked' : 'failed';
     t.note = err.message;
     t.error = err.code;
     t.ms = Date.now() - t.started;
@@ -291,7 +297,9 @@ export async function send(text: string) {
   s.messages.push({ role: 'assistant', parts: [], started: Date.now() });
   const msg = s.messages[s.messages.length - 1];
   try {
-    if (api.kind === 'mock') await reply(msg, text, connOf(sources[0])!);
+    // Mock mode scripts SQL flows only; a Mongo source anywhere gives a plain answer instead of fake steps.
+    const mongoConn = sources.map((x) => connOf(x)).find((c) => c?.engine === 'mongo');
+    if (api.kind === 'mock') await reply(msg, text, mongoConn ?? connOf(sources[0])!, !!mongoConn);
     else await liveReply(msg, text, sources, history);
   } finally {
     msg.ended = Date.now();
@@ -310,8 +318,8 @@ function historyOf(messages: Msg[]): ChatRequest['history'] {
   });
 }
 
-const BLOCKED: Partial<Record<ErrorCode, true>> = { guard_rejected: true, write_blocked: true, read_only_violation: true };
-const NOT_BUILT = 'Approving AI writes is not built yet. Copy the SQL to the editor to run it yourself.';
+/** Codes of a step the guard or the write policy refused: `BLOCKED`, never `FAILED`. */
+const BLOCKED: Partial<Record<ErrorCode, true>> = { guard_rejected: true, write_blocked: true, read_only_violation: true, connection_read_only: true };
 
 /** First number of a summary such as "5 rows · 42 ms". */
 const countIn = (summary: string) => Number(/^([\d,]+)/.exec(summary)?.[1].replace(/,/g, '') ?? NaN);
@@ -367,7 +375,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
         break;
       case 'tool_call': {
         if (chat.starting === e.name) chat.starting = null;
-        const sql = typeof e.args.sql === 'string' ? e.args.sql : typeof e.args.table === 'string' ? e.args.table : undefined;
+        const sql = typeof e.args.sql === 'string' ? e.args.sql : typeof e.args.query === 'string' ? e.args.query : typeof e.args.table === 'string' ? e.args.table : undefined;
         const started = Date.now();
         const i = sourceIn(e.args);
         const source = i < 0 ? undefined : { ...sources[i] };
@@ -379,10 +387,22 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
       case 'write_preview': {
         const step = steps.get(e.id);
         if (!step) break;
-        step.part.sql = e.sql;
-        step.part.status = 'awaiting';
-        step.part.note = NOT_BUILT;
+        const { part } = step;
+        part.sql = e.sql;
+        part.info = e.info;
+        part.status = 'awaiting';
         ui.chatOpen = true;
+        // The backend waits for this decision; its `tool_result` follows.
+        chat.pending = {
+          resolve: (ok) => {
+            chat.pending = null;
+            part.status = 'running';
+            if (ok) part.note = 'Running the write…';
+            (ok ? api.approveWrite : api.denyWrite)(chatId, e.id).catch((err) => {
+              part.note = ApiError.from(err).message;
+            });
+          },
+        };
         break;
       }
       case 'chart':
@@ -393,24 +413,25 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
         if (!step) break;
         const { part, started, conn } = step;
         const blocked = !e.ok && !!e.error && !!BLOCKED[e.error.code];
-        // An allowed write stays open: its preview already set the status and the note.
-        if (part.status !== 'awaiting') {
-          part.status = e.ok ? 'done' : blocked ? 'blocked' : 'denied';
-          part.note = e.ok ? e.summary : (e.error?.message ?? e.summary);
-        }
+        const denied = !e.ok && e.error?.code === 'write_denied';
+        const write = isWriteTool(part.name);
+        part.status = e.ok ? (write ? 'approved' : 'done') : denied ? 'denied' : blocked ? 'blocked' : 'failed';
+        part.note = e.ok ? e.summary : (e.error?.message ?? e.summary);
         part.ms = Date.now() - started;
         if (e.error) part.error = e.error.code;
         const columns = e.columns;
         if (e.ok && columns && e.rows?.length) part.rows = e.rows.map((r) => Object.fromEntries(columns.map((c, i) => [c, r[i] as Cell])));
         if (e.truncated) part.truncated = true;
-        if (part.name === 'run_read_query' && part.sql) {
+        if ((part.name === 'run_read_query' || part.name === 'run_mongo_read') && part.sql) {
           const n = countIn(e.summary);
           const result: AuditResult = e.ok ? { status: 'ok', rows: Number.isFinite(n) ? n : (e.rows?.length ?? 0) } : blocked ? { status: 'blocked' } : { status: 'error', message: e.error?.message ?? e.summary };
           logQuery({ conn, kind: 'READ', source: 'AI', sql: part.sql, result, ms: e.ok ? Date.now() - started : 0 });
         }
-        if (part.name === 'propose_write' && part.sql) {
-          const result: AuditResult = part.status === 'awaiting' ? { status: 'error', message: 'Not run: approving AI writes is not built yet' } : blocked ? { status: 'blocked' } : { status: 'error', message: e.error?.message ?? e.summary };
-          logQuery({ conn, kind: 'WRITE', source: 'AI', sql: part.sql, result, ms: 0 });
+        if (write && part.sql) {
+          const n = countIn(e.summary);
+          const ms = Number(/(\d+) ms$/.exec(e.summary)?.[1] ?? 0);
+          const result: AuditResult = e.ok ? { status: 'ok', rows: Number.isFinite(n) ? n : 0 } : e.error?.code === 'write_denied' ? { status: 'denied' } : blocked ? { status: 'blocked' } : { status: 'error', message: e.error?.message ?? e.summary };
+          logQuery({ conn, kind: 'WRITE', source: 'AI', sql: part.sql, result, ms: e.ok ? ms : 0 });
         }
         break;
       }
@@ -432,20 +453,34 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
       fail(err.code, err.message);
     }
   } finally {
-    // Steps without a result can never finish now.
-    for (const { part } of steps.values())
+    // Steps without a result can never finish now. A write still waiting for approval never ran:
+    // the audit log gets the same WRITE/denied row a Deny click would leave.
+    for (const { part, conn } of steps.values()) {
       if (part.status === 'running') {
-        part.status = 'denied';
+        part.status = 'failed';
         part.note = 'Stopped before this step finished.';
+      } else if (part.status === 'awaiting' && isWriteTool(part.name) && part.sql) {
+        part.status = 'failed';
+        part.note = 'Stopped: the write was not approved, nothing ran.';
+        logQuery({ conn, kind: 'WRITE', source: 'AI', sql: part.sql, result: { status: 'denied' }, ms: 0 });
       }
+    }
   }
 }
 
 const WRITE = /\b(delete|remove|update|insert|drop|truncate|alter|mark)\b/i;
+
+/** The propose_* tools: their result is a write that needs (or got) approval. */
+const isWriteTool = (name: string) => name === 'propose_write' || name === 'propose_mongo_write';
 const find = (tables: string[], name: string) => tables.find((t) => t.toLowerCase() === name.toLowerCase());
 
 // Prototype only: scripted agent that mimics the real tool-calling loop.
-async function reply(msg: Msg, text: string, conn: Conn) {
+async function reply(msg: Msg, text: string, conn: Conn, mongo = false) {
+  // Mock mode has no scripted Mongo flow: a Mongo source gets a plain answer, not fake tool steps.
+  if (mongo || conn.engine === 'mongo') {
+    await stream(msg, `I can read MongoDB collections on **${conn.name}**, but the demo build has no scripted Mongo answers. Ask a question about a collection and the live assistant will query it.`);
+    return;
+  }
   const schema = schemas[conn.schema];
   const tables = Object.keys(schema);
   const wantsSqlBlock = /\bsql\s+(?:block|code|snippet)\b/i.test(text);

@@ -15,8 +15,25 @@ const toolScenarios = {
   write: ['propose_write', { sql: "UPDATE orders SET status = 'shipped' WHERE id = 1" }],
   chart: ['render_chart', { sql: 'SELECT status, count(*) AS orders FROM orders GROUP BY status ORDER BY status', type: 'bar', title: 'Orders by status', x: 'status', y: ['orders'] }],
 };
-// Checked in this order, so "error" and "slow" win over tool keywords.
-const keywords = ['error', 'slow', 'bypass', 'write', 'chart', 'describe', 'count', 'list'];
+// MongoDB scenarios on the seed database shop_staging. "mongo write" and "mongo out" use the
+// first ai_it_* name in the message as their scratch collection (default ai_it_mock).
+const mongoScenarios = {
+  'mongo read': () => ['run_mongo_read', { query: 'db.orders.find({status: "paid"}, {status: 1, total: 1}).sort({_id: 1}).limit(5)' }],
+  'mongo chart': () => ['render_mongo_chart', {
+    query: 'db.orders.aggregate([{$group: {_id: "$status", orders: {$sum: 1}, revenue: {$sum: "$total"}}}, {$sort: {_id: 1}}])',
+    type: 'bar', title: 'Orders by status', x: '_id', y: ['orders', 'revenue'],
+  }],
+  'mongo write': (coll) => ['propose_mongo_write', { query: `db.${coll}.insertOne({item: "mock", qty: 1})` }],
+  'mongo out': (coll) => ['run_mongo_read', { query: `db.orders.aggregate([{$match: {status: "paid"}}, {$out: "${coll}"}])` }],
+};
+// "mixed": one step per tool result, a PG read on db1 and then a MongoDB read on db2.
+const mixedSteps = [
+  ['run_read_query', { source: 'db1', sql: 'SELECT count(*) AS orders FROM orders' }],
+  ['run_mongo_read', { source: 'db2', query: 'db.orders.countDocuments({})' }],
+];
+// Checked in this order, so "error" and "slow" win over tool keywords, and the two-word MongoDB
+// keywords win over "write" and "chart".
+const keywords = ['error', 'slow', 'mixed', 'mongo out', 'mongo write', 'mongo chart', 'mongo read', 'bypass', 'write', 'chart', 'describe', 'count', 'list'];
 
 let seq = 0;
 const nextId = (p) => `${p}_${Date.now().toString(36)}${(++seq).toString(36)}`;
@@ -35,14 +52,28 @@ const textOf = (content) =>
 function plan(body) {
   const msgs = Array.isArray(body.messages) ? body.messages : [];
   const last = msgs[msgs.length - 1];
+  const userAt = msgs.findLastIndex((m) => m.role === 'user');
+  const lastUser = msgs[userAt];
+  const q = textOf(lastUser?.content).toLowerCase();
+  const kw = keywords.find((k) => new RegExp(`\\b${k}\\b`).test(q));
+  if (kw === 'mixed') {
+    const results = msgs.slice(userAt + 1).filter((m) => m.role === 'tool').map((m) => textOf(m.content));
+    if (results.length < mixedSteps.length) {
+      const [name, args] = mixedSteps[results.length];
+      return { kind: 'tool', name, args: JSON.stringify(args) };
+    }
+    return { kind: 'text', text: `Mixed results received: ${results.map((r) => r.slice(0, 200)).join(' | ')}` };
+  }
   if (last?.role === 'tool') {
     return { kind: 'text', text: `Tool result received: ${textOf(last.content).slice(0, 200)}` };
   }
-  const lastUser = [...msgs].reverse().find((m) => m.role === 'user');
-  const q = textOf(lastUser?.content).toLowerCase();
-  const kw = keywords.find((k) => new RegExp(`\\b${k}\\b`).test(q));
   if (kw === 'error') return { kind: 'error' };
   if (kw === 'slow') return { kind: 'slow' };
+  if (kw in mongoScenarios) {
+    const coll = q.match(/\bai_it_\w+/)?.[0] ?? 'ai_it_mock';
+    const [name, args] = mongoScenarios[kw](coll);
+    return { kind: 'tool', name, args: JSON.stringify(args) };
+  }
   if (kw) {
     const [name, args] = toolScenarios[kw];
     return { kind: 'tool', name, args: JSON.stringify(args) };

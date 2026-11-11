@@ -11,11 +11,12 @@ use sqlx::mysql::{
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions};
 
-use crate::core::connections::{Connection, Engine, SslMode, expand_home};
+use crate::core::connections::{Connection, Engine, SslMode, Topology, expand_home};
 use crate::core::error::{AppError, ErrorCode};
+use crate::core::mongo;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_CONNECTIONS: u32 = 5;
+pub(crate) const MAX_CONNECTIONS: u32 = 5;
 /// Database pools kept per saved connection; browsing more databases closes the least recently used.
 const MAX_POOLS_PER_CONNECTION: usize = 8;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -226,6 +227,7 @@ pub(crate) async fn connect_one(
         Engine::Sqlite => Err(AppError::internal(
             "SQLite kills never use a second connection",
         )),
+        Engine::Mongo => Err(AppError::unsupported_mongo()),
     }
 }
 
@@ -278,11 +280,21 @@ fn open_lazy(c: &Connection, password: Option<&str>) -> Result<DbPool, AppError>
             }
             DbPool::Sqlite(o.connect_lazy_with(sqlite_options(c, read_only)?))
         }
+        // MongoDB has its own client; no SQL pool opens for it. This refuses every SQL path
+        // (browse, query, chat, export, edit) on a Mongo connection with `unsupported`.
+        Engine::Mongo => return Err(AppError::unsupported_mongo()),
     })
 }
 
+/// What "Test connection" reports.
+pub struct ServerInfo {
+    pub version: String,
+    /// MongoDB only.
+    pub topology: Option<Topology>,
+}
+
 /// Opens one connection (not pooled), reads the server version and closes it. Times out after 10 s.
-pub async fn probe(c: &Connection, password: Option<&str>) -> Result<String, AppError> {
+pub async fn probe(c: &Connection, password: Option<&str>) -> Result<ServerInfo, AppError> {
     let work = async {
         match c.engine {
             Engine::Pg => {
@@ -291,7 +303,10 @@ pub async fn probe(c: &Connection, password: Option<&str>) -> Result<String, App
                     .fetch_one(&mut conn)
                     .await?;
                 let _ = conn.close().await;
-                Ok::<_, AppError>(format_pg_version(&v))
+                Ok::<_, AppError>(ServerInfo {
+                    version: format_pg_version(&v),
+                    topology: None,
+                })
             }
             Engine::Mysql => {
                 let mut conn = MySqlConnection::connect_with(&mysql_options(c, password)).await?;
@@ -299,7 +314,10 @@ pub async fn probe(c: &Connection, password: Option<&str>) -> Result<String, App
                     .fetch_one(&mut conn)
                     .await?;
                 let _ = conn.close().await;
-                Ok(format_mysql_version(&v))
+                Ok(ServerInfo {
+                    version: format_mysql_version(&v),
+                    topology: None,
+                })
             }
             Engine::Sqlite => {
                 let mut conn = SqliteConnection::connect_with(&sqlite_options(c, true)?).await?;
@@ -307,7 +325,17 @@ pub async fn probe(c: &Connection, password: Option<&str>) -> Result<String, App
                     .fetch_one(&mut conn)
                     .await?;
                 let _ = conn.close().await;
-                Ok(format!("SQLite {v}"))
+                Ok(ServerInfo {
+                    version: format!("SQLite {v}"),
+                    topology: None,
+                })
+            }
+            Engine::Mongo => {
+                let (version, topology) = mongo::conn::probe(c, password).await?;
+                Ok(ServerInfo {
+                    version,
+                    topology: Some(topology),
+                })
             }
         }
     };
@@ -358,6 +386,9 @@ mod tests {
             file: file.to_string_lossy().into_owned(),
             ai_write: false,
             read_only: false,
+            uri: String::new(),
+            auth_source: String::new(),
+            topology: None,
         }
     }
 

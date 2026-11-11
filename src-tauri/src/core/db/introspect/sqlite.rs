@@ -68,6 +68,8 @@ pub async fn columns(p: &SqlitePool, table: &str) -> Result<Vec<ColumnInfo>, App
             default,
             is_pk: pk > 0,
             pk_ordinal: (pk > 0).then_some(pk as u32),
+            frequency: None,
+            sample_size: None,
         })
         .collect())
 }
@@ -221,6 +223,7 @@ pub async fn properties(p: &SqlitePool, table: &str) -> Result<Option<TablePrope
                 primary: origin == "pk",
                 method: None,
                 definition: sql,
+                mongo: None,
             };
             (index, origin == "u")
         },
@@ -305,6 +308,7 @@ pub async fn properties(p: &SqlitePool, table: &str) -> Result<Option<TablePrope
         constraints,
         foreign_keys: group_foreign_keys(foreign_keys),
         references: group_foreign_keys(references),
+        mongo: None,
     }))
 }
 

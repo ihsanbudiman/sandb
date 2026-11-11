@@ -16,8 +16,10 @@ const CLOSE_TAB_ID: &str = "sandb-close-tab";
 const CLOSE_WINDOW_ID: &str = "sandb-close-window";
 
 fn has_pending<R: Runtime, M: Manager<R>>(m: &M) -> bool {
-    m.try_state::<AppState>()
-        .is_some_and(|s| !s.sessions.pending_tab_ids().is_empty())
+    m.try_state::<AppState>().is_some_and(|s| {
+        !s.sessions.pending_tab_ids().is_empty()
+            || s.unsaved_edits.load(std::sync::atomic::Ordering::Relaxed)
+    })
 }
 
 /// The default menu's Quit is the native `terminate:` action, which exits without a close request
@@ -161,6 +163,7 @@ pub fn run() {
             commands::update_connection,
             commands::duplicate_connection,
             commands::delete_connection,
+            commands::reorder_connections,
             commands::test_connection,
             commands::list_databases,
             commands::list_schemas,
@@ -181,8 +184,10 @@ pub fn run() {
             commands::tab_status,
             commands::close_tab_session,
             commands::quit_app,
+            commands::set_unsaved_edits,
             commands::export_csv,
             commands::export_result_sql,
+            commands::export_documents,
             commands::save_pdf,
             commands::guard_check,
             commands::classify_write,
@@ -194,6 +199,8 @@ pub fn run() {
             commands::list_ai_models,
             commands::chat_send,
             commands::chat_cancel,
+            commands::approve_write,
+            commands::deny_write,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

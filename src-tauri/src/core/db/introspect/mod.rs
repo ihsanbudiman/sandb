@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::core::connections::{self, Engine};
 use crate::core::db::pool::DbPool;
 use crate::core::error::AppError;
+use crate::core::mongo;
 use crate::core::state::AppState;
 
 /// Columns in one autocomplete snapshot; larger schemas are cut and flagged `truncated`.
@@ -58,6 +59,12 @@ pub struct ColumnInfo {
     /// 1-based position in the primary key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pk_ordinal: Option<u32>,
+    /// MongoDB only: the share of sampled documents that have this field, 0.0 to 1.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency: Option<f64>,
+    /// MongoDB only: the number of documents in the sample the fields come from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -101,6 +108,29 @@ pub struct IndexInfo {
     /// Full `CREATE INDEX` text when the engine gives it (PG, SQLite).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition: Option<String>,
+    /// MongoDB only: the parts of the index that have no SQL counterpart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mongo: Option<MongoIndexInfo>,
+}
+
+/// A MongoDB index as `listIndexes` describes it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoIndexInfo {
+    /// The key document as compact relaxed Extended JSON, e.g. `{"status":1,"createdAt":-1}`.
+    pub keys: String,
+    pub sparse: bool,
+    pub hidden: bool,
+    /// `expireAfterSeconds`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<i64>,
+    /// `partialFilterExpression`, as compact relaxed Extended JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partial_filter: Option<String>,
+    /// The remaining options (collation, weights, default_language, ...), as compact relaxed
+    /// Extended JSON; absent when the index has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -151,6 +181,49 @@ pub struct TableProperties {
     pub foreign_keys: Vec<ForeignKeyInfo>,
     /// Foreign keys of other tables (or self-references) that point at this table.
     pub references: Vec<ForeignKeyInfo>,
+    /// MongoDB only: everything the SQL fields have no room for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mongo: Option<MongoCollectionInfo>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MongoCollectionKind {
+    #[default]
+    Collection,
+    View,
+    Timeseries,
+}
+
+/// A MongoDB collection as `listCollections` and `$collStats` describe it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoCollectionInfo {
+    pub kind: MongoCollectionKind,
+    /// The whole validator document, as pretty (2-space) relaxed Extended JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_action: Option<String>,
+    /// The other `listCollections` options (capped, size, max, timeseries, collation, viewOn,
+    /// pipeline, ...) as pretty relaxed Extended JSON; `{}` when there are none.
+    pub options: String,
+    /// Absent for views, and when the user may not read the stats.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<MongoCollectionStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MongoCollectionStats {
+    pub count: i64,
+    pub size: i64,
+    pub avg_obj_size: f64,
+    pub storage_size: i64,
+    pub total_index_size: i64,
+    pub nindexes: i64,
 }
 
 /// One table or view, ordered as the engine lists them, at most `SNAPSHOT_MAX_TABLES + 1`.
@@ -234,6 +307,14 @@ fn engine_of(state: &AppState, conn_id: &str) -> Result<Engine, AppError> {
 
 /// Databases the user can open. SQLite has exactly one: `main`.
 pub async fn list_databases(state: &AppState, conn_id: &str) -> Result<Vec<String>, AppError> {
+    let conn = connections::get(state, conn_id)?;
+    if conn.engine == Engine::Mongo {
+        return mongo::introspect::databases(
+            &mongo::client::client(state, conn_id).await?,
+            &conn.database,
+        )
+        .await;
+    }
     // PG and MySQL list databases from the connection's own database.
     match connections::pool(state, conn_id)? {
         DbPool::Pg(p) => pg::databases(&p).await,
@@ -249,6 +330,7 @@ pub async fn list_schemas(
     database: &str,
 ) -> Result<Vec<String>, AppError> {
     if engine_of(state, conn_id)? != Engine::Pg {
+        // MongoDB has no schema level and, like MySQL and SQLite, never opens a pool here.
         return Ok(vec![]);
     }
     match connections::pool_for(state, conn_id, Some(database))? {
@@ -264,6 +346,10 @@ pub async fn list_tables(
     database: &str,
     schema: Option<&str>,
 ) -> Result<Vec<TableInfo>, AppError> {
+    if engine_of(state, conn_id)? == Engine::Mongo {
+        return mongo::introspect::tables(&mongo::client::client(state, conn_id).await?, database)
+            .await;
+    }
     match connections::pool_for(state, conn_id, Some(database))? {
         DbPool::Pg(p) => pg::tables(&p, schema.unwrap_or("public")).await,
         DbPool::MySql(p) => mysql::tables(&p, database).await,
@@ -278,6 +364,15 @@ pub async fn list_columns(
     schema: Option<&str>,
     table: &str,
 ) -> Result<Vec<ColumnInfo>, AppError> {
+    if engine_of(state, conn_id)? == Engine::Mongo {
+        // An empty collection yields an empty list; only an unknown name is `not_found`.
+        return mongo::introspect::columns(
+            &mongo::client::client(state, conn_id).await?,
+            database,
+            table,
+        )
+        .await;
+    }
     let cols = match connections::pool_for(state, conn_id, Some(database))? {
         DbPool::Pg(p) => pg::columns(&p, schema.unwrap_or("public"), table).await?,
         DbPool::MySql(p) => mysql::columns(&p, database, table).await?,
@@ -294,6 +389,13 @@ pub async fn schema_snapshot(
     conn_id: &str,
     database: &str,
 ) -> Result<SchemaSnapshot, AppError> {
+    if engine_of(state, conn_id)? == Engine::Mongo {
+        return mongo::introspect::snapshot(
+            &mongo::client::client(state, conn_id).await?,
+            database,
+        )
+        .await;
+    }
     let (tables, rows) = match connections::pool_for(state, conn_id, Some(database))? {
         DbPool::Pg(p) => (pg::snapshot_tables(&p).await?, pg::snapshot(&p).await?),
         DbPool::MySql(p) => (
@@ -322,6 +424,14 @@ pub async fn table_properties(
     schema: Option<&str>,
     table: &str,
 ) -> Result<TableProperties, AppError> {
+    if engine_of(state, conn_id)? == Engine::Mongo {
+        return mongo::introspect::properties(
+            &mongo::client::client(state, conn_id).await?,
+            database,
+            table,
+        )
+        .await;
+    }
     let props = match connections::pool_for(state, conn_id, Some(database))? {
         DbPool::Pg(p) => pg::properties(&p, schema.unwrap_or("public"), table).await?,
         DbPool::MySql(p) => mysql::properties(&p, database, table).await?,
@@ -418,6 +528,8 @@ mod tests {
             default: None,
             is_pk: true,
             pk_ordinal: Some(1),
+            frequency: None,
+            sample_size: None,
         };
         assert_eq!(
             serde_json::to_value(&c).unwrap(),
@@ -444,6 +556,7 @@ mod tests {
                 primary: true,
                 method: None,
                 definition: None,
+                mongo: None,
             }],
             constraints: vec![ConstraintInfo {
                 name: "t_pkey".into(),
@@ -463,6 +576,7 @@ mod tests {
                 on_delete: "CASCADE".into(),
             }],
             references: vec![],
+            mongo: None,
         };
         assert_eq!(
             serde_json::to_value(&p).unwrap(),

@@ -1466,7 +1466,7 @@ fn write_warnings() {
         ),
     ];
     for (e, sql, want) in cases {
-        let info = classify_write(sql, *e);
+        let info = classify_write(sql, *e, None);
         assert_eq!(codes(&info), *want, "[{e:?}] {sql}: {info:?}");
     }
 }
@@ -1476,6 +1476,7 @@ fn write_statements_have_kind_and_table() {
     let info = classify_write(
         "INSERT INTO shop.orders (id) VALUES (1); UPDATE customers SET a = 1 WHERE id = 2; DROP TABLE IF EXISTS old_a, old_b",
         Pg,
+        None,
     );
     let got: Vec<(&str, Option<&str>)> = info
         .statements
@@ -1501,7 +1502,7 @@ fn write_statements_have_kind_and_table() {
 
 #[test]
 fn write_info_json_shape() {
-    let v = serde_json::to_value(classify_write("DELETE FROM t", Sqlite)).unwrap();
+    let v = serde_json::to_value(classify_write("DELETE FROM t", Sqlite, None)).unwrap();
     assert_eq!(
         v,
         serde_json::json!({
@@ -1509,7 +1510,7 @@ fn write_info_json_shape() {
             "warnings": [{"code": "delete_without_where", "message": "DELETE without WHERE removes every row of t", "statement": 0}]
         })
     );
-    let v = serde_json::to_value(classify_write("x", Pg)).unwrap();
+    let v = serde_json::to_value(classify_write("x", Pg, None)).unwrap();
     assert_eq!(v["statements"], serde_json::json!([]));
     assert_eq!(v["warnings"][0]["code"], "unparsable");
     assert!(v["warnings"][0].get("statement").is_none());

@@ -63,7 +63,7 @@ fn private_reads(engine: Engine, s: &StatementFacts) -> Vec<String> {
                     out.push(t.clone());
                 }
             }
-            Engine::Sqlite => {}
+            Engine::Sqlite | Engine::Mongo => {}
         }
     }
     out.sort();
@@ -137,6 +137,9 @@ pub struct GuardCheck {
 }
 
 pub fn guard_check(sql: &str, engine: Engine) -> GuardCheck {
+    if engine == Engine::Mongo {
+        return crate::core::mongo::guard::guard_check(sql);
+    }
     match check_ai_read(sql, engine) {
         Ok(ok) => GuardCheck {
             allowed: true,
@@ -159,6 +162,11 @@ const READ_KINDS: &str = "Only one SELECT, WITH … SELECT, VALUES, SHOW, DESCRI
 pub fn check_ai_read(sql: &str, engine: Engine) -> Result<ReadOk, GuardRejection> {
     if sql.trim().is_empty() {
         return Err(GuardRejection::new("The query is empty"));
+    }
+    if engine == Engine::Mongo {
+        return Err(GuardRejection::new(
+            "MongoDB queries are not available in the assistant yet",
+        ));
     }
     let facts = facts::analyze(engine, sql).map_err(|e| GuardRejection {
         detail: Some(e.to_string()),
@@ -196,6 +204,7 @@ fn dialect_name(engine: Engine) -> &'static str {
         Engine::Pg => "PostgreSQL",
         Engine::Mysql => "MySQL/MariaDB",
         Engine::Sqlite => "SQLite",
+        Engine::Mongo => "MongoDB",
     }
 }
 
@@ -387,6 +396,14 @@ pub struct WriteStatement {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<String>,
+    /// MongoDB only: the database the statement runs on, from the tab's database and following
+    /// `use`, so the confirmation names it even when `table` is absent (`db.dropDatabase()`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    /// MongoDB only: the statement only reads. The editor asks for a confirmation before a run on
+    /// a Production connection when any statement has `read: false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -400,6 +417,10 @@ pub enum WarningCode {
     MultipleStatements,
     Unparsable,
     ExecutableComment,
+    /// MongoDB: `renameCollection` cannot be undone.
+    Rename,
+    /// MongoDB: the guard cannot say what the statement does.
+    UnknownCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -419,7 +440,10 @@ pub struct WriteInfo {
 
 /// What a proposed write would do, for the approval preview. Never refuses: unknown SQL gets a
 /// warning instead, and the user decides.
-pub fn classify_write(sql: &str, engine: Engine) -> WriteInfo {
+pub fn classify_write(sql: &str, engine: Engine, database: Option<&str>) -> WriteInfo {
+    if engine == Engine::Mongo {
+        return crate::core::mongo::guard::classify_write(sql, database);
+    }
     let mut warnings = Vec::new();
     let facts = match facts::analyze(engine, sql) {
         Ok(f) => f,
@@ -490,6 +514,8 @@ pub fn classify_write(sql: &str, engine: Engine) -> WriteInfo {
         statements.push(WriteStatement {
             kind: s.label.clone(),
             table,
+            database: None,
+            read: None,
         });
     }
     WriteInfo {

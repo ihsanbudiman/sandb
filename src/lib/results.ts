@@ -3,6 +3,14 @@ import type { Cell, Engine, QueryResult, Schema } from './mock';
 
 export const isBytes = (v: unknown): v is BytesValue => !!v && typeof v === 'object' && '$bytes' in v && 'len' in v;
 
+/** Longest text cell the backend sends (`PREVIEW_BYTES` in `core/db/value.rs`); longer text is cut and ends with `…`. */
+const PREVIEW_BYTES = 4096;
+
+/** A text cell the backend cut at the preview limit. The cut backs off at most 3 bytes to a character start and `…` adds 3, so a cut cell has at least `PREVIEW_BYTES` UTF-8 bytes. */
+export function isCutOff(v: unknown): v is string {
+  return typeof v === 'string' && v.endsWith('…') && new TextEncoder().encode(v).length >= PREVIEW_BYTES;
+}
+
 /** Short text for a JSON or bytes cell. */
 export function formatCell(v: object): string {
   if (isBytes(v)) {
@@ -12,6 +20,91 @@ export function formatCell(v: object): string {
   }
   const s = JSON.stringify(v);
   return s.length > 200 ? s.slice(0, 199) + '…' : s;
+}
+
+// ---- MongoDB: the `documents` of a result arrive as relaxed Extended JSON ----
+
+/** The one `$…` key of a relaxed EJSON wrapper (`{"$oid": …}`), or undefined for a plain object or array. */
+export function ejsonWrapper(v: unknown): [string, unknown] | undefined {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const keys = Object.keys(v);
+  return keys.length === 1 && keys[0].startsWith('$') ? [keys[0], (v as Record<string, unknown>)[keys[0]]] : undefined;
+}
+
+/** ISO text of a relaxed EJSON date: an ISO string, or the canonical `{"$numberLong": millis}`. */
+function ejsonDate(x: unknown): string {
+  if (typeof x === 'string') return x;
+  const ms = Number((x as Record<string, unknown> | undefined)?.$numberLong);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : String(x);
+}
+
+/** Hyphenated hex of a 16-byte UUID sent as base64, as mongosh shows it; other lengths stay base64. */
+function uuidText(base64: string): string {
+  let bytes: string;
+  try {
+    bytes = atob(base64);
+  } catch {
+    return base64;
+  }
+  if (bytes.length !== 16) return base64;
+  const hex = [...bytes].map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/** mongosh-style one-line text of a relaxed EJSON value: ObjectId("…"), ISODate("…"), 3, [2], {4}, … */
+export function ejsonText(v: unknown): string {
+  if (v === null) return 'null';
+  if (typeof v !== 'object') return typeof v === 'string' ? JSON.stringify(v) : String(v);
+  if (Array.isArray(v)) return v.length ? `[${v.length}]` : '[]';
+  const wrap = ejsonWrapper(v);
+  if (wrap) {
+    const [k, x] = wrap;
+    switch (k) {
+      case '$oid': return `ObjectId("${String(x)}")`;
+      case '$date': return `ISODate("${ejsonDate(x)}")`;
+      case '$numberDecimal': return `NumberDecimal("${String(x)}")`;
+      case '$numberLong': return `NumberLong("${String(x)}")`;
+      case '$binary': {
+        const b = x as { base64: string; subType: string };
+        return b.subType === '04' ? `UUID("${uuidText(b.base64)}")` : `BinData(${parseInt(b.subType, 16)}, "${b.base64}")`;
+      }
+      case '$regularExpression': {
+        const r = x as { pattern: string; options: string };
+        return `/${r.pattern}/${r.options}`;
+      }
+      case '$timestamp': {
+        const t = x as { t: unknown; i: unknown };
+        return `Timestamp({ t: ${Number(t.t)}, i: ${Number(t.i)} })`;
+      }
+      case '$minKey': return 'MinKey()';
+      case '$maxKey': return 'MaxKey()';
+    }
+  }
+  const keys = Object.keys(v);
+  return keys.length ? `{${keys.length}}` : '{}';
+}
+
+/** The value as plain JSON for copying: wrappers become their values (ObjectId → its string, …); binary, timestamps and min/max keys have no plain form and stay as they are. */
+export function ejsonPlain(v: unknown): unknown {
+  if (v === null || typeof v !== 'object') return v;
+  if (Array.isArray(v)) return v.map(ejsonPlain);
+  const wrap = ejsonWrapper(v);
+  if (wrap) {
+    const [k, x] = wrap;
+    if (k === '$oid' || k === '$numberDecimal' || k === '$numberLong') return x;
+    if (k === '$date') return ejsonDate(x);
+    if (k === '$regularExpression') {
+      const r = x as { pattern: string; options: string };
+      return `/${r.pattern}/${r.options}`;
+    }
+    return v;
+  }
+  return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, ejsonPlain(x)]));
+}
+
+/** Copy text of a value: a string goes out bare, everything else as indented JSON of the unwrapped value. */
+export function copyValue(v: unknown): string {
+  return typeof v === 'string' ? v : JSON.stringify(ejsonPlain(v), null, 2);
 }
 
 /** CSV text of a cell: NULL is empty, bytes are base64 (the loaded preview), JSON is JSON. */
@@ -68,9 +161,23 @@ function rowResult(s: StatementResult, mock: boolean, limit: number, database: s
     table: s.table,
     sql: s.sql,
     ms: s.elapsedMs,
-    database,
+    // A Mongo `use` earlier in the run moves the statement to another database; edits and re-runs go there.
+    database: s.database ?? database,
     live: !mock,
+    documents: s.documents,
+    cellTypes: s.cellTypes,
   };
+}
+
+/** Largest row limit of a run, as `MAX_LIMIT` in `core/db/query.rs`. */
+const MAX_LIMIT = 100_000;
+
+/**
+ * Whether Load more can bring more rows. It runs the statement again with twice the row limit, so it helps only when
+ * the rows filled the limit. A MongoDB page that stopped at the 16 MB byte limit gets no new rows from a larger limit.
+ */
+export function moreRows(r: QueryResult) {
+  return r.truncated && r.isRead && !r.summary && !!r.sql && !!r.limit && r.rows.length >= r.limit && r.limit < MAX_LIMIT;
 }
 
 /**

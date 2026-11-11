@@ -231,6 +231,7 @@
           <p class="mt-1 text-[12.5px] leading-relaxed text-muted">Read-only is on for every connection by default. With write mode on, each write still needs your approval.</p>
         </div>
         <div class="min-w-0 divide-y divide-line rounded-lg border border-line">
+          <!-- SQL and MongoDB connections: the chat can propose writes on both, each still needs approval. -->
           {#each db.connections as c (c.id)}
             {@const on = c.aiWrite && canWrite(c)}
             <div class="flex items-center gap-2 px-3 py-2.5">

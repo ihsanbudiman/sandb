@@ -1,6 +1,9 @@
 /** SQL text helpers shared by the editor and the column autocomplete. */
 
-export type Dialect = 'pg' | 'mysql' | 'sqlite';
+import type { Engine } from '../api';
+
+/** The engine of the text. MongoDB never reaches these helpers; its text would split as plain SQL. */
+export type Dialect = Engine;
 
 /**
  * Cuts the text at `;` outside strings, quoted names, comments and Postgres dollar quotes, like the
