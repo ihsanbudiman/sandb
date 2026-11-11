@@ -4,6 +4,8 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-11
+
 - New: you can now sort the connection list. Drag a connection up or down in the sidebar. You can also select a connection and press Alt+↑ or Alt+↓. sandb saves the order. If the save fails, the list shows the old order again and a message shows the error.
 - Changed: the MongoDB **JSON** view is easier to read. Values have the same colors as the SQL editor: strings, numbers, `true`/`false`, `null` and type names such as `ObjectId` and `BinData` each have a color. A line at the left of each open level shows the nesting. A collapsed document shows its `_id`, and a collapsed document or array shows its size, for example `7 fields` or `2 items`. A line separates the documents, and the row under the pointer is highlighted.
 - Fixed: in the MongoDB grid, you can now open and edit the cells of a document that has a `binData` `_id`. Before, a double-click on a nested value, for example `[2 items]`, showed "This document's _id type (binData) cannot be edited in the grid". sandb now finds the document with its full `BinData(…)` value.
