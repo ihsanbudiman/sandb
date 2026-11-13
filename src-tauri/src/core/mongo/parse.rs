@@ -12,6 +12,7 @@ use mongodb::bson::spec::BinarySubtype;
 use mongodb::bson::{Binary, Bson, DateTime, Decimal128, Document, Regex, Timestamp};
 
 use crate::core::error::AppError;
+use crate::core::mongo::options::whole_number;
 use crate::core::mongo::command::{Command, Find, Method, Statement};
 
 /// A parse failure. `line` and `column` are 1-based; the column counts characters.
@@ -63,13 +64,65 @@ pub fn parse(text: &str) -> Result<Vec<Statement>, ParseError> {
         }
         out.push(Statement {
             text: text[start..end].to_string(),
-            start,
             command,
         });
     }
 }
 
-/// One value literal and nothing after it, such as the `shell` text of a grid cell.
+/// The collection methods the parser accepts, in the order the editor offers them. Completion
+/// reads this list, so it cannot offer a method the parser rejects.
+pub const COLLECTION_METHODS: &[&str] = &[
+    "find",
+    "findOne",
+    "aggregate",
+    "countDocuments",
+    "estimatedDocumentCount",
+    "distinct",
+    "getIndexes",
+    "stats",
+    "insertOne",
+    "insertMany",
+    "updateOne",
+    "updateMany",
+    "replaceOne",
+    "deleteOne",
+    "deleteMany",
+    "findOneAndUpdate",
+    "findOneAndReplace",
+    "findOneAndDelete",
+    "bulkWrite",
+    "createIndex",
+    "createIndexes",
+    "dropIndex",
+    "dropIndexes",
+    "drop",
+    "renameCollection",
+];
+
+/// The cursor methods of a `find(...)` chain. The parser also takes `projection` for `project`
+/// and `pretty` as a no-op, which are not offered.
+pub const CURSOR_METHODS: &[&str] = &[
+    "sort",
+    "project",
+    "collation",
+    "limit",
+    "skip",
+    "hint",
+    "maxTimeMS",
+    "count",
+    "toArray",
+];
+
+/// The methods of `db` itself; any other name after `db.` is a collection.
+pub const DB_METHODS: &[&str] = &[
+    "getCollection",
+    "runCommand",
+    "adminCommand",
+    "createCollection",
+    "dropDatabase",
+];
+
+/// One value literal and nothing after it, such as the mongosh text of a grid cell.
 pub fn parse_value(text: &str) -> Result<Bson, ParseError> {
     let toks = Lexer::new(text).run()?;
     let mut p = Parser {
@@ -83,8 +136,6 @@ pub fn parse_value(text: &str) -> Result<Bson, ParseError> {
     }
     Ok(value)
 }
-
-// ---- lexer ----
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
@@ -282,7 +333,6 @@ impl<'a> Lexer<'a> {
         Ok(self.out)
     }
 
-    /// Digits, a fraction, an exponent, or a `0x` hex number. Validity is checked on use.
     fn number(&mut self) {
         let b = self.b;
         if b[self.i] == b'0' && matches!(b.get(self.i + 1), Some(b'x' | b'X')) {
@@ -449,8 +499,6 @@ impl<'a> Lexer<'a> {
     }
 }
 
-// ---- parser ----
-
 /// A parsed argument and the byte offset where it starts, for error positions.
 type Arg = (Bson, usize);
 
@@ -501,7 +549,6 @@ impl Parser<'_> {
         error_at(self.src, at, message)
     }
 
-    /// "Expected X, found Y", or the JavaScript refusal when Y is JavaScript.
     fn unexpected(&self, t: &Token, expected: &str) -> ParseError {
         if let Some(w) = js_error_word(&t.tok) {
             return self.err(
@@ -544,8 +591,6 @@ impl Parser<'_> {
             _ => Err(self.unexpected(&t, what)),
         }
     }
-
-    // ---- statements
 
     fn statement(&mut self) -> Result<Command, ParseError> {
         let t = self.peek().clone();
@@ -691,7 +736,6 @@ impl Parser<'_> {
         self.args()
     }
 
-    /// `( value, value, … )` with an optional trailing comma.
     fn args(&mut self) -> Result<Vec<Arg>, ParseError> {
         self.expect_punct('(')?;
         let mut out = Vec::new();
@@ -710,8 +754,6 @@ impl Parser<'_> {
             return Err(self.unexpected(self.peek(), "',' or ')'"));
         }
     }
-
-    // ---- methods
 
     fn method(&self, name: &str, at: usize, args: Vec<Arg>) -> Result<Method, ParseError> {
         let usage = |u: &str| self.err(at, format!("Usage: {name}({u})"));
@@ -977,16 +1019,16 @@ impl Parser<'_> {
                 find.collation =
                     Some(self.doc(one.unwrap_or_default(), "collation needs a document")?)
             }
-            "limit" => find.limit = Some(self.count_arg(one, "limit")?),
+            "limit" => find.limit = Some(self.count_arg(one, "limit", at)?),
             "skip" => {
-                let n = self.count_arg(one, "skip")?;
+                let n = self.count_arg(one, "skip", at)?;
                 find.skip = Some(n as u64);
             }
             "hint" => match one {
                 Some((h @ (Bson::String(_) | Bson::Document(_)), _)) => find.hint = Some(h),
                 _ => return Err(self.err(at, "hint needs an index name or a key document")),
             },
-            "maxTimeMS" => find.max_time_ms = Some(self.count_arg(one, "maxTimeMS")? as u64),
+            "maxTimeMS" => find.max_time_ms = Some(self.count_arg(one, "maxTimeMS", at)? as u64),
             "count" => {
                 if one.is_some() {
                     return Err(self.err(at, "Usage: count()"));
@@ -997,8 +1039,6 @@ impl Parser<'_> {
         }
         Ok(())
     }
-
-    // ---- argument shapes
 
     fn doc(&self, (v, at): Arg, message: &str) -> Result<Document, ParseError> {
         match v {
@@ -1042,23 +1082,20 @@ impl Parser<'_> {
         }
     }
 
-    fn count_arg(&self, a: Option<Arg>, name: &str) -> Result<i64, ParseError> {
+    /// A whole count of a cursor method. A missing argument points at the method name, not at
+    /// the start of the text.
+    fn count_arg(&self, a: Option<Arg>, name: &str, call: usize) -> Result<i64, ParseError> {
         let Some((v, at)) = a else {
-            return Err(self.err(0, format!("{name} needs a number")));
+            return Err(self.err(call, format!("{name} needs a number")));
         };
-        let n = match v {
-            Bson::Int32(i) => i64::from(i),
-            Bson::Int64(i) => i,
-            Bson::Double(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => f as i64,
-            _ => return Err(self.err(at, format!("{name} needs a whole number"))),
+        let Some(n) = whole_number(&v, i64::MIN, i64::MAX) else {
+            return Err(self.err(at, format!("{name} needs a whole number")));
         };
         if n < 0 {
             return Err(self.err(at, format!("{name} cannot be negative")));
         }
         Ok(n)
     }
-
-    // ---- values
 
     fn value(&mut self) -> Result<Bson, ParseError> {
         let t = self.next();
@@ -1185,8 +1222,6 @@ impl Parser<'_> {
             _ => Err(bad()),
         }
     }
-
-    // ---- helpers such as ObjectId(…)
 
     fn helper(&mut self, name: &str, at: usize, with_new: bool) -> Result<Bson, ParseError> {
         if !self.at_punct('(') {
@@ -1403,6 +1438,21 @@ mod tests {
             Method::InsertOne { mut document } => document.remove("v").expect("v"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_value_reads_one_value_only() {
+        assert_eq!(parse_value(" 42 ").unwrap(), Bson::Int32(42));
+        assert_eq!(
+            parse_value("/a/i").unwrap(),
+            Bson::RegularExpression(Regex {
+                pattern: "a".into(),
+                options: "i".into(),
+            })
+        );
+        let e = parse_value("{a: 1} x").unwrap_err();
+        assert_eq!(e.message, "Expected the end of the value, found 'x'");
+        assert!(parse_value("1; 2").is_err());
     }
 
     #[test]
@@ -1661,6 +1711,13 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_cursor_argument_points_at_the_method() {
+        let e = err("db.c.find().limit()");
+        assert_eq!((e.line, e.column), (1, 13));
+        assert_eq!(e.message, ".limit() takes one argument");
+    }
+
+    #[test]
     fn strings_comments_and_trailing_commas() {
         assert_eq!(
             value(r"'a\n\t\'\\b\u0041\x42\u{1F600}'"),
@@ -1812,11 +1869,10 @@ mod tests {
         let v = parse(text).unwrap();
         assert_eq!(v.len(), 5);
         assert_eq!(v[0].text, "db.a.find()");
-        assert_eq!((v[1].text.as_str(), v[1].start), ("db.b.find()", 14));
+        assert_eq!(v[1].text, "db.b.find()");
         assert_eq!(v[2].command, Command::ShowDbs);
         assert_eq!(v[3].command, Command::Use("analytics".into()));
         assert_eq!(v[4].text, "db.c.find({\n  x: 1\n})\n  .limit(2)");
-        assert_eq!(&text[v[4].start..v[4].start + 4], "db.c");
         assert!(
             parse("  // only a comment\n/* and */ ;; ")
                 .unwrap()
@@ -1825,6 +1881,28 @@ mod tests {
         let e = err("db.a.find() db.b.find()");
         assert_eq!((e.line, e.column), (1, 13));
         assert_eq!(e.message, "Expected ';' or a new line, found 'db'");
+    }
+
+    /// Completion offers these names, so every one must reach the parser's arguments instead
+    /// of its unknown-name refusal.
+    #[test]
+    fn every_offered_name_is_parsed() {
+        let accepted = |text: &str| match parse(text) {
+            Ok(_) => true,
+            Err(e) => !e.message.starts_with("Unknown "),
+        };
+        for name in COLLECTION_METHODS {
+            let text = format!("db.c.{name}()");
+            assert!(accepted(&text), "{text}");
+        }
+        for name in CURSOR_METHODS {
+            let text = format!("db.c.find().{name}()");
+            assert!(accepted(&text), "{text}");
+        }
+        for name in DB_METHODS {
+            let text = format!("db.{name}()");
+            assert!(accepted(&text), "{text}");
+        }
     }
 
     #[test]

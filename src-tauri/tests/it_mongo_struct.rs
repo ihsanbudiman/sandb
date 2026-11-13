@@ -4,105 +4,58 @@
 //! `testdb/seed/mongo/01_data.js`. Run: `cargo test --features it --test it_mongo_struct`.
 #![cfg(feature = "it")]
 
-use std::collections::HashMap;
+mod common;
+
 use std::io::BufRead;
-use std::path::PathBuf;
 
 use futures_util::TryStreamExt;
 use mongodb::bson::oid::ObjectId;
 use mongodb::bson::spec::BinarySubtype;
 use mongodb::bson::{Binary, Bson, DateTime, Decimal128, Document, Regex, Timestamp, doc};
-use sandb_lib::core::connections::{self, ConnectionInput, Engine, Env, SslMode};
-use sandb_lib::core::db::dump::{self, TableExportRequest};
-use sandb_lib::core::db::export::{
-    self, DocumentExportRequest, DocumentFormat, EjsonFlavor, ExportRequest,
+use sandb_lib::core::result::TableExportRequest;
+use sandb_lib::core::result::{
+    DocumentExportRequest, DocumentFormat, EjsonFlavor, ExportRequest,
 };
-use sandb_lib::core::db::introspect::{
-    self, MongoCollectionInfo, MongoCollectionKind, TableProperties,
-};
-use sandb_lib::core::db::query::{self, RunRequest};
+use sandb_lib::core::result::MongoCollectionKind;
+use sandb_lib::core::result::RunRequest;
+use sandb_lib::core::ops;
 use sandb_lib::core::error::{AppError, ErrorCode};
 use sandb_lib::core::mongo;
-use sandb_lib::core::secrets::MemoryStore;
 use sandb_lib::core::state::AppState;
 
-const RS: u16 = 57017;
+use common::Cleanup;
 
 /// Every test reads the seed of one small Mongo, and one of them streams `big_docs` (about
 /// 200 MB): they take turns.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn env_test() -> HashMap<String, String> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdb/.env.test");
-    let raw =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
-}
-
-fn state() -> (tempfile::TempDir, AppState) {
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
-    (dir, st)
-}
-
 /// A saved connection to `shop_staging` as `user` (`sandb_ro` or `sandb_rw`).
 fn saved(st: &AppState, user: &str, read_only: bool) -> String {
-    let key = if user == "sandb_rw" {
-        "SANDB_RW_PASSWORD"
-    } else {
-        "SANDB_RO_PASSWORD"
-    };
-    let password = env_test().get(key).cloned().expect("password in .env.test");
-    let input = ConnectionInput {
-        name: format!("it-mongo-struct-{user}"),
-        engine: Engine::Mongo,
-        env: Env::Local,
-        host: "127.0.0.1".into(),
-        port: RS,
-        database: "shop_staging".into(),
-        user: user.into(),
-        ssl: SslMode::Disable,
-        file: String::new(),
-        ai_write: false,
+    let input = common::mongo_input(
+        &format!("mongo-struct-{user}"),
+        common::mongo_rs(),
+        user,
+        common::seed::STAGING,
         read_only,
-        version: None,
-        uri: String::new(),
-        auth_source: "admin".into(),
-        topology: None,
-    };
-    connections::create(st, input, Some(password)).unwrap().id
+    );
+    st.create_connection(input, Some(common::password(user)))
+        .unwrap()
+        .id
 }
 
 /// The stack's root user, whose roles reach every database: `sandb_rw` is `readWrite` on
 /// `shop_staging` and `analytics` only, so it cannot `collMod` or create a database.
 fn root(st: &AppState) -> String {
-    let password = env_test()
-        .get("MONGO_INITDB_ROOT_PASSWORD")
-        .cloned()
-        .expect("MONGO_INITDB_ROOT_PASSWORD in testdb/.env.test");
-    let mut input = ConnectionInput {
-        name: "it-mongo-struct-root".into(),
-        engine: Engine::Mongo,
-        env: Env::Local,
-        host: "127.0.0.1".into(),
-        port: RS,
-        database: "shop_staging".into(),
-        user: "root".into(),
-        ssl: SslMode::Disable,
-        file: String::new(),
-        ai_write: false,
-        read_only: false,
-        version: None,
-        uri: String::new(),
-        auth_source: "admin".into(),
-        topology: None,
-    };
-    input.name = format!("it-mongo-struct-root-{}", uuid::Uuid::new_v4().simple());
-    connections::create(st, input, Some(password)).unwrap().id
+    let input = common::mongo_input(
+        "mongo-struct-root",
+        common::mongo_rs(),
+        "root",
+        common::seed::STAGING,
+        false,
+    );
+    st.create_connection(input, Some(common::root_password()))
+        .unwrap()
+        .id
 }
 
 fn req(conn_id: &str, database: Option<&str>, text: &str) -> RunRequest {
@@ -119,99 +72,13 @@ fn req(conn_id: &str, database: Option<&str>, text: &str) -> RunRequest {
 
 async fn run(st: &AppState, r: RunRequest) {
     let text = r.sql.clone();
-    query::run(st, r)
+    ops::run_query(st, r)
         .await
         .unwrap_or_else(|e| panic!("{text}: {e:?}"));
 }
 
 async fn run_err(st: &AppState, r: RunRequest) -> AppError {
-    query::run(st, r).await.expect_err("the run must fail")
-}
-
-/// A fresh scratch collection name, `it_scratch_` + 32 hex characters.
-fn scratch() -> String {
-    format!("it_scratch_{}", uuid::Uuid::new_v4().simple())
-}
-
-/// A fresh scratch database name, dropped by each test that creates one.
-fn scratch_db() -> String {
-    format!("it_scratch_db_{}", uuid::Uuid::new_v4().simple())
-}
-
-/// Drops the scratch names a test made when the test ends, also while a failed test unwinds.
-/// `Drop` cannot use the test's client or runtime (both are being torn down after a panic), so it
-/// opens its own root client on its own thread: root can drop every name a test creates.
-struct Cleanup {
-    uri: String,
-    collections: Vec<String>,
-    databases: Vec<String>,
-}
-
-impl Cleanup {
-    /// A guard for scratch names on the server at `port`.
-    fn new(port: u16) -> Self {
-        let password = env_test()
-            .get("MONGO_INITDB_ROOT_PASSWORD")
-            .cloned()
-            .expect("MONGO_INITDB_ROOT_PASSWORD in testdb/.env.test");
-        Self {
-            uri: format!("mongodb://root:{password}@127.0.0.1:{port}/admin"),
-            collections: Vec::new(),
-            databases: Vec::new(),
-        }
-    }
-
-    /// Tracks `coll` and returns it.
-    fn collection(&mut self, coll: impl Into<String>) -> String {
-        let coll = coll.into();
-        self.collections.push(coll.clone());
-        coll
-    }
-
-    /// Tracks `db` and returns it.
-    fn database(&mut self, db: impl Into<String>) -> String {
-        let db = db.into();
-        self.databases.push(db.clone());
-        db
-    }
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if self.collections.is_empty() && self.databases.is_empty() {
-            return;
-        }
-        let uri = self.uri.clone();
-        let collections = std::mem::take(&mut self.collections);
-        let databases = std::mem::take(&mut self.databases);
-        let joined = std::thread::Builder::new()
-            .name("it-mongo-cleanup".into())
-            .spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                rt.block_on(async move {
-                    let Ok(client) = mongodb::Client::with_uri_str(uri).await else {
-                        return;
-                    };
-                    for coll in collections {
-                        let _ = client
-                            .database("shop_staging")
-                            .collection::<Document>(&coll)
-                            .drop()
-                            .await;
-                    }
-                    for db in databases {
-                        let _ = client.database(&db).drop().await;
-                    }
-                });
-            })
-            .map(|h| h.join());
-        let _ = joined;
-    }
+    ops::run_query(st, r).await.expect_err("the run must fail")
 }
 
 /// Quotes a collection name for the mongosh text of a test.
@@ -321,10 +188,10 @@ fn every_type() -> Document {
 #[tokio::test]
 async fn properties_of_a_collection_and_of_a_view() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_rw", false);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(scratch());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
     run(
         &st,
         req(
@@ -340,7 +207,7 @@ async fn properties_of_a_collection_and_of_a_view() {
     )
     .await;
 
-    let p = introspect::table_properties(&st, &id, "shop_staging", None, &coll)
+    let p = ops::table_properties(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap();
     let mongo = p.mongo.as_ref().expect("the mongo part");
@@ -379,7 +246,7 @@ async fn properties_of_a_collection_and_of_a_view() {
     );
 
     // The seed view: no indexes and no stats, its options carry viewOn and pipeline.
-    let view = introspect::table_properties(&st, &id, "shop_staging", None, "order_summary")
+    let view = ops::table_properties(&st, &id, "shop_staging", None, "order_summary")
         .await
         .unwrap();
     assert!(view.indexes.is_empty());
@@ -393,7 +260,7 @@ async fn properties_of_a_collection_and_of_a_view() {
     );
 
     // The seed's time series collection.
-    let series = introspect::table_properties(&st, &id, "analytics", None, "metrics")
+    let series = ops::table_properties(&st, &id, "analytics", None, "metrics")
         .await
         .unwrap();
     assert_eq!(
@@ -402,7 +269,7 @@ async fn properties_of_a_collection_and_of_a_view() {
     );
 
     // An unknown collection is `not_found`.
-    let e = introspect::table_properties(&st, &id, "shop_staging", None, &coll[..8])
+    let e = ops::table_properties(&st, &id, "shop_staging", None, &coll[..8])
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
@@ -413,10 +280,10 @@ async fn properties_of_a_collection_and_of_a_view() {
 #[tokio::test]
 async fn index_changes_show_in_properties_and_drop() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_rw", false);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(scratch());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
     let c = q(&coll);
     run(
         &st,
@@ -434,7 +301,7 @@ async fn index_changes_show_in_properties_and_drop() {
     )
     .await;
 
-    let p = introspect::table_properties(&st, &id, "shop_staging", None, &coll)
+    let p = ops::table_properties(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap();
     let partial = p
@@ -482,7 +349,7 @@ async fn index_changes_show_in_properties_and_drop() {
         req(&id, None, &format!("{c}.dropIndex(\"status_partial\")")),
     )
     .await;
-    let p = introspect::table_properties(&st, &id, "shop_staging", None, &coll)
+    let p = ops::table_properties(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap();
     assert!(
@@ -498,10 +365,10 @@ async fn index_changes_show_in_properties_and_drop() {
 #[tokio::test]
 async fn validator_is_set_and_removed() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = root(&st);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(scratch());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
     let c = q(&coll);
     run(
         &st,
@@ -520,7 +387,7 @@ async fn validator_is_set_and_removed() {
         ),
     )
     .await;
-    let mongo = introspect::table_properties(&st, &id, "shop_staging", None, &coll)
+    let mongo = ops::table_properties(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap()
         .mongo
@@ -544,7 +411,7 @@ async fn validator_is_set_and_removed() {
         ),
     )
     .await;
-    let mongo = introspect::table_properties(&st, &id, "shop_staging", None, &coll)
+    let mongo = ops::table_properties(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap()
         .mongo
@@ -557,7 +424,7 @@ async fn validator_is_set_and_removed() {
 #[tokio::test]
 async fn read_only_connection_refuses_schema_changes() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     for text in [
         "db.orders.createIndex({status: 1})",
@@ -573,10 +440,10 @@ async fn read_only_connection_refuses_schema_changes() {
 #[tokio::test]
 async fn drop_database_removes_it_from_the_list() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = root(&st);
-    let mut clean = Cleanup::new(RS);
-    let db = clean.database(scratch_db());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let db = clean.database(common::scratch());
     // A database appears in the list once it has a collection.
     run(
         &st,
@@ -587,10 +454,10 @@ async fn drop_database_removes_it_from_the_list() {
         ),
     )
     .await;
-    let names = introspect::list_databases(&st, &id).await.unwrap();
+    let names = ops::list_databases(&st, &id).await.unwrap();
     assert!(names.contains(&db), "{db} not in {names:?}");
 
-    let r = query::run(&st, req(&id, Some(&db), "db.dropDatabase()"))
+    let r = ops::run_query(&st, req(&id, Some(&db), "db.dropDatabase()"))
         .await
         .unwrap();
     assert_eq!(r.statements.len(), 1);
@@ -607,18 +474,18 @@ async fn drop_database_removes_it_from_the_list() {
         r.notices
     );
 
-    let names = introspect::list_databases(&st, &id).await.unwrap();
+    let names = ops::list_databases(&st, &id).await.unwrap();
     assert!(!names.contains(&db), "{db} still in {names:?}");
 }
 
 #[tokio::test]
 async fn the_script_recreates_the_collection_in_another_database() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = root(&st);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(scratch());
-    let target = clean.database(scratch_db());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
+    let target = clean.database(common::scratch());
     let c = q(&coll);
     run(
         &st,
@@ -635,7 +502,7 @@ async fn the_script_recreates_the_collection_in_another_database() {
     )
     .await;
 
-    let ddl = dump::table_ddl(&st, &id, "shop_staging", None, &coll)
+    let ddl = ops::table_ddl(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap();
     assert!(
@@ -655,17 +522,13 @@ async fn the_script_recreates_the_collection_in_another_database() {
     // Without data the file is the script alone.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(format!("{coll}.js"));
-    let r = dump::export_table_sql(
-        &st,
-        TableExportRequest {
+    let r = ops::export_table_sql(&st, TableExportRequest {
             conn_id: id.clone(),
             database: "shop_staging".into(),
             schema: None,
             table: coll.clone(),
             data: false,
-        },
-        &path,
-    )
+        }, &path, )
     .await
     .unwrap();
     assert_eq!(r.rows, 0);
@@ -673,7 +536,7 @@ async fn the_script_recreates_the_collection_in_another_database() {
     assert!(!script_only.contains("insertMany("), "{script_only}");
 
     // The seed view: `db.createCollection` with its viewOn and pipeline.
-    let view_ddl = dump::table_ddl(&st, &id, "shop_staging", None, "order_summary")
+    let view_ddl = ops::table_ddl(&st, &id, "shop_staging", None, "order_summary")
         .await
         .unwrap();
     assert!(view_ddl.contains("\"viewOn\": \"orders\""), "{view_ddl}");
@@ -682,10 +545,10 @@ async fn the_script_recreates_the_collection_in_another_database() {
     run(&st, req(&id, Some(&target), &ddl)).await;
     run(&st, req(&id, Some(&target), &view_ddl)).await;
 
-    let source = introspect::table_properties(&st, &id, "shop_staging", None, &coll)
+    let source = ops::table_properties(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap();
-    let copy = introspect::table_properties(&st, &id, &target, None, &coll)
+    let copy = ops::table_properties(&st, &id, &target, None, &coll)
         .await
         .unwrap();
     assert_eq!(source.indexes, copy.indexes);
@@ -697,7 +560,7 @@ async fn the_script_recreates_the_collection_in_another_database() {
     assert_eq!(source.options, copy.options);
     assert_eq!(copy.stats.expect("stats of an empty copy").count, 0);
     // The view came across too.
-    let view = introspect::table_properties(&st, &id, &target, None, "order_summary")
+    let view = ops::table_properties(&st, &id, &target, None, "order_summary")
         .await
         .unwrap();
     assert!(view.indexes.is_empty());
@@ -719,11 +582,11 @@ async fn the_script_recreates_the_collection_in_another_database() {
 #[tokio::test]
 async fn special_index_options_replay() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = root(&st);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(scratch());
-    let target = clean.database(scratch_db());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
+    let target = clean.database(common::scratch());
     let c = q(&coll);
     run(
         &st,
@@ -741,7 +604,7 @@ async fn special_index_options_replay() {
     )
     .await;
 
-    let source = introspect::table_properties(&st, &id, "shop_staging", None, &coll)
+    let source = ops::table_properties(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap();
     let index = |name: &str| {
@@ -782,7 +645,7 @@ async fn special_index_options_replay() {
     assert_eq!(index("flat").method.as_deref(), Some("2d"));
 
     // The script carries every one of them, and a replay builds the same indexes.
-    let ddl = dump::table_ddl(&st, &id, "shop_staging", None, &coll)
+    let ddl = ops::table_ddl(&st, &id, "shop_staging", None, &coll)
         .await
         .unwrap();
     for needle in [
@@ -797,7 +660,7 @@ async fn special_index_options_replay() {
         assert!(ddl.contains(needle), "{needle} in {ddl}");
     }
     run(&st, req(&id, Some(&target), &ddl)).await;
-    let copy = introspect::table_properties(&st, &id, &target, None, &coll)
+    let copy = ops::table_properties(&st, &id, &target, None, &coll)
         .await
         .unwrap();
     assert_eq!(source.indexes, copy.indexes);
@@ -813,12 +676,12 @@ async fn special_index_options_replay() {
 #[tokio::test]
 async fn export_with_data_recreates_every_bson_type() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = root(&st);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(scratch());
-    let target = clean.database(scratch_db());
-    let client = mongo::client::client(&st, &id).await.unwrap();
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
+    let target = clean.database(common::scratch());
+    let client = mongo::client::client(st.as_ref(), &id).await.unwrap();
     let source = vec![
         every_type(),
         doc! { "_id": 2, "nested": { "deeper": [{ "x": Bson::Double(f64::NAN) }] }, "date": Bson::DateTime(DateTime::from_millis(-62_167_219_200_001)) },
@@ -832,17 +695,13 @@ async fn export_with_data_recreates_every_bson_type() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(format!("{coll}.js"));
-    let r = dump::export_table_sql(
-        &st,
-        TableExportRequest {
+    let r = ops::export_table_sql(&st, TableExportRequest {
             conn_id: id.clone(),
             database: "shop_staging".into(),
             schema: None,
             table: coll.clone(),
             data: true,
-        },
-        &path,
-    )
+        }, &path, )
     .await
     .unwrap();
     assert_eq!(r.rows, 2);
@@ -869,11 +728,11 @@ async fn export_with_data_recreates_every_bson_type() {
 #[tokio::test]
 async fn export_documents_as_json_and_ndjson() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_rw", false);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(scratch());
-    let client = mongo::client::client(&st, &id).await.unwrap();
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
+    let client = mongo::client::client(st.as_ref(), &id).await.unwrap();
     let source = vec![
         every_type(),
         doc! { "_id": 2, "n": Bson::Int64(2), "d": Bson::Double(1.5) },
@@ -898,7 +757,7 @@ async fn export_documents_as_json_and_ndjson() {
     };
 
     let path = dir.path().join("docs.json");
-    let r = export::export_documents(
+    let r = ops::export_documents(
         &st,
         request(DocumentFormat::Json, EjsonFlavor::Canonical),
         &path,
@@ -923,7 +782,7 @@ async fn export_documents_as_json_and_ndjson() {
     assert_eq!(canonicals(&source), canonicals(&parsed_docs));
 
     let path = dir.path().join("docs.ndjson");
-    export::export_documents(
+    ops::export_documents(
         &st,
         request(DocumentFormat::Ndjson, EjsonFlavor::Canonical),
         &path,
@@ -948,7 +807,7 @@ async fn export_documents_as_json_and_ndjson() {
 
     // Relaxed keeps a plain number where the type survives, and still parses.
     let path = dir.path().join("relaxed.json");
-    export::export_documents(
+    ops::export_documents(
         &st,
         request(DocumentFormat::Json, EjsonFlavor::Relaxed),
         &path,
@@ -962,7 +821,7 @@ async fn export_documents_as_json_and_ndjson() {
         assert!(Bson::try_from(value.clone()).is_ok(), "{value}");
     }
     let path = dir.path().join("relaxed.ndjson");
-    export::export_documents(
+    ops::export_documents(
         &st,
         request(DocumentFormat::Ndjson, EjsonFlavor::Relaxed),
         &path,
@@ -972,7 +831,7 @@ async fn export_documents_as_json_and_ndjson() {
     assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
 
     // One read only, as for CSV.
-    let e = export::check_documents(
+    let e = ops::check_documents(
         &st,
         &DocumentExportRequest {
             query: ExportRequest {
@@ -989,29 +848,10 @@ async fn export_documents_as_json_and_ndjson() {
     assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
 
     // Extended JSON is not a SQL feature.
-    let sqlite = connections::create(
-        &st,
-        ConnectionInput {
-            name: "it-mongo-struct-sqlite".into(),
-            engine: Engine::Sqlite,
-            env: Env::Local,
-            host: String::new(),
-            port: 0,
-            database: String::new(),
-            user: String::new(),
-            ssl: SslMode::Disable,
-            file: dir.path().join("it.sqlite").display().to_string(),
-            ai_write: false,
-            read_only: false,
-            version: None,
-            uri: String::new(),
-            auth_source: String::new(),
-            topology: None,
-        },
-        None,
-    )
-    .unwrap();
-    let e = export::check_documents(
+    let sqlite = st
+        .create_connection(common::sqlite_input(&dir.path().join("it.sqlite"), false), None)
+        .unwrap();
+    let e = ops::check_documents(
         &st,
         &DocumentExportRequest {
             query: ExportRequest {
@@ -1040,10 +880,10 @@ async fn export_documents_as_json_and_ndjson() {
 #[tokio::test]
 async fn a_server_command_error_stays_readable() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_rw", false);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(scratch());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
     let c = q(&coll);
     run(
         &st,
@@ -1064,7 +904,7 @@ async fn a_server_command_error_stays_readable() {
     )
     .await;
     assert_eq!(e.code, ErrorCode::Database, "{e:?}");
-    assert_eq!(e.server_code.as_deref(), Some("MongoDB error 67"), "{e:?}");
+    assert_eq!(e.server_code.as_ref().map(|c| c.code.as_str()), Some("67"), "{e:?}");
     assert!(e.message.contains("TTL indexes are single-field"), "{e:?}");
     assert_eq!(e.detail.as_deref(), Some("MongoDB error 67"), "{e:?}");
     for bad in ["RawDocumentBuf", "server response", "labels:"] {
@@ -1084,7 +924,7 @@ async fn a_server_command_error_stays_readable() {
         ),
     )
     .await;
-    assert_eq!(e.server_code.as_deref(), Some("MongoDB error 13"), "{e:?}");
+    assert_eq!(e.server_code.as_ref().map(|c| c.code.as_str()), Some("13"), "{e:?}");
     assert!(e.message.starts_with("not authorized"), "{e:?}");
     assert_eq!(e.detail.as_deref(), Some("MongoDB error 13"), "{e:?}");
     let shown = format!("{}: {}", e.message, e.detail.clone().unwrap_or_default());
@@ -1098,17 +938,17 @@ async fn a_server_command_error_stays_readable() {
 #[tokio::test]
 async fn export_documents_streams_big_documents() {
     let _serial = SERIAL.lock().await;
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     // The count first: `big_docs` is read once, by the export.
-    let count = query::run(&st, req(&id, None, "db.big_docs.countDocuments({})"))
+    let count = ops::run_query(&st, req(&id, None, "db.big_docs.countDocuments({})"))
         .await
         .unwrap();
     let count = count.statements[0].rows[0][0].as_i64().expect("a count");
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("big.ndjson");
-    let r = export::export_documents(
+    let r = ops::export_documents(
         &st,
         DocumentExportRequest {
             query: ExportRequest {
@@ -1137,28 +977,4 @@ async fn export_documents_streams_big_documents() {
     let _ = std::fs::remove_file(&path);
 }
 
-#[test]
-fn properties_serialize_with_camel_case_and_omit_empty_parts() {
-    let properties = TableProperties {
-        indexes: vec![],
-        constraints: vec![],
-        foreign_keys: vec![],
-        references: vec![],
-        mongo: Some(MongoCollectionInfo {
-            kind: MongoCollectionKind::Collection,
-            validator: None,
-            validation_level: None,
-            validation_action: None,
-            options: "{}".into(),
-            stats: None,
-        }),
-    };
-    let json = serde_json::to_value(&properties).unwrap();
-    let mongo = &json["mongo"];
-    assert_eq!(mongo["kind"], serde_json::json!("collection"));
-    assert_eq!(mongo["options"], serde_json::json!("{}"));
-    assert!(mongo.get("validator").is_none() && mongo.get("stats").is_none());
-    let plain = TableProperties::default();
-    let json = serde_json::to_value(&plain).unwrap();
-    assert!(json.get("mongo").is_none(), "{json}");
-}
+

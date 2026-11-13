@@ -6,154 +6,54 @@
 //! unreachable databases FAIL, nothing is skipped.
 #![cfg(feature = "it")]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+mod common;
 
 use serde_json::json;
 
-use sandb_lib::core::connections::{self, Connection, ConnectionInput, Engine, Env, SslMode};
-use sandb_lib::core::db::query::{self, QueryRun, RunRequest};
+use common::Ctx;
+use sandb_lib::core::result::{QueryRun, RunRequest};
+use sandb_lib::core::engine::Engine;
+use sandb_lib::core::ops;
 use sandb_lib::core::error::{AppError, ErrorCode};
-use sandb_lib::core::secrets::MemoryStore;
-use sandb_lib::core::state::AppState;
-
-const NET: [(&str, Engine, u16); 4] = [
-    ("pg16", Engine::Pg, 55416),
-    ("pg13", Engine::Pg, 55413),
-    ("mysql", Engine::Mysql, 53384),
-    ("mariadb", Engine::Mysql, 53311),
-];
-
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
-}
-
-fn env_test() -> HashMap<String, String> {
-    let p = root().join("testdb/.env.test");
-    let raw =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
-}
-
-struct Ctx {
-    _dir: tempfile::TempDir,
-    st: AppState,
-    conn: Connection,
-    label: String,
-}
-
-fn state() -> (tempfile::TempDir, AppState) {
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
-    (dir, st)
-}
-
-fn net_input(label: &str, engine: Engine, port: u16, read_only: bool) -> ConnectionInput {
-    let e = env_test();
-    ConnectionInput {
-        name: format!("it-{label}"),
-        engine,
-        env: Env::Local,
-        host: "127.0.0.1".into(),
-        port,
-        database: "shop".into(),
-        user: e.get("SANDB_RW_USER").cloned().unwrap_or("sandb_rw".into()),
-        ssl: SslMode::Prefer,
-        file: String::new(),
-        ai_write: false,
-        read_only,
-        version: None,
-        uri: String::new(),
-        auth_source: String::new(),
-        topology: None,
-    }
-}
 
 fn net(label: &str, engine: Engine, port: u16, read_only: bool) -> Ctx {
-    let (dir, st) = state();
-    let pw = env_test()
-        .get("SANDB_RW_PASSWORD")
-        .cloned()
-        .expect("SANDB_RW_PASSWORD");
-    let conn =
-        connections::create(&st, net_input(label, engine, port, read_only), Some(pw)).unwrap();
-    Ctx {
-        _dir: dir,
-        st,
-        conn,
-        label: label.into(),
-    }
-}
-
-fn sqlite_input(file: &std::path::Path, read_only: bool) -> ConnectionInput {
-    ConnectionInput {
-        name: format!("it-sqlite{}", if read_only { "-ro" } else { "" }),
-        engine: Engine::Sqlite,
-        env: Env::Local,
-        host: String::new(),
-        port: 0,
-        database: String::new(),
-        user: String::new(),
-        ssl: SslMode::Prefer,
-        file: file.to_string_lossy().into_owned(),
-        ai_write: false,
-        read_only,
-        version: None,
-        uri: String::new(),
-        auth_source: String::new(),
-        topology: None,
-    }
+    common::ctx(
+        label,
+        common::sql_input(label, engine, port, read_only),
+        Some(common::rw_password()),
+    )
 }
 
 /// A temp copy of the SQLite fixture; the fixture itself is never opened.
 fn sqlite(read_only: bool) -> Ctx {
-    let (dir, st) = state();
-    let src = root().join("testdb/sqlite/shop.db");
-    let file = dir.path().join("shop.db");
-    std::fs::copy(&src, &file).unwrap_or_else(|e| {
-        panic!(
-            "missing fixture {} (run `pnpm db:sqlite`): {e}",
-            src.display()
-        )
-    });
-    let conn = connections::create(&st, sqlite_input(&file, read_only), None).unwrap();
-    Ctx {
-        _dir: dir,
-        st,
-        conn,
-        label: "sqlite".into(),
-    }
+    common::sqlite_ctx(read_only)
 }
 
 /// A writable and a read-only connection on the same target (same file for SQLite).
 fn pair(label: &str, engine: Engine, port: u16) -> (Ctx, Ctx) {
     match engine {
         Engine::Sqlite => {
-            let (dir, st) = state();
-            let src = root().join("testdb/sqlite/shop.db");
+            let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("shop.db");
-            std::fs::copy(&src, &file).unwrap();
-            let w = connections::create(&st, sqlite_input(&file, false), None).unwrap();
-            let (dir2, st2) = state();
-            let c = connections::create(&st2, sqlite_input(&file, true), None).unwrap();
-            (
-                Ctx {
-                    _dir: dir,
-                    st,
-                    conn: w,
-                    label: label.into(),
-                },
-                Ctx {
-                    _dir: dir2,
-                    st: st2,
-                    conn: c,
-                    label: label.into(),
-                },
-            )
+            std::fs::copy(common::sqlite_fixture(), &file).unwrap();
+            let st = common::state_in(dir.path());
+            let w = common::ctx_in(
+                dir,
+                st,
+                label,
+                common::sqlite_input(&file, false),
+                None,
+            );
+            let dir2 = tempfile::tempdir().unwrap();
+            let st2 = common::state_in(dir2.path());
+            let c = common::ctx_in(
+                dir2,
+                st2,
+                label,
+                common::sqlite_input(&file, true),
+                None,
+            );
+            (w, c)
         }
         _ => (
             net(label, engine, port, false),
@@ -163,41 +63,26 @@ fn pair(label: &str, engine: Engine, port: u16) -> (Ctx, Ctx) {
 }
 
 fn all(read_only: bool) -> Vec<Ctx> {
-    let mut v: Vec<Ctx> = NET
-        .iter()
-        .map(|(l, e, p)| net(l, *e, *p, read_only))
+    let mut v: Vec<Ctx> = common::sqlnet()
+        .into_iter()
+        .map(|n| net(n.label, n.engine, n.port, read_only))
         .collect();
     v.push(sqlite(read_only));
     v
 }
 
-fn scratch() -> String {
-    format!(
-        "it_cro_{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    )
-}
-
 fn req(c: &Ctx, sql: &str) -> RunRequest {
-    RunRequest {
-        conn_id: c.conn.id.clone(),
-        database: None,
-        sql: sql.into(),
-        query_id: uuid::Uuid::new_v4().to_string(),
-        limit: None,
-        tab_id: None,
-        sort: None,
-    }
+    common::req(&c.conn, sql)
 }
 
 /// The editor path: read-only connections run the pre-check first.
 async fn editor(c: &Ctx, sql: &str) -> Result<QueryRun, AppError> {
-    query::run(&c.st, req(c, sql)).await
+    ops::run_query(&c.st, req(c, sql)).await
 }
 
 /// The it-only path with the pre-check skipped: only the database barrier can refuse.
 async fn unchecked(c: &Ctx, sql: &str) -> Result<QueryRun, AppError> {
-    query::run_editor_unchecked(&c.st, req(c, sql)).await
+    ops::run_editor_unchecked(&c.st, req(c, sql)).await
 }
 
 /// The error a refused run returns; panics with the result when the run went through.
@@ -225,7 +110,6 @@ async fn pre_check_refuses_writes_on_every_engine() {
                 "{l}: names the connection: {e}"
             );
         }
-        // Reads still work.
         editor(&c, "SELECT count(*) AS n FROM products")
             .await
             .unwrap_or_else(|e| panic!("{l}: SELECT on a read-only connection failed: {e:?}"));
@@ -238,32 +122,12 @@ async fn pre_check_refuses_writes_on_every_engine() {
 async fn pre_check_refuses_session_mode_changes() {
     for c in all(true) {
         let l = &c.label;
+        // One representative escape per engine: the full statement list is the unit test's
+        // job (`core::conn_ro`), this proves the saved connection's pre-check uses it.
         let escapes: &[&str] = match c.conn.engine {
-            Engine::Pg => &[
-                "SET default_transaction_read_only = off",
-                "SET SESSION default_transaction_read_only TO off",
-                "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE",
-                "BEGIN READ WRITE",
-                "RESET ALL",
-                "DISCARD ALL",
-                // Review item 4 bypass forms.
-                "SET transaction_read_only = off",
-                "SET LOCAL transaction_read_only = off",
-                "SET \"default_transaction_read_only\" = off",
-                "SELECT set_config('default_transaction_read_only', 'off', false)",
-                "SELECT pg_catalog.set_config('transaction_read_only', 'off', false)",
-            ],
-            Engine::Mysql => &[
-                "SET SESSION TRANSACTION READ WRITE",
-                "SET transaction_read_only = 0",
-                "START TRANSACTION READ WRITE",
-                // Review item 4 bypass forms.
-                "SET @@transaction_read_only = 0",
-                "SET @@tx_read_only = 0",
-                "SET @@session.transaction_read_only = 0",
-                "SET @@SESSION.tx_read_only = OFF",
-            ],
-            Engine::Sqlite => &["PRAGMA query_only = 0", "PRAGMA query_only = OFF"],
+            Engine::Pg => &["SET default_transaction_read_only = off"],
+            Engine::Mysql => &["SET SESSION TRANSACTION READ WRITE"],
+            Engine::Sqlite => &["PRAGMA query_only = 0"],
             Engine::Mongo => unreachable!("SQL engines only"),
         };
         for sql in escapes {
@@ -297,19 +161,16 @@ async fn pre_check_refuses_session_mode_changes() {
 /// help: the file itself is read-only).
 #[tokio::test]
 async fn database_barrier_refuses_writes_on_every_engine() {
-    let t = scratch();
-    let pairs: Vec<(Ctx, Ctx)> = NET
-        .iter()
-        .map(|(l, e, p)| pair(l, *e, *p))
+    let t = common::scratch();
+    let pairs: Vec<(Ctx, Ctx)> = common::sqlnet()
+        .into_iter()
+        .map(|n| pair(n.label, n.engine, n.port))
         .chain(std::iter::once(pair("sqlite", Engine::Sqlite, 0)))
         .collect();
     for (w, c) in pairs {
         let l = &c.label;
         // Setup through a normal writable connection on the same database.
-        query::run(
-            &w.st,
-            req(&w, &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)")),
-        )
+        ops::run_query(&w.st, req(&w, &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)")), )
         .await
         .unwrap_or_else(|e| panic!("{l}: scratch setup failed (is `pnpm db:up` running?): {e:?}"));
 
@@ -337,10 +198,10 @@ async fn database_barrier_refuses_writes_on_every_engine() {
             json!(0),
             "{l}: a write landed despite the barrier"
         );
-        query::run(&w.st, req(&w, &format!("DROP TABLE IF EXISTS {t}")))
+        ops::run_query(&w.st, req(&w, &format!("DROP TABLE IF EXISTS {t}")))
             .await
             .unwrap_or_else(|e| panic!("{l}: cleanup failed: {e:?}"));
-        let _ = query::run(&w.st, req(&w, &format!("DROP TABLE IF EXISTS {t}_ddl"))).await;
+        let _ = ops::run_query(&w.st, req(&w, &format!("DROP TABLE IF EXISTS {t}_ddl"))).await;
     }
 }
 
@@ -348,16 +209,14 @@ async fn database_barrier_refuses_writes_on_every_engine() {
 /// read-only session instead of a pooled writable one.
 #[tokio::test]
 async fn toggling_read_only_reopens_the_pools() {
-    let t = scratch();
-    let w = net("pg16", Engine::Pg, 55416, false);
-    let mut input = net_input("pg16-ro", Engine::Pg, 55416, false);
-    let (dir, st) = state();
-    let pw = env_test().get("SANDB_RW_PASSWORD").cloned().unwrap();
-    let c = connections::create(&st, input.clone(), Some(pw)).unwrap();
-    query::run(
-        &w.st,
-        req(&w, &format!("CREATE TABLE {t} (id int PRIMARY KEY)")),
-    )
+    let t = common::scratch();
+    let w = net("pg16", Engine::Pg, common::pg16(), false);
+    let mut input = common::sql_input("pg16-ro", Engine::Pg, common::pg16(), false);
+    let (dir, st) = common::state();
+    let c = st
+        .create_connection(input.clone(), Some(common::rw_password()))
+        .unwrap();
+    ops::run_query(&w.st, req(&w, &format!("CREATE TABLE {t} (id int PRIMARY KEY)")), )
     .await
     .unwrap();
 
@@ -373,7 +232,7 @@ async fn toggling_read_only_reopens_the_pools() {
         .unwrap_or_else(|e| panic!("write through the pooled session failed: {e:?}"));
 
     input.read_only = true;
-    let updated = connections::update(&ctx.st, &c.id, input.clone(), None)
+    let updated = ctx.st.update_connection(&c.id, input.clone(), None)
         .await
         .unwrap();
     assert!(updated.read_only);
@@ -386,13 +245,13 @@ async fn toggling_read_only_reopens_the_pools() {
     );
 
     input.read_only = false;
-    connections::update(&ctx.st, &c.id, input.clone(), None)
+    ctx.st.update_connection(&c.id, input.clone(), None)
         .await
         .unwrap();
     unchecked(&ctx, &format!("INSERT INTO {t} VALUES (3)"))
         .await
         .unwrap_or_else(|e| panic!("toggling back did not restore writes: {e:?}"));
-    query::run(&w.st, req(&w, &format!("DROP TABLE {t}")))
+    ops::run_query(&w.st, req(&w, &format!("DROP TABLE {t}")))
         .await
         .unwrap();
 }

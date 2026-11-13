@@ -1,35 +1,21 @@
 <script lang="ts">
   import { Plus, X, Check, ChevronRight, LoaderCircle } from '@lucide/svelte';
-  import { db, engines, envDot, type Conn } from '../state.svelte';
-  import { defaultDb } from '../tabs.svelte';
-  import { api, ApiError } from '../api';
-  import { connOf, dbOf, sameSource, MAX_SOURCES, type Source } from '../chat.svelte';
+  import { catalog, loadDatabases } from '../catalog.svelte';
+  import { db, defaultDb, engines, envDot, connOf, dbOf, sameSource, type Conn, type Source } from '../connections.svelte';
+  import { MAX_SOURCES } from '../api/generated/constants';
 
-  // The databases of one chat: chips, and a menu to add or remove databases of any connection.
   let { sources, disabled = false, onchange }: { sources: Source[]; disabled?: boolean; onchange: (list: Source[]) => void } = $props();
 
   let menu = $state(false);
   let filter = $state('');
   const expanded = $state<Record<string, boolean>>({});
-  // Per connection; loaded when the connection opens in the menu.
-  const dbs = $state<Record<string, string[]>>({});
-  const loading = $state<Record<string, boolean>>({});
-  const errors = $state<Record<string, string>>({});
 
   const full = $derived(sources.length >= MAX_SOURCES);
   const query = $derived(filter.trim().toLowerCase());
 
   async function load(c: Conn) {
-    if (c.engine === 'sqlite' || loading[c.id]) return;
-    loading[c.id] = true;
-    delete errors[c.id];
-    try {
-      dbs[c.id] = await api.listDatabases(c.id);
-    } catch (e) {
-      errors[c.id] = ApiError.from(e).message;
-    } finally {
-      loading[c.id] = false;
-    }
+    if (c.engine === 'sqlite') return;
+    await loadDatabases(c.id);
   }
 
   function toggleConn(c: Conn) {
@@ -41,7 +27,7 @@
   function dbList(c: Conn) {
     const chosen = sources.filter((s) => s.connId === c.id).map((s) => dbOf(s, c));
     // An empty connection database (possible on MongoDB) is not a choice.
-    const all = [...new Set([defaultDb(c), ...(dbs[c.id] ?? []), ...chosen])].filter((n) => n !== '');
+    const all = [...new Set([defaultDb(c), ...(catalog.databases[c.id]?.items ?? []), ...chosen])].filter((n) => n !== '');
     return query && !c.name.toLowerCase().includes(query) ? all.filter((n) => n.toLowerCase().includes(query)) : all;
   }
 
@@ -94,8 +80,9 @@
         {#each shown as c (c.id)}
           {@const n = chosenIn(c)}
           {#if c.engine === 'sqlite'}
-            {@const on = has(c, 'main')}
-            <button class="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12.5px] hover:bg-hover disabled:opacity-40" disabled={!on && full} onclick={() => toggle(c, 'main')} aria-pressed={on}>
+            {@const own = defaultDb(c)}
+            {@const on = has(c, own)}
+            <button class="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12.5px] hover:bg-hover disabled:opacity-40" disabled={!on && full} onclick={() => toggle(c, own)} aria-pressed={on}>
               <span class="w-3"></span>
               <span class="w-5 shrink-0 font-mono text-[10.5px] font-semibold {engines[c.engine].badge}">{engines[c.engine].short}</span>
               <span class="min-w-0 flex-1 truncate text-ink">{c.name}</span>
@@ -107,7 +94,7 @@
               <ChevronRight size={12} class="w-3 shrink-0 text-faint transition-transform {openRow ? 'rotate-90' : ''}" />
               <span class="w-5 shrink-0 font-mono text-[10.5px] font-semibold {engines[c.engine].badge}">{engines[c.engine].short}</span>
               <span class="min-w-0 flex-1 truncate text-ink">{c.name}</span>
-              {#if loading[c.id]}<LoaderCircle size={11} class="shrink-0 animate-spin text-faint" />{/if}
+              {#if catalog.databases[c.id]?.status === 'loading'}<LoaderCircle size={11} class="shrink-0 animate-spin text-faint" />{/if}
               {#if n}<span class="shrink-0 text-[11px] text-accent tabular-nums">{n}</span>{/if}
             </button>
             {#if openRow}
@@ -118,7 +105,7 @@
                   <span class="grid size-3.5 shrink-0 place-items-center rounded-sm border {on ? 'border-accent bg-accent text-white' : 'border-line'}">{#if on}<Check size={10} />{/if}</span>
                 </button>
               {/each}
-              {#if errors[c.id]}<p class="py-1 pr-2 pl-12 text-[12px] text-red-700 dark:text-red-400" role="alert">{errors[c.id]}</p>{/if}
+              {#if catalog.databases[c.id]?.status === 'error'}<p class="py-1 pr-2 pl-12 text-[12px] text-red-700 dark:text-red-400" role="alert">{catalog.databases[c.id].error}</p>{/if}
             {/if}
           {/if}
         {:else}

@@ -1,6 +1,6 @@
+import { autosave, readStored } from './persist.svelte';
 import { tabs, type Tab } from './tabs.svelte';
 
-/** A saved query (a script, as in DBeaver). It remembers the connection and database it was saved on. */
 export interface SavedQuery {
   id: string;
   name: string;
@@ -11,47 +11,19 @@ export interface SavedQuery {
   updated: number;
 }
 
-/** A pending Save dialog. `copy`: Save as… on a tab that is already linked; the tab moves to the new query. */
-export type SaveAsk = { tab: Tab; name: string; copy: boolean };
-
 const KEY = 'sandb.saved-queries.v1';
 
-function load(): SavedQuery[] {
-  try {
-    const list = JSON.parse(localStorage.getItem(KEY) ?? '[]');
-    return Array.isArray(list) ? list : [];
-  } catch (e) {
-    console.warn('Saved queries are not readable; starting empty.', e);
-    return [];
-  }
-}
+export const saved = $state({ list: readStored<SavedQuery[]>(KEY, [], { migrate: (data) => (Array.isArray(data) ? (data as SavedQuery[]) : []) }) });
 
-export const saved = $state({ list: load() });
-
-let saveTimer: ReturnType<typeof setTimeout> | undefined;
-$effect.root(() => {
-  $effect(() => {
-    const json = JSON.stringify(saved.list);
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {
-      try {
-        localStorage.setItem(KEY, json);
-      } catch (e) {
-        console.warn('Saved queries were not stored.', e);
-      }
-    }, 200);
-  });
-});
+autosave(KEY, () => saved.list, { delay: 200, onError: (e) => console.warn('Saved queries were not stored.', e) });
 
 export const findSaved = (id: string | null | undefined) => (id ? saved.list.find((q) => q.id === id) : undefined);
 
-/** The tab is linked to a saved query and its text differs from the saved text. */
 export function isDirty(t: Tab): boolean {
   const q = findSaved(t.savedId);
   return !!q && q.sql !== t.query;
 }
 
-/** A name from the first table the SQL reads or writes, e.g. "orders query". */
 export function suggestName(sql: string): string {
   const clean = sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
   const m = /\b(?:from|into|update|join|table)\s+([`"[\]\w.]+)/i.exec(clean);
@@ -59,7 +31,6 @@ export function suggestName(sql: string): string {
   return name ? `${name} query` : 'Untitled query';
 }
 
-/** Saves the tab's text as a new query and links the tab to it. */
 export function createSaved(t: Tab, name: string): SavedQuery {
   const now = Date.now();
   saved.list.push({ id: crypto.randomUUID(), name, sql: t.query, connId: t.connId, database: t.database, created: now, updated: now });
@@ -69,7 +40,6 @@ export function createSaved(t: Tab, name: string): SavedQuery {
   return q;
 }
 
-/** Writes the tab's text, connection and database to its linked query. */
 export function updateSaved(t: Tab) {
   const q = findSaved(t.savedId);
   if (!q) return;
@@ -95,7 +65,6 @@ export function duplicateSaved(id: string): SavedQuery | undefined {
   return saved.list[saved.list.length - 1];
 }
 
-/** Removes the query; open tabs keep their text but lose the link. Returns a function that undoes the delete. */
 export function deleteSaved(id: string): () => void {
   const i = saved.list.findIndex((q) => q.id === id);
   if (i < 0) return () => {};

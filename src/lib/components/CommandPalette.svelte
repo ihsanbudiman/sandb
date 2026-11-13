@@ -4,12 +4,15 @@
 </script>
 
 <script lang="ts">
-  import { tick } from 'svelte';
   import { Search, FileCode, Play, PanelRight, PanelLeft, Settings, ScrollText, SunMoon, Plus, Table2, Database, Save } from '@lucide/svelte';
-  import { db, active, envDot, type Conn } from '../state.svelte';
+  import { scrollOn } from '../actions';
+  import Modal from './Modal.svelte';
+  import { db, envDot, type Conn } from '../connections.svelte';
+  import { KEYS } from '../keys';
+  import { active } from '../tabs.svelte';
   import { saved, type SavedQuery } from '../saved.svelte';
 
-  type Item = { id: string; group: string; label: string; icon?: typeof Search; dot?: string; env?: string; hint?: string; run: () => void };
+  type Item = { id: string; group: string; label: string; icon?: typeof Search; dot?: string; env?: string; hint?: string; kbd?: boolean; run: () => void };
 
   let {
     open = $bindable(false),
@@ -41,13 +44,11 @@
 
   let q = $state('');
   let sel = $state(0);
-  let input = $state<HTMLInputElement>();
-  let list = $state<HTMLDivElement>();
 
   const items = $derived<Item[]>([
     { id: 'a-new', group: 'Actions', label: 'New query / focus editor', icon: FileCode, run: onfocuseditor },
-    { id: 'a-run', group: 'Actions', label: 'Run statement at cursor', icon: Play, hint: '⌘↵', run: onrun },
-    { id: 'a-save', group: 'Actions', label: 'Save query', icon: Save, hint: '⌘S', run: onsave },
+    { id: 'a-run', group: 'Actions', label: 'Run statement at cursor', icon: Play, hint: KEYS.run.hint, kbd: true, run: onrun },
+    { id: 'a-save', group: 'Actions', label: 'Save query', icon: Save, hint: KEYS.save.hint, kbd: true, run: onsave },
     { id: 'a-chat', group: 'Actions', label: 'Toggle AI chat', icon: PanelRight, run: ontogglechat },
     { id: 'a-sidebar', group: 'Actions', label: 'Toggle sidebar', icon: PanelLeft, run: ontogglesidebar },
     { id: 'a-settings', group: 'Actions', label: 'Open Settings', icon: Settings, run: () => onpage('settings') },
@@ -90,9 +91,10 @@
     if (open) {
       q = '';
       sel = 0;
-      tick().then(() => input?.focus());
     }
   });
+
+  const focus = (el: HTMLInputElement) => el.focus();
 
   function close() {
     open = false;
@@ -108,7 +110,6 @@
     const n = filtered.length;
     if (!n) return;
     sel = (sel + d + n) % n;
-    tick().then(() => list?.querySelector(`[data-i="${sel}"]`)?.scrollIntoView({ block: 'nearest' }));
   }
 
   function onkey(e: KeyboardEvent) {
@@ -120,13 +121,11 @@
 </script>
 
 {#if open}
-  <div class="fixed inset-0 z-50 flex items-start justify-center bg-black/35 p-4 pt-[14vh] dark:bg-black/55">
-    <button class="absolute inset-0 cursor-default" aria-label="Close" tabindex="-1" onclick={close}></button>
-    <div class="dialog relative flex max-h-[60vh] w-full max-w-xl flex-col overflow-hidden" role="dialog" aria-label="Command palette">
+  <Modal bare layout="top" width="max-w-xl" class="flex max-h-[60vh] flex-col overflow-hidden" label="Command palette" dismissOnBackdrop onclose={close}>
       <div class="flex items-center gap-2.5 border-b border-line px-4">
         <Search size={15} class="shrink-0 text-faint" />
         <input
-          bind:this={input}
+          use:focus
           bind:value={q}
           oninput={() => (sel = 0)}
           onkeydown={onkey}
@@ -139,7 +138,7 @@
         />
         <kbd class="kbd">esc</kbd>
       </div>
-      <div bind:this={list} class="flex-1 overflow-auto p-1.5">
+      <div class="flex-1 overflow-auto p-1.5">
         {#each filtered as it, i (it.id)}
           {#if i === 0 || filtered[i - 1].group !== it.group}
             <div class="label px-2.5 pt-2 pb-1 text-faint">{it.group}</div>
@@ -147,6 +146,7 @@
           <button
             data-i={i}
             class="flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-[13px] {i === sel ? 'bg-active text-ink' : 'text-muted'}"
+            use:scrollOn={i === sel}
             onmousemove={() => (sel = i)}
             onclick={() => exec(it)}
           >
@@ -154,7 +154,7 @@
             <span class="flex-1 truncate {it.group === 'Tables' ? 'font-mono text-[12.5px]' : ''}">{it.label}</span>
             {#if it.dot}<span class="size-1.5 shrink-0 rounded-full {it.dot}" title={it.env}></span>{#if it.env !== it.hint}<span class="sr-only">{it.env}</span>{/if}{/if}
             {#if it.hint}
-              {#if /[⌘⌥⇧↵]/.test(it.hint)}
+              {#if it.kbd}
                 <kbd class="kbd {i === sel ? 'text-muted' : ''}">{it.hint}</kbd>
               {:else}
                 <span class="text-[11.5px] {i === sel ? 'text-muted' : 'text-faint'}">{it.hint}</span>
@@ -170,6 +170,5 @@
         <span class="flex items-center gap-1.5"><kbd class="kbd">↵</kbd> open</span>
         <span class="flex items-center gap-1.5"><kbd class="kbd">esc</kbd> close</span>
       </div>
-    </div>
-  </div>
+  </Modal>
 {/if}

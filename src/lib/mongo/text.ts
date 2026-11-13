@@ -8,8 +8,8 @@
  */
 export function mongoStatementRanges(doc: string): { from: number; to: number }[] {
   const out: { from: number; to: number }[] = [];
-  let start = 0; // start of the open statement
-  let depth = 0; // () [] {} nesting
+  let start = 0;
+  let depth = 0;
   let hasCode = false; // the open statement holds code, not only blanks and comments
   let lineStart = true; // the next code character begins a line's first token
   let regexOK = true; // a `/` here can open a regex (false right after a word, `)`, `]`, `}` or string)

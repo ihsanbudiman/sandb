@@ -1,120 +1,95 @@
-import { ApiError, type Backend, type ChatEvent, type ChatRequest } from './types';
+import type { Transport } from './backend';
+import { BRIDGE_URL } from './devConfig';
+import { ApiError } from './types';
+import type { ChatEvent, CommandName } from './generated/wire';
 
-// Dev-only transport to the Rust bridge (`pnpm bridge`). The bridge only allows the origin http://localhost:5199.
-const base = ((import.meta.env.VITE_BRIDGE_URL as string | undefined) || 'http://127.0.0.1:58123').replace(/\/+$/, '');
+// Dev-only transport to the Rust bridge (`pnpm bridge`). The bridge only allows the origin of the
+// Vite dev server; both defaults live in `devConfig.ts` and are overridden by `VITE_BRIDGE_*`.
+const base = ((import.meta.env.VITE_BRIDGE_URL as string | undefined) || BRIDGE_URL).replace(/\/+$/, '');
 const token = (import.meta.env.VITE_BRIDGE_TOKEN as string | undefined) ?? '';
 
-async function call<T>(cmd: string, args: Record<string, unknown> = {}, keepalive = false): Promise<T> {
-  let res: Response;
+const unreachable = (e: unknown) => new ApiError({ code: 'io', message: 'Cannot reach the dev bridge', detail: `${base}: ${e instanceof Error ? e.message : e}` });
+
+async function body(res: Response): Promise<unknown> {
+  const text = await res.text();
+  if (!text) return null;
   try {
-    res = await fetch(`${base}/api/${cmd}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify(args),
-      keepalive,
-    });
-  } catch (e) {
-    throw new ApiError({ code: 'io', message: 'Cannot reach the dev bridge', detail: `${base}: ${e instanceof Error ? e.message : e}` });
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
   }
-  const body: unknown = await res.json().catch(() => null);
-  if (!res.ok) throw ApiError.from(body ?? { code: 'internal', message: `Bridge returned HTTP ${res.status}` });
-  return body as T;
 }
 
-// The bridge answers with `text/event-stream`: one `data: <ChatEvent JSON>` line per event, events split by a blank line.
-async function chatSend(request: ChatRequest, onEvent: (e: ChatEvent) => void): Promise<void> {
-  let res: Response;
-  try {
-    res = await fetch(`${base}/api/chat_send`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
-      body: JSON.stringify({ request }),
-    });
-  } catch (e) {
-    throw new ApiError({ code: 'io', message: 'Cannot reach the dev bridge', detail: `${base}: ${e instanceof Error ? e.message : e}` });
-  }
-  if (!res.ok || !res.body) {
-    const body: unknown = await res.json().catch(() => null);
-    throw ApiError.from(body ?? { code: 'internal', message: `Bridge returned HTTP ${res.status}` });
-  }
-  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buf = '';
-  let ended = false;
-  const line = (l: string) => {
-    if (!l.startsWith('data:')) return;
-    let e: ChatEvent;
+function failure(res: Response, raw: unknown): ApiError {
+  if (raw && typeof raw === 'object' && 'code' in raw) return ApiError.from(raw);
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  return new ApiError({ code: 'internal', message: text || `Bridge returned HTTP ${res.status}` });
+}
+
+export const httpTransport: Transport = {
+  async call<T>(name: CommandName, args: Record<string, unknown> | Uint8Array = {}, headers?: Record<string, string>): Promise<T> {
+    // `close_tab_session` runs from the page-hide cleanup; `keepalive` keeps the request alive while the page unloads.
+    const keepalive = name === 'close_tab_session';
+    const bytes = args instanceof Uint8Array;
+    let res: Response;
     try {
-      e = JSON.parse(l.slice(5).trim()) as ChatEvent;
-    } catch {
-      throw new ApiError({ code: 'ai_protocol', message: 'The dev bridge sent an event that is not valid JSON' });
+      res = await fetch(`${base}/api/${name}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': bytes ? 'application/octet-stream' : 'application/json', ...headers },
+        body: bytes ? args.slice().buffer : JSON.stringify(args),
+        keepalive,
+      });
+    } catch (e) {
+      throw unreachable(e);
     }
-    onEvent(e);
-    if (e.type === 'done' || e.type === 'error') ended = true;
-  };
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += value;
-      const lines = buf.split(/\r?\n/);
-      buf = lines.pop() ?? '';
-      for (const l of lines) line(l);
-    }
-    line(buf);
-  } catch (e) {
-    reader.cancel().catch(() => {});
-    if (e instanceof ApiError) throw e;
-    throw new ApiError({ code: 'io', message: 'The connection to the dev bridge stopped', detail: e instanceof Error ? e.message : String(e) });
-  } finally {
-    reader.releaseLock();
-  }
-  if (!ended) throw new ApiError({ code: 'ai_protocol', message: 'The reply stopped before it was complete' });
-}
+    const raw = await body(res);
+    if (!res.ok) throw failure(res, raw);
+    return raw as T;
+  },
 
-export const httpBackend: Backend = {
-  kind: 'bridge',
-  listConnections: () => call('list_connections'),
-  createConnection: (input, password) => call('create_connection', { input, password }),
-  updateConnection: (id, input, password) => call('update_connection', { id, input, password }),
-  duplicateConnection: (id, input, password) => call('duplicate_connection', { id, input, password }),
-  deleteConnection: (id) => call('delete_connection', { id }),
-  reorderConnections: (ids) => call('reorder_connections', { ids }),
-  testConnection: (input, password, id) => call('test_connection', { input, password, id }),
-  listDatabases: (connId) => call('list_databases', { connId }),
-  listSchemas: (connId, database) => call('list_schemas', { connId, database }),
-  listTables: (connId, database, schema) => call('list_tables', { connId, database, schema }),
-  listColumns: (connId, database, schema, table) => call('list_columns', { connId, database, schema, table }),
-  tableProperties: (connId, database, schema, table) => call('table_properties', { connId, database, schema, table }),
-  schemaSnapshot: (connId, database) => call('schema_snapshot', { connId, database }),
-  runQuery: (request) => call('run_query', { request }),
-  editableResult: (request) => call('editable_result', { request }),
-  applyEdits: (request) => call('apply_edits', { request }),
-  cellValue: (request) => call('cell_value', { request }),
-  cancelQuery: (queryId) => call('cancel_query', { queryId }),
-  queryProgress: (queryId) => call('query_progress', { queryId }),
-  commitTransaction: (tabId) => call('commit_transaction', { tabId }),
-  rollbackTransaction: (tabId) => call('rollback_transaction', { tabId }),
-  tabStatus: (tabId) => call('tab_status', { tabId }),
-  // keepalive: the page-hide cleanup sends this while the page unloads, which cancels plain requests.
-  closeTabSession: (tabId) => call('close_tab_session', { tabId }, true),
-  quitApp: () => call('quit_app'),
-  // The bridge never writes files on request; the UI exports the loaded rows in the browser instead.
-  guardCheck: (engine, sql) => call('guard_check', { engine, sql }),
-  classifyWrite: (engine, sql, database) => call('classify_write', { engine, sql, database: database ?? null }),
-  runAiRead: (connId, database, sql) => call('run_ai_read', { connId, database, sql }),
-  getAiSettings: () => call('get_ai_settings'),
-  saveAiSettings: (settings) => call('save_ai_settings', { settings }),
-  setAiKey: (key) => call('set_ai_key', { key }),
-  testAi: (settings, key) => call('test_ai', { settings, key }),
-  listAiModels: (settings, key) => call('list_ai_models', { settings, key }),
-  chatSend,
-  chatCancel: (chatId) => call('chat_cancel', { chatId }),
-  approveWrite: (chatId, id) => call('approve_write', { chatId, id }),
-  denyWrite: (chatId, id) => call('deny_write', { chatId, id }),
-  exportCsv: () => Promise.reject(new ApiError({ code: 'invalid_input', message: 'CSV export to a file needs the desktop app' })),
-  exportResultSql: () => Promise.reject(new ApiError({ code: 'invalid_input', message: 'SQL export to a file needs the desktop app' })),
-  exportDocuments: () => Promise.reject(new ApiError({ code: 'invalid_input', message: 'Document export to a file needs the desktop app' })),
-  tableDdl: (connId, database, schema, table) => call('table_ddl', { connId, database, schema, table }),
-  exportTableSql: () => Promise.reject(new ApiError({ code: 'invalid_input', message: 'SQL export to a file needs the desktop app' })),
-  savePdf: () => Promise.reject(new ApiError({ code: 'invalid_input', message: 'Saving a PDF to a file needs the desktop app' })),
+  async stream(name, args, onEvent) {
+    let res: Response;
+    try {
+      res = await fetch(`${base}/api/${name}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
+        body: JSON.stringify(args),
+      });
+    } catch (e) {
+      throw unreachable(e);
+    }
+    if (!res.ok || !res.body) throw failure(res, await body(res));
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = '';
+    let ended = false;
+    const line = (l: string) => {
+      if (!l.startsWith('data:')) return;
+      let e: ChatEvent;
+      try {
+        e = JSON.parse(l.slice(5).trim()) as ChatEvent;
+      } catch {
+        throw new ApiError({ code: 'ai_protocol', message: 'The dev bridge sent an event that is not valid JSON' });
+      }
+      onEvent(e);
+      if (e.type === 'done' || e.type === 'error') ended = true;
+    };
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        const lines = buf.split(/\r?\n/);
+        buf = lines.pop() ?? '';
+        for (const l of lines) line(l);
+      }
+      line(buf);
+    } catch (e) {
+      reader.cancel().catch(() => {});
+      if (e instanceof ApiError) throw e;
+      throw new ApiError({ code: 'io', message: 'The connection to the dev bridge stopped', detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      reader.releaseLock();
+    }
+    if (!ended) throw new ApiError({ code: 'ai_protocol', message: 'The reply stopped before it was complete' });
+  },
 };

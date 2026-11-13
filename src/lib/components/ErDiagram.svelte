@@ -1,15 +1,11 @@
-<script lang="ts" module>
-  import type { ColumnInfo, ForeignKeyInfo, TableProperties } from '../api';
-  // Keyed by the properties object: the parent keeps that object until Refresh, so a remount reuses the columns.
-  const cache = new WeakMap<TableProperties, Map<string, ColumnInfo[] | string>>();
-</script>
-
 <script lang="ts">
-  import { tick, untrack } from 'svelte';
+  import { untrack } from 'svelte';
   import { KeyRound, Link, Table2, LoaderCircle, RotateCcw, ZoomIn, ZoomOut, Maximize } from '@lucide/svelte';
-  import { api, ApiError } from '../api';
-  import type { Conn } from '../state.svelte';
+  import type { ColumnInfo, ForeignKeyInfo, TableProperties } from '../api';
+  import { catalog, loadColumns } from '../catalog.svelte';
+  import type { Conn } from '../connections.svelte';
   import { displayName, type TableRef } from '../tableActions';
+  import { tableKey } from '../tableId';
 
   /** `onopen`: double-click on a related table. */
   let { conn, table, columns, info, onopen }: { conn: Conn; table: TableRef; columns: ColumnInfo[]; info: TableProperties; onopen?: (t: TableRef) => void } = $props();
@@ -43,25 +39,18 @@
     return { left: [...left.values()], right: [...right.values()], center: { key: selfKey, ref: table, self: true } as Node, edges };
   });
 
-  // Column list per related table, or the error text when it could not load.
-  let related = $state<Map<string, ColumnInfo[] | string> | null>(null);
+  // Columns of the related tables come from the catalog, which the properties view shares.
+  const related = $derived([...graph.left, ...graph.right].map((n) => ({ n, load: catalog.columns[tableKey({ connId: conn.id, database: table.database, schema: n.ref.schema, name: n.ref.name })] })));
+  const ready = $derived(related.every(({ load }) => !!load && load.status !== 'loading'));
   $effect(() => {
-    const props = info;
-    const nodes = [...graph.left, ...graph.right];
-    const hit = cache.get(props);
-    if (hit) { related = hit; return; }
-    related = null;
-    let live = true;
-    Promise.allSettled(nodes.map((n) => api.listColumns(conn.id, table.database, n.ref.schema, n.ref.name))).then((res) => {
-      const m = new Map<string, ColumnInfo[] | string>();
-      res.forEach((r, i) => m.set(nodes[i].key, r.status === 'fulfilled' ? r.value : ApiError.from(r.reason).message));
-      cache.set(props, m);
-      if (live) related = m;
-    });
-    return () => { live = false; };
+    for (const { n } of related) void loadColumns(conn.id, table.database, n.ref.schema, n.ref.name);
   });
 
-  const colsOf = (k: string): ColumnInfo[] | string => (k === selfKey ? columns : related?.get(k) ?? []);
+  const colsOf = (k: string): ColumnInfo[] | string => {
+    if (k === selfKey) return columns;
+    const hit = related.find(({ n }) => n.key === k)?.load;
+    return hit?.status === 'error' ? hit.error : (hit?.items ?? []);
+  };
   const heightOf = (k: string) => {
     const c = colsOf(k);
     return HEAD + (typeof c === 'string' || !c.length ? 1 : c.length) * ROW + FOOT;
@@ -98,7 +87,8 @@
 
   let pos = $state<Record<string, { x: number; y: number }>>({});
   $effect(() => {
-    if (related) pos = untrack(layout);
+    catalog.rev;
+    if (ready) pos = untrack(layout);
   });
 
   const nodes = $derived([graph.center, ...graph.left, ...graph.right]);
@@ -174,19 +164,30 @@
   let zoom = $state(1);
   let scroller = $state<HTMLDivElement>();
 
+  // The scroll position to restore once the new scale is in the DOM.
+  let pendingScroll: { x: number; y: number; px: number; py: number } | null = null;
+
   /** Sets the zoom and keeps the diagram point under (px, py), relative to the scroller, in place. */
-  async function zoomTo(z: number, px?: number, py?: number) {
+  function zoomTo(z: number, px?: number, py?: number) {
     const el = scroller;
     const next = Math.min(ZMAX, Math.max(ZMIN, z));
     if (!el || next === zoom) return;
     px ??= el.clientWidth / 2;
     py ??= el.clientHeight / 2;
-    const x = (el.scrollLeft + px) / zoom, y = (el.scrollTop + py) / zoom;
+    pendingScroll = { x: (el.scrollLeft + px) / zoom, y: (el.scrollTop + py) / zoom, px, py };
     zoom = next;
-    await tick();
-    el.scrollLeft = x * next - px;
-    el.scrollTop = y * next - py;
   }
+
+  // After the render: the scaled diagram has its new size.
+  $effect(() => {
+    zoom;
+    const el = scroller;
+    const p = pendingScroll;
+    if (!el || !p) return;
+    pendingScroll = null;
+    el.scrollLeft = p.x * zoom - p.px;
+    el.scrollTop = p.y * zoom - p.py;
+  });
   function fit() {
     if (!scroller) return;
     zoomTo(Math.min(1, (scroller.clientWidth - 8) / size.w, (scroller.clientHeight - 8) / size.h));
@@ -208,7 +209,7 @@
 </script>
 
 <div class="relative h-full bg-sunken">
-  {#if !related}
+  {#if !ready}
     <div class="grid h-full place-items-center text-faint"><LoaderCircle size={16} class="animate-spin" /></div>
   {:else}
     <div class="absolute top-2 right-4 z-20 flex items-center gap-0.5 rounded-md border border-line bg-surface p-0.5 text-[12px] shadow-sm">

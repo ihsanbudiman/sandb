@@ -1,103 +1,77 @@
 //! Maps database values to JSON for the grid and CSV export. Pure functions, unit tested; the
-//! per-engine row readers in `query.rs` call them.
+//! per-engine row readers in `db/reader.rs` call them.
 //!
 //! Rules: integers → number while JS holds them exactly, else string; numeric/decimal → string
 //! (keeps precision); floats → number; json → JSON value; bytes → `{"$bytes": base64, "len": n}`;
-//! NULL → null; PostGIS geometry/geography → EWKT; the rest → text. With a cap (the grid
-//! preview), long text and bytes are cut.
+//! NULL → null; PostGIS geometry/geography → EWKT; the rest → text. The [`View`] type parameter
+//! says whether long text and bytes are cut: the grid passes [`Preview`], export passes [`Full`].
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
-use serde_json::{Number, Value, json};
+use serde_json::Value;
 
+use crate::core::cell::{self, PREVIEW_BYTES};
 use crate::core::db::wkb;
 
-/// Bytes shown per binary or text cell in the grid. CSV export passes `None` (no cap).
-pub const PREVIEW_BYTES: usize = 4096;
-
-/// Largest integer a JS number holds exactly (2^53 - 1).
-const MAX_SAFE_INT: u64 = 9_007_199_254_740_991;
-
-pub fn bytes(b: &[u8], cap: Option<usize>) -> Value {
-    let shown = match cap {
-        Some(c) => &b[..b.len().min(c)],
-        None => b,
-    };
-    json!({"$bytes": STANDARD.encode(shown), "len": b.len()})
+/// How much of a value the caller wants. A type parameter, not an `Option<usize>` argument: a
+/// caller cannot hand an export the preview cap by accident.
+pub trait View {
+    const CAP: Option<usize>;
 }
 
-/// A number while JS can hold it exactly, else a string.
-pub fn int(i: i64) -> Value {
-    if i.unsigned_abs() <= MAX_SAFE_INT {
-        Value::from(i)
-    } else {
-        Value::String(i.to_string())
-    }
+/// The grid's cell: long text and bytes are cut at [`PREVIEW_BYTES`] and end with `…`.
+pub struct Preview;
+
+/// The whole value: an export or DDL file never truncates.
+pub struct Full;
+
+impl View for Preview {
+    const CAP: Option<usize> = Some(PREVIEW_BYTES);
 }
 
-/// NaN and infinities have no JSON number form; they become strings.
-pub fn float(f: f64) -> Value {
-    Number::from_f64(f)
-        .map(Value::Number)
-        .unwrap_or_else(|| Value::String(f.to_string()))
-}
-
-pub fn unsupported(type_name: &str) -> Value {
-    Value::String(format!("<unsupported: {type_name}>"))
-}
-
-fn text(s: &str) -> Value {
-    Value::String(s.to_string())
-}
-
-/// Text cut to at most `cap` bytes on a char boundary, with `…` when cut. Geometry as WKT or
-/// hex EWKB runs to megabytes per cell; sending it whole to the grid freezes the UI.
-pub fn text_capped(s: &str, cap: Option<usize>) -> Value {
-    match cap {
-        Some(c) if s.len() > c => {
-            let end = (0..=c).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
-            Value::String(format!("{}…", &s[..end]))
-        }
-        _ => text(s),
-    }
+impl View for Full {
+    const CAP: Option<usize> = None;
 }
 
 fn int_or_text(s: &str) -> Value {
-    s.trim().parse::<i64>().map(int).unwrap_or_else(|_| text(s))
+    s.trim().parse::<i64>().map(cell::int).unwrap_or_else(|_| cell::text(s))
 }
 
 fn float_or_text(s: &str) -> Value {
     match s.trim().parse::<f64>() {
-        Ok(f) if f.is_finite() => float(f),
-        _ => text(s),
+        Ok(f) if f.is_finite() => cell::float(f),
+        _ => cell::text(s),
     }
 }
 
 fn json_or_text(s: &str) -> Value {
-    serde_json::from_str(s).unwrap_or_else(|_| text(s))
+    serde_json::from_str(s).unwrap_or_else(|_| cell::text(s))
 }
 
-/// PG text-format value (simple query protocol) by type name as sqlx reports it (`INT4`, `TEXT[]`, …).
-pub fn pg_text(type_name: &str, s: &str, cap: Option<usize>) -> Value {
+/// PG text-format value (simple query protocol) by type name as sqlx reports it
+/// (`INT4`, `TEXT[]`, …).
+pub fn pg_text<V: View>(type_name: &str, s: &str) -> Value {
+    pg_text_with(type_name, s, V::CAP)
+}
+
+fn pg_text_with(type_name: &str, s: &str, cap: Option<usize>) -> Value {
     let t = type_name.to_ascii_uppercase();
     if let Some(elem) = t.strip_suffix("[]") {
-        return pg_array(elem, s, cap).unwrap_or_else(|| text(s));
+        return pg_array(elem, s, cap).unwrap_or_else(|| cell::text(s));
     }
     match t.as_str() {
         "BOOL" => match s {
             "t" => Value::Bool(true),
             "f" => Value::Bool(false),
-            _ => text(s),
+            _ => cell::text(s),
         },
         "INT2" | "INT4" | "INT8" | "OID" => int_or_text(s),
         "FLOAT4" | "FLOAT8" => float_or_text(s),
         "JSON" | "JSONB" => json_or_text(s),
-        "BYTEA" => pg_bytea(s).map_or_else(|| text(s), |b| bytes(&b, cap)),
+        "BYTEA" => pg_bytea(s).map_or_else(|| cell::text(s), |b| cell::bytes(&b, cap)),
         // Types sqlx has not looked up are `?`; PostGIS geometry and geography among them
         // arrive as hex EWKB and are shown as EWKT. Other values do not parse as EWKB.
-        "?" => wkb::hex_ewkb_to_wkt(s, cap).map_or_else(|| text_capped(s, cap), Value::String),
+        "?" => wkb::hex_ewkb_to_wkt(s, cap).map_or_else(|| cell::text_capped(s, cap), Value::String),
         // NUMERIC and MONEY stay strings on purpose; dates, uuid, enums, unknown types are text.
-        _ => text_capped(s, cap),
+        _ => cell::text_capped(s, cap),
     }
 }
 
@@ -176,7 +150,7 @@ impl ArrayParser {
                             c => s.push(c),
                         }
                     }
-                    pg_text(elem, &s, cap)
+                    pg_text_with(elem, &s, cap)
                 }
                 _ => {
                     let start = self.pos;
@@ -188,7 +162,7 @@ impl ArrayParser {
                     if raw.eq_ignore_ascii_case("NULL") {
                         Value::Null
                     } else {
-                        pg_text(elem, raw, cap)
+                        pg_text_with(elem, raw, cap)
                     }
                 }
             };
@@ -204,7 +178,11 @@ impl ArrayParser {
 }
 
 /// MySQL/MariaDB text-protocol value by the sqlx type name (`INT`, `BOOLEAN`, `BLOB`, …).
-pub fn mysql_value(type_name: &str, raw: &[u8], cap: Option<usize>) -> Value {
+pub fn mysql_value<V: View>(type_name: &str, raw: &[u8]) -> Value {
+    mysql_value_with(type_name, raw, V::CAP)
+}
+
+fn mysql_value_with(type_name: &str, raw: &[u8], cap: Option<usize>) -> Value {
     let t = type_name.to_ascii_uppercase();
     let as_text = std::str::from_utf8(raw);
     match t.as_str() {
@@ -212,31 +190,30 @@ pub fn mysql_value(type_name: &str, raw: &[u8], cap: Option<usize>) -> Value {
         "BOOLEAN" => match raw {
             b"0" => Value::Bool(false),
             b"1" => Value::Bool(true),
-            _ => as_text.map_or_else(|_| unsupported(&t), int_or_text),
+            _ => as_text.map_or_else(|_| cell::unsupported(&t), int_or_text),
         },
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "YEAR" | "TINYINT UNSIGNED"
         | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" | "BIGINT UNSIGNED" => {
-            as_text.map_or_else(|_| unsupported(&t), int_or_text)
+            as_text.map_or_else(|_| cell::unsupported(&t), int_or_text)
         }
-        "FLOAT" | "DOUBLE" => as_text.map_or_else(|_| unsupported(&t), float_or_text),
-        "JSON" => as_text.map_or_else(|_| bytes(raw, cap), json_or_text),
+        "FLOAT" | "DOUBLE" => as_text.map_or_else(|_| cell::unsupported(&t), float_or_text),
+        "JSON" => as_text.map_or_else(|_| cell::bytes(raw, cap), json_or_text),
         // sqlx reports text with a binary collation (utf8mb4_bin, MariaDB's JSON) as these types and
         // does not expose the collation, so readable UTF-8 is shown as text and anything else as bytes.
         "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => match as_text {
-            Ok(s) if looks_like_text(s) => text_capped(s, cap),
-            _ => bytes(raw, cap),
+            Ok(s) if looks_like_text(s) => cell::text_capped(s, cap),
+            _ => cell::bytes(raw, cap),
         },
-        "BIT" | "GEOMETRY" => bytes(raw, cap),
+        "BIT" | "GEOMETRY" => cell::bytes(raw, cap),
         // DECIMAL stays a string; text, enum, set, date and time types are text.
         "DECIMAL" | "CHAR" | "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT"
         | "ENUM" | "SET" | "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" => {
-            as_text.map_or_else(|_| bytes(raw, cap), |s| text_capped(s, cap))
+            as_text.map_or_else(|_| cell::bytes(raw, cap), |s| cell::text_capped(s, cap))
         }
-        _ => as_text.map_or_else(|_| unsupported(&t), |s| text_capped(s, cap)),
+        _ => as_text.map_or_else(|_| cell::unsupported(&t), |s| cell::text_capped(s, cap)),
     }
 }
 
-/// Non-empty and free of control characters other than tab, CR and LF.
 fn looks_like_text(s: &str) -> bool {
     !s.is_empty()
         && !s
@@ -244,7 +221,6 @@ fn looks_like_text(s: &str) -> bool {
             .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
 }
 
-/// A SQLite value by its storage class.
 pub enum SqliteRaw<'a> {
     Null,
     Int(i64),
@@ -254,39 +230,43 @@ pub enum SqliteRaw<'a> {
 }
 
 /// `declared`: the sqlx column type name (`BOOLEAN` when declared so); storage class decides the rest.
-pub fn sqlite_value(declared: &str, raw: SqliteRaw<'_>, cap: Option<usize>) -> Value {
+pub fn sqlite_value<V: View>(declared: &str, raw: SqliteRaw<'_>) -> Value {
+    sqlite_value_with(declared, raw, V::CAP)
+}
+
+fn sqlite_value_with(declared: &str, raw: SqliteRaw<'_>, cap: Option<usize>) -> Value {
     match raw {
         SqliteRaw::Null => Value::Null,
         SqliteRaw::Int(i) if declared.eq_ignore_ascii_case("BOOLEAN") && (i == 0 || i == 1) => {
             Value::Bool(i == 1)
         }
-        SqliteRaw::Int(i) => int(i),
-        SqliteRaw::Real(f) => float(f),
-        SqliteRaw::Text(s) => text_capped(s, cap),
-        SqliteRaw::Blob(b) => bytes(b, cap),
+        SqliteRaw::Int(i) => cell::int(i),
+        SqliteRaw::Real(f) => cell::float(f),
+        SqliteRaw::Text(s) => cell::text_capped(s, cap),
+        SqliteRaw::Blob(b) => cell::bytes(b, cap),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::cell::{bytes, text_capped};
+    use serde_json::json;
 
-    #[test]
-    fn ints_keep_precision() {
-        assert_eq!(int(42), json!(42));
-        assert_eq!(
-            int(-9_007_199_254_740_991),
-            json!(-9_007_199_254_740_991_i64)
-        );
-        assert_eq!(int(9_007_199_254_740_993), json!("9007199254740993"));
-        assert_eq!(int(i64::MIN), json!("-9223372036854775808"));
+    fn pg_text(t: &str, s: &str) -> Value {
+        super::pg_text::<Full>(t, s)
     }
 
-    #[test]
-    fn floats_and_non_finite() {
-        assert_eq!(float(3.5), json!(3.5));
-        assert_eq!(float(f64::NAN), json!("NaN"));
-        assert_eq!(float(f64::INFINITY), json!("inf"));
+    fn pg_preview(t: &str, s: &str) -> Value {
+        super::pg_text::<Preview>(t, s)
+    }
+
+    fn mysql_value(t: &str, b: &[u8]) -> Value {
+        super::mysql_value::<Full>(t, b)
+    }
+
+    fn sqlite_value(t: &str, r: SqliteRaw<'_>) -> Value {
+        super::sqlite_value::<Full>(t, r)
     }
 
     #[test]
@@ -304,12 +284,12 @@ mod tests {
     #[test]
     fn long_text_is_cut_only_with_a_cap() {
         let wkt = format!("POLYGON(({}))", "106.8 -6.2, ".repeat(100_000));
-        let v = pg_text("TEXT", &wkt, Some(PREVIEW_BYTES));
+        let v = pg_preview("TEXT", &wkt);
         let s = v.as_str().unwrap();
         assert!(s.ends_with('…') && s.len() <= PREVIEW_BYTES + '…'.len_utf8());
         assert!(wkt.starts_with(s.trim_end_matches('…')));
         assert_eq!(
-            pg_text("TEXT", &wkt, None),
+            pg_text("TEXT", &wkt),
             json!(wkt),
             "export keeps the full value"
         );
@@ -317,12 +297,12 @@ mod tests {
         // A cut inside a multi-byte char backs off to the char start.
         assert_eq!(text_capped("ab日本", Some(3)), json!("ab…"));
         assert_eq!(
-            mysql_value("LONGTEXT", wkt.as_bytes(), Some(PREVIEW_BYTES)),
-            pg_text("TEXT", &wkt, Some(PREVIEW_BYTES))
+            super::mysql_value::<Preview>("LONGTEXT", wkt.as_bytes()),
+            pg_preview("TEXT", &wkt)
         );
         assert_eq!(
-            sqlite_value("TEXT", SqliteRaw::Text(&wkt), Some(PREVIEW_BYTES)),
-            pg_text("TEXT", &wkt, Some(PREVIEW_BYTES))
+            super::sqlite_value::<Preview>("TEXT", SqliteRaw::Text(&wkt)),
+            pg_preview("TEXT", &wkt)
         );
     }
 
@@ -330,42 +310,42 @@ mod tests {
     fn pg_unlooked_up_types_show_geometry_as_wkt_and_keep_other_text() {
         // `SRID=4326;POINT(106.8 -6.2)` as PostGIS prints it.
         let point = "0101000020E61000003333333333B35A40CDCCCCCCCCCC18C0";
-        assert_eq!(pg_text("?", point, None), json!("POINT(106.8 -6.2)"));
+        assert_eq!(pg_text("?", point), json!("POINT(106.8 -6.2)"));
         // Enums and other extension types are `?` too and stay as they are.
-        assert_eq!(pg_text("?", "active", None), json!("active"));
-        assert_eq!(pg_text("?", "0101", None), json!("0101"));
+        assert_eq!(pg_text("?", "active"), json!("active"));
+        assert_eq!(pg_text("?", "0101"), json!("0101"));
         // A known text column that holds hex EWKB is the user's text, not a geometry.
-        assert_eq!(pg_text("TEXT", point, None), json!(point));
+        assert_eq!(pg_text("TEXT", point), json!(point));
     }
 
     #[test]
     fn pg_scalars() {
-        assert_eq!(pg_text("INT4", "-2147483648", None), json!(-2147483648_i64));
+        assert_eq!(pg_text("INT4", "-2147483648"), json!(-2147483648_i64));
         assert_eq!(
-            pg_text("INT8", "9007199254740993", None),
+            pg_text("INT8", "9007199254740993"),
             json!("9007199254740993")
         );
-        assert_eq!(pg_text("INT8", "42", None), json!(42));
-        assert_eq!(pg_text("NUMERIC", "1234.5678", None), json!("1234.5678"));
-        assert_eq!(pg_text("FLOAT8", "-1.5e+300", None), json!(-1.5e300));
-        assert_eq!(pg_text("FLOAT8", "NaN", None), json!("NaN"));
-        assert_eq!(pg_text("BOOL", "t", None), json!(true));
-        assert_eq!(pg_text("BOOL", "f", None), json!(false));
+        assert_eq!(pg_text("INT8", "42"), json!(42));
+        assert_eq!(pg_text("NUMERIC", "1234.5678"), json!("1234.5678"));
+        assert_eq!(pg_text("FLOAT8", "-1.5e+300"), json!(-1.5e300));
+        assert_eq!(pg_text("FLOAT8", "NaN"), json!("NaN"));
+        assert_eq!(pg_text("BOOL", "t"), json!(true));
+        assert_eq!(pg_text("BOOL", "f"), json!(false));
         assert_eq!(
-            pg_text("JSONB", r#"{"a": [1, 2]}"#, None),
+            pg_text("JSONB", r#"{"a": [1, 2]}"#),
             json!({"a": [1, 2]})
         );
-        assert_eq!(pg_text("JSON", "not json", None), json!("not json"));
+        assert_eq!(pg_text("JSON", "not json"), json!("not json"));
         assert_eq!(
-            pg_text("BYTEA", "\\xdeadbeef", None),
+            pg_text("BYTEA", "\\xdeadbeef"),
             json!({"$bytes": "3q2+7w==", "len": 4})
         );
-        assert_eq!(pg_text("?", "happy", None), json!("happy"));
+        assert_eq!(pg_text("?", "happy"), json!("happy"));
         assert_eq!(
-            pg_text("TIMESTAMPTZ", "2026-11-02 03:30:00+00", None),
+            pg_text("TIMESTAMPTZ", "2026-11-02 03:30:00+00"),
             json!("2026-11-02 03:30:00+00")
         );
-        assert_eq!(pg_text("TEXT", "🚀 café", None), json!("🚀 café"));
+        assert_eq!(pg_text("TEXT", "🚀 café"), json!("🚀 café"));
     }
 
     #[test]
@@ -374,71 +354,71 @@ mod tests {
         assert_eq!(pg_bytea("\\x0"), None);
         assert_eq!(pg_bytea("\\xzz"), None);
         assert_eq!(pg_bytea("abc"), None);
-        assert_eq!(pg_text("BYTEA", "abc", None), json!("abc"));
+        assert_eq!(pg_text("BYTEA", "abc"), json!("abc"));
     }
 
     #[test]
     fn pg_arrays() {
-        assert_eq!(pg_text("INT4[]", "{1,2,3}", None), json!([1, 2, 3]));
-        assert_eq!(pg_text("INT4[]", "{}", None), json!([]));
+        assert_eq!(pg_text("INT4[]", "{1,2,3}"), json!([1, 2, 3]));
+        assert_eq!(pg_text("INT4[]", "{}"), json!([]));
         assert_eq!(
-            pg_text("TEXT[]", r#"{a,"b c",NULL,"NULL","x\"y\\z"}"#, None),
+            pg_text("TEXT[]", r#"{a,"b c",NULL,"NULL","x\"y\\z"}"#),
             json!(["a", "b c", null, "NULL", "x\"y\\z"])
         );
         assert_eq!(
-            pg_text("INT8[]", "{{1,2},{3,4}}", None),
+            pg_text("INT8[]", "{{1,2},{3,4}}"),
             json!([[1, 2], [3, 4]])
         );
-        assert_eq!(pg_text("INT4[]", "[0:1]={7,8}", None), json!([7, 8]));
+        assert_eq!(pg_text("INT4[]", "[0:1]={7,8}"), json!([7, 8]));
         assert_eq!(
-            pg_text("BYTEA[]", r#"{"\\x00"}"#, None),
+            pg_text("BYTEA[]", r#"{"\\x00"}"#),
             json!([{"$bytes": "AA==", "len": 1}])
         );
-        assert_eq!(pg_text("INT4[]", "{1,2", None), json!("{1,2"));
+        assert_eq!(pg_text("INT4[]", "{1,2"), json!("{1,2"));
     }
 
     #[test]
     fn mysql_values() {
-        assert_eq!(mysql_value("BOOLEAN", b"1", None), json!(true));
-        assert_eq!(mysql_value("BOOLEAN", b"0", None), json!(false));
-        assert_eq!(mysql_value("INT", b"-5", None), json!(-5));
+        assert_eq!(mysql_value("BOOLEAN", b"1"), json!(true));
+        assert_eq!(mysql_value("BOOLEAN", b"0"), json!(false));
+        assert_eq!(mysql_value("INT", b"-5"), json!(-5));
         assert_eq!(
-            mysql_value("BIGINT", b"-9223372036854775808", None),
+            mysql_value("BIGINT", b"-9223372036854775808"),
             json!("-9223372036854775808")
         );
-        assert_eq!(mysql_value("DECIMAL", b"-0.0001", None), json!("-0.0001"));
-        assert_eq!(mysql_value("BIGINT", b"1", None), json!(1));
+        assert_eq!(mysql_value("DECIMAL", b"-0.0001"), json!("-0.0001"));
+        assert_eq!(mysql_value("BIGINT", b"1"), json!(1));
         assert_eq!(
-            mysql_value("BLOB", &[0], None),
+            mysql_value("BLOB", &[0]),
             json!({"$bytes": "AA==", "len": 1})
         );
         assert_eq!(
-            mysql_value("VARBINARY", b"", None),
+            mysql_value("VARBINARY", b""),
             json!({"$bytes": "", "len": 0})
         );
         // Binary-collated text (utf8mb4_bin, MariaDB JSON) reads as text.
         assert_eq!(
-            mysql_value("LONGBLOB", "{\"a\": 1} 🚀\n".as_bytes(), None),
+            mysql_value("LONGBLOB", "{\"a\": 1} 🚀\n".as_bytes()),
             json!("{\"a\": 1} 🚀\n")
         );
-        assert_eq!(mysql_value("DOUBLE", b"2.5e-3", None), json!(0.0025));
-        assert_eq!(mysql_value("JSON", br#"{"a": 1}"#, None), json!({"a": 1}));
+        assert_eq!(mysql_value("DOUBLE", b"2.5e-3"), json!(0.0025));
+        assert_eq!(mysql_value("JSON", br#"{"a": 1}"#), json!({"a": 1}));
         assert_eq!(
-            mysql_value("BLOB", &[0xde, 0xad, 0xbe, 0xef], None),
+            mysql_value("BLOB", &[0xde, 0xad, 0xbe, 0xef]),
             json!({"$bytes": "3q2+7w==", "len": 4})
         );
-        assert_eq!(mysql_value("ENUM", b"happy", None), json!("happy"));
+        assert_eq!(mysql_value("ENUM", b"happy"), json!("happy"));
         assert_eq!(
-            mysql_value("VARCHAR", "emoji 👍".as_bytes(), None),
+            mysql_value("VARCHAR", "emoji 👍".as_bytes()),
             json!("emoji 👍")
         );
         assert_eq!(
-            mysql_value("VARCHAR", &[0xff], None),
+            mysql_value("VARCHAR", &[0xff]),
             json!({"$bytes": "/w==", "len": 1})
         );
-        assert_eq!(mysql_value("WHATEVER", b"x", None), json!("x"));
+        assert_eq!(mysql_value("WHATEVER", b"x"), json!("x"));
         assert_eq!(
-            mysql_value("WHATEVER", &[0xff], None),
+            mysql_value("WHATEVER", &[0xff]),
             json!("<unsupported: WHATEVER>")
         );
     }
@@ -446,23 +426,23 @@ mod tests {
     #[test]
     fn sqlite_values() {
         assert_eq!(
-            sqlite_value("BOOLEAN", SqliteRaw::Int(1), None),
+            sqlite_value("BOOLEAN", SqliteRaw::Int(1)),
             json!(true)
         );
-        assert_eq!(sqlite_value("BOOLEAN", SqliteRaw::Int(7), None), json!(7));
+        assert_eq!(sqlite_value("BOOLEAN", SqliteRaw::Int(7)), json!(7));
         assert_eq!(
-            sqlite_value("INTEGER", SqliteRaw::Int(9_007_199_254_740_993), None),
+            sqlite_value("INTEGER", SqliteRaw::Int(9_007_199_254_740_993)),
             json!("9007199254740993")
         );
-        assert_eq!(sqlite_value("REAL", SqliteRaw::Real(0.5), None), json!(0.5));
+        assert_eq!(sqlite_value("REAL", SqliteRaw::Real(0.5)), json!(0.5));
         assert_eq!(
-            sqlite_value("TEXT", SqliteRaw::Text("日本語"), None),
+            sqlite_value("TEXT", SqliteRaw::Text("日本語")),
             json!("日本語")
         );
         assert_eq!(
-            sqlite_value("BLOB", SqliteRaw::Blob(&[0]), None),
+            sqlite_value("BLOB", SqliteRaw::Blob(&[0])),
             json!({"$bytes": "AA==", "len": 1})
         );
-        assert_eq!(sqlite_value("TEXT", SqliteRaw::Null, None), Value::Null);
+        assert_eq!(sqlite_value("TEXT", SqliteRaw::Null), Value::Null);
     }
 }

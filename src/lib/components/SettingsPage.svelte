@@ -1,6 +1,9 @@
 <script lang="ts">
   import { ArrowLeft, Bot, KeyRound, Eye, EyeOff, Lock, Gauge, ShieldCheck, Palette, Sun, Moon, Monitor, Check, LoaderCircle, X, CircleArrowUp, Image, AppWindow, Square, SlidersHorizontal } from '@lucide/svelte';
-  import { ui, ai, db, providers, engines, envTag, canWrite, aiSettings, saveAiSoon, saveAiKeySoon, flushAi, removeAiKey, type Provider, type Conn } from '../state.svelte';
+  import { db, engines, envTag, canWrite, setAiWrite, type Conn } from '../connections.svelte';
+  import { ui, ai, providers, aiSettings, saveAiSoon, saveAiKeySoon, flushAi, removeAiKey } from '../state.svelte';
+  import type { Provider } from '../api';
+  import { MAX_ROWS_LIMIT, TIMEOUT_SEC_LIMIT } from '../api/generated/constants';
   import { look, canSeeThrough, backdropOn, lookChanged, setTheme, setBackgroundImage, removeBackgroundImage, resetBackdrop, type Backdrop } from '../appearance.svelte';
   import { api, ApiError } from '../api';
   import { appVersion, updates, checkForUpdates, installUpdate, restartApp, updatesEnabled as canUpdate } from '../updates.svelte';
@@ -15,7 +18,7 @@
   // A test that a later edit made out of date must not show its result.
   let testSeq = 0;
 
-  const keyNote = { tauri: 'Stored encrypted on this computer.', bridge: 'Kept in memory while the dev bridge runs.', mock: 'Demo build: no AI backend.' }[api.kind];
+  const keyNote = api.capabilities.secretStorage === 'encrypted' ? 'Stored encrypted on this computer.' : api.capabilities.secretStorage === 'memory' ? 'Kept in memory while the dev bridge runs.' : 'Demo build: no AI backend.';
 
   function changed() {
     testSeq++;
@@ -54,7 +57,7 @@
     test = 'testing';
     try {
       await flushAi();
-      const r = await api.testAi(aiSettings(), ai.apiKey || null);
+      const r = await api.testAi({ settings: aiSettings(), key: ai.apiKey || null });
       if (seq !== testSeq) return;
       tested = { models: r.modelCount, ms: r.latencyMs };
       test = 'ok';
@@ -66,7 +69,7 @@
   }
 
   function toggleWrites(c: Conn) {
-    if (c.aiWrite) c.aiWrite = false;
+    if (c.aiWrite) void setAiWrite(c, false);
     else if (canWrite(c)) onEnableWrites(c);
   }
 
@@ -179,12 +182,17 @@
             {#if test === 'ok' && tested}<span class="flex items-center gap-1 text-[12px] font-medium text-emerald-700 dark:text-emerald-400"><Check size={13} /> Connected · {tested.models.toLocaleString()} {tested.models === 1 ? 'model' : 'models'} · {tested.ms} ms</span>
             {:else if test === 'fail'}<span class="flex items-center gap-1 text-[12px] font-medium text-red-700 dark:text-red-400"><X size={13} /> Failed</span>
             {:else if test === 'testing'}<span class="text-[12px] text-muted">testing…</span>{/if}
-            <button class="btn btn-secondary" onclick={runTest} disabled={test === 'testing'}>
-              {#if test === 'testing'}<LoaderCircle size={13} class="animate-spin" />{/if} Test
-            </button>
+            {#if api.capabilities.ai}
+              <button class="btn btn-secondary" onclick={runTest} disabled={test === 'testing'}>
+                {#if test === 'testing'}<LoaderCircle size={13} class="animate-spin" />{/if} Test
+              </button>
+            {/if}
           </div>
           {#if test === 'fail' && testError}
             <p class="mt-1.5 text-right text-[12px] break-words text-muted">{testError.message}{#if testError.code === 'model_not_found' && testError.detail}{' '}<span class="text-faint">Models: {testError.detail}</span>{/if}</p>
+          {/if}
+          {#if ai.saveError}
+            <p class="mt-1.5 text-right text-[12px] break-words text-red-700 dark:text-red-400" role="alert">These settings were not saved: {ai.saveError}</p>
           {/if}
         </div>
       </section>
@@ -214,11 +222,11 @@
         <div class="grid min-w-0 gap-3 sm:grid-cols-2">
           <label class="block">
             <span class="label mb-1.5 block">Max rows</span>
-            <input class="input font-mono tabular-nums" type="number" min="1" max="10000" bind:value={ai.maxRows} oninput={changed} />
+            <input class="input font-mono tabular-nums" type="number" min="1" max={MAX_ROWS_LIMIT} bind:value={ai.maxRows} oninput={changed} />
           </label>
           <label class="block">
             <span class="label mb-1.5 block">Timeout (seconds)</span>
-            <input class="input font-mono tabular-nums" type="number" min="1" max="300" bind:value={ai.timeoutSec} oninput={changed} />
+            <input class="input font-mono tabular-nums" type="number" min="1" max={TIMEOUT_SEC_LIMIT} bind:value={ai.timeoutSec} oninput={changed} />
           </label>
         </div>
       </section>
@@ -228,7 +236,7 @@
       <section class="grid gap-x-10 gap-y-3 py-6 sm:grid-cols-[180px_1fr]">
         <div>
           <h2 class="flex items-center gap-2 text-[13px] font-semibold"><ShieldCheck size={14} class="text-faint" /> Safeguards</h2>
-          <p class="mt-1 text-[12.5px] leading-relaxed text-muted">Read-only is on for every connection by default. With write mode on, each write still needs your approval.</p>
+          <p class="mt-1 text-[12.5px] leading-relaxed text-muted">AI writes are off for every connection by default. With write mode on, each write still needs your approval.</p>
         </div>
         <div class="min-w-0 divide-y divide-line rounded-lg border border-line">
           <!-- SQL and MongoDB connections: the chat can propose writes on both, each still needs approval. -->
@@ -240,7 +248,7 @@
               <span class="tag {envTag[c.env]}">{c.env}</span>
               <div class="flex-1"></div>
               {#if canWrite(c)}
-                <span class="text-[12px] {on ? 'text-amber-600 dark:text-amber-400' : 'text-muted'}">{on ? 'Writes need approval' : 'Read-only'}</span>
+                <span class="text-[12px] {on ? 'text-amber-600 dark:text-amber-400' : 'text-muted'}">{on ? 'Writes need approval' : 'Writes off'}</span>
               {:else}
                 <span class="text-[12px] text-muted">Connection is read-only</span>
               {/if}

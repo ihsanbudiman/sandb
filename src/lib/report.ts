@@ -2,8 +2,9 @@
 import { marked, type Token, type Tokens } from 'marked';
 import { jsPDF } from 'jspdf';
 import { svg2pdf } from 'svg2pdf.js';
+import { api } from './api';
 import { chartSvg } from './charts';
-import type { ChartPart, Part } from './chat.svelte';
+import type { ChartPart, Part } from './chatModel';
 
 const PAGE_MARGIN = 50;
 const BODY = 10.5;
@@ -73,7 +74,6 @@ class Writer {
     this.bottom = doc.internal.pageSize.getHeight() - PAGE_MARGIN;
   }
 
-  /** Starts a new page unless `h` more points fit on this one. */
   room(h: number) {
     if (this.y + h <= this.bottom) return;
     this.doc.addPage();
@@ -85,7 +85,6 @@ class Writer {
     this.doc.setFontSize(run.mono ? size * 0.92 : size);
   }
 
-  /** Wraps mixed-style text into the width and draws it line by line. */
   rich(rs: Run[], size: number, x = PAGE_MARGIN, width = this.width, color = INK) {
     const lh = size * 1.45;
     type Piece = Run & { w: number };
@@ -291,14 +290,11 @@ class Writer {
 }
 
 export interface ReportInput {
-  /** Used when the reply has no `#` heading of its own. */
   title: string;
-  /** Connection, database and date line under the title. */
   meta: string;
   parts: Part[];
 }
 
-/** The chart's text in the PDF fonts' character set. */
 function printable(p: ChartPart): ChartPart {
   const text = (v: unknown) => (typeof v === 'string' ? pdfText(v) : v);
   return {
@@ -349,7 +345,6 @@ export async function replyPdf({ title, meta, parts }: ReportInput): Promise<{ b
   return { bytes: new Uint8Array(doc.output('arraybuffer')), title: heading };
 }
 
-/** An ASCII file name from a title: "Orders revenue report" → "orders-revenue-report.pdf". */
 export function pdfName(title: string): string {
   const slug = title
     .normalize('NFKD')
@@ -360,4 +355,23 @@ export function pdfName(title: string): string {
     .slice(0, 60)
     .replace(/-+$/, '');
   return `${slug || 'report'}.pdf`;
+}
+
+/**
+ * Renders one reply and hands the PDF to the user: the desktop app writes it through the save dialog,
+ * a browser downloads it. Returns the line to show when the file was saved; throws otherwise.
+ */
+export async function exportReply(parts: Part[], question: string, meta: string): Promise<string> {
+  const title = question.length > 90 ? `${question.slice(0, 87)}...` : question || 'Report';
+  const { bytes, title: heading } = await replyPdf({ title, meta, parts });
+  const name = pdfName(heading);
+  if (!api.capabilities.fileExport) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+    const a = Object.assign(document.createElement('a'), { href: url, download: name });
+    a.click();
+    URL.revokeObjectURL(url);
+    return '';
+  }
+  const path = await api.savePdf(name, bytes);
+  return path ? `Saved to ${path}` : '';
 }

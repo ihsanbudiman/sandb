@@ -1,24 +1,72 @@
-//! Execution of one parsed write statement.
-
-use std::time::Duration;
+//! Execution of one parsed write statement. `guard::kind` sends every statement that changes
+//! documents or the schema here, including an aggregate whose pipeline ends in `$out` or
+//! `$merge`.
 
 use mongodb::{
     Client, Collection, IndexModel,
     bson::{Bson, Document, doc},
     options::{
-        Collation, CreateIndexOptions, DeleteOptions, DropIndexOptions, FindOneAndDeleteOptions,
-        FindOneAndReplaceOptions, FindOneAndUpdateOptions, Hint, IndexOptions, InsertManyOptions,
-        InsertOneOptions, ReplaceOptions, ReturnDocument, UpdateModifications, UpdateOptions,
+        CreateIndexOptions, DeleteOptions, DropIndexOptions, FindOneAndDeleteOptions,
+        FindOneAndReplaceOptions, FindOneAndUpdateOptions, IndexOptions, InsertManyOptions,
+        InsertOneOptions, ReplaceOptions, UpdateModifications, UpdateOptions,
     },
 };
 
 use crate::core::error::AppError;
 use crate::core::mongo::command::{Command, Method};
+use crate::core::mongo::comment::OpComment;
+use crate::core::mongo::options::{apply_aggregate_options, Options};
 
-/// The result of one write statement: the server's own counts plus one notice line.
+const UPDATE_OPTIONS: &[&str] = &["upsert", "arrayFilters", "collation", "hint", "let"];
+const REPLACE_OPTIONS: &[&str] = &["upsert", "collation", "hint", "let"];
+const FIND_ONE_AND_UPDATE_OPTIONS: &[&str] = &[
+    "upsert",
+    "returnDocument",
+    "projection",
+    "sort",
+    "arrayFilters",
+    "collation",
+    "hint",
+    "let",
+];
+const FIND_ONE_AND_REPLACE_OPTIONS: &[&str] = &[
+    "upsert",
+    "returnDocument",
+    "projection",
+    "sort",
+    "collation",
+    "hint",
+    "let",
+];
+const FIND_ONE_AND_DELETE_OPTIONS: &[&str] = &["projection", "sort", "collation", "hint", "let"];
+const ORDERED_OPTIONS: &[&str] = &["ordered"];
+/// The export script writes a stored index with the same keys.
+pub(crate) const CREATE_INDEX_OPTIONS: &[&str] = &[
+    "name",
+    "unique",
+    "sparse",
+    "expireAfterSeconds",
+    "partialFilterExpression",
+    "collation",
+    "hidden",
+    "weights",
+    "default_language",
+    "wildcardProjection",
+    "language_override",
+    "textIndexVersion",
+    "2dsphereIndexVersion",
+    "bits",
+    "min",
+    "max",
+    "storageEngine",
+    "background",
+];
+const DROP_DATABASE_OPTIONS: &[&str] = &["writeConcern"];
+
 #[derive(Debug)]
 pub struct WriteOutcome {
-    /// Inserted, modified, deleted or upserted count; 0 for schema changes.
+    /// Inserted, modified, deleted or upserted count; 0 for schema changes and an aggregate that
+    /// writes.
     pub affected: u64,
     /// One line for `QueryRun.notices`, e.g. "updateMany on orders: matched 3, modified 2".
     pub notice: String,
@@ -26,12 +74,13 @@ pub struct WriteOutcome {
     pub document: Option<Document>,
 }
 
-/// Runs one statement whose `guard::kind` is Write or Schema. Every operation carries `comment`.
+/// Runs one statement whose `guard::kind` is Write or Schema. Every operation carries `comment`;
+/// a collection `drop` is the one the driver cannot comment.
 pub async fn execute(
     client: &Client,
     database: &str,
     cmd: &Command,
-    comment: &str,
+    comment: OpComment<'_>,
 ) -> Result<WriteOutcome, AppError> {
     match cmd {
         Command::Collection { collection, method } => {
@@ -51,20 +100,21 @@ pub async fn execute(
 }
 
 /// `create` takes many options and the server validates them, so the user's document goes through
-/// as it is. A user `comment` replaces the query id.
+/// as it is. A user `comment` replaces the run's.
 async fn create_collection(
     client: &Client,
     database: &str,
     name: &str,
     options: Option<&Document>,
-    comment: &str,
+    comment: OpComment<'_>,
 ) -> Result<WriteOutcome, AppError> {
-    let mut command = doc! { "create": name, "comment": comment };
+    let mut command = doc! { "create": name };
     if let Some(options) = options {
         for (key, value) in options {
             command.insert(key.clone(), value.clone());
         }
     }
+    comment.apply(&mut command);
     client.database(database).run_command(command).await?;
     Ok(WriteOutcome {
         affected: 0,
@@ -73,21 +123,22 @@ async fn create_collection(
     })
 }
 
-/// `db.dropDatabase()`: the server command, so the query id goes along as `comment`. mongosh
-/// takes only `writeConcern`; the server validates its value.
+/// `db.dropDatabase()`: the server command, so the run's comment goes along. mongosh takes only
+/// `writeConcern`; the server validates its value.
 async fn drop_database(
     client: &Client,
     database: &str,
     options: Option<&Document>,
-    comment: &str,
+    comment: OpComment<'_>,
 ) -> Result<WriteOutcome, AppError> {
-    check_keys("dropDatabase", options, &["writeConcern"])?;
-    let mut command = doc! { "dropDatabase": 1, "comment": comment };
+    Options::new("dropDatabase", options).check(DROP_DATABASE_OPTIONS)?;
+    let mut command = doc! { "dropDatabase": 1 };
     if let Some(options) = options {
         for (key, value) in options {
             command.insert(key.clone(), value.clone());
         }
     }
+    comment.apply(&mut command);
     client.database(database).run_command(command).await?;
     Ok(WriteOutcome {
         affected: 0,
@@ -96,230 +147,25 @@ async fn drop_database(
     })
 }
 
-/// The option keys each write method knows; anything else is refused before the run.
 fn known_options(method: &Method) -> &'static [&'static str] {
     match method {
-        Method::InsertMany { .. } | Method::BulkWrite { .. } => &["ordered"],
-        Method::UpdateOne { .. } | Method::UpdateMany { .. } => {
-            &["upsert", "arrayFilters", "collation", "hint", "let"]
-        }
-        Method::ReplaceOne { .. } => &["upsert", "collation", "hint", "let"],
-        Method::FindOneAndUpdate { .. } => &[
-            "upsert",
-            "returnDocument",
-            "projection",
-            "sort",
-            "arrayFilters",
-            "collation",
-            "hint",
-            "let",
-        ],
-        Method::FindOneAndReplace { .. } => &[
-            "upsert",
-            "returnDocument",
-            "projection",
-            "sort",
-            "collation",
-            "hint",
-            "let",
-        ],
-        Method::FindOneAndDelete { .. } => &["projection", "sort", "collation", "hint", "let"],
-        Method::CreateIndex { .. } | Method::CreateIndexes { .. } => &[
-            "name",
-            "unique",
-            "sparse",
-            "expireAfterSeconds",
-            "partialFilterExpression",
-            "collation",
-            "hidden",
-            "weights",
-            "default_language",
-            "wildcardProjection",
-            "language_override",
-            "textIndexVersion",
-            "2dsphereIndexVersion",
-            "bits",
-            "min",
-            "max",
-            "storageEngine",
-            "background",
-        ],
+        Method::InsertMany { .. } | Method::BulkWrite { .. } => ORDERED_OPTIONS,
+        Method::UpdateOne { .. } | Method::UpdateMany { .. } => UPDATE_OPTIONS,
+        Method::ReplaceOne { .. } => REPLACE_OPTIONS,
+        Method::FindOneAndUpdate { .. } => FIND_ONE_AND_UPDATE_OPTIONS,
+        Method::FindOneAndReplace { .. } => FIND_ONE_AND_REPLACE_OPTIONS,
+        Method::FindOneAndDelete { .. } => FIND_ONE_AND_DELETE_OPTIONS,
+        Method::CreateIndex { .. } | Method::CreateIndexes { .. } => CREATE_INDEX_OPTIONS,
         _ => &[],
     }
 }
 
-/// Refuses keys `method` does not know, before anything runs.
-fn check_options(method: &Method, options: Option<&Document>) -> Result<(), AppError> {
-    check_keys(method.name(), options, known_options(method))
+fn method_options<'a>(method: &'a Method, options: Option<&'a Document>) -> Result<Options<'a>, AppError> {
+    let o = Options::new(method.name(), options);
+    o.check(known_options(method))?;
+    Ok(o)
 }
 
-/// Refuses keys the named operation does not know, before anything runs.
-fn check_keys(method: &str, options: Option<&Document>, known: &[&str]) -> Result<(), AppError> {
-    let Some(options) = options else {
-        return Ok(());
-    };
-    for key in options.keys() {
-        if !known.contains(&key.as_str()) {
-            return Err(AppError::invalid(format!("Unknown {method} option: {key}")));
-        }
-    }
-    Ok(())
-}
-
-/// Reads a boolean option; `null` counts as absent.
-fn opt_bool(options: Option<&Document>, key: &str) -> Result<Option<bool>, AppError> {
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(Bson::Boolean(value)) => Ok(Some(*value)),
-        Some(_) => Err(AppError::invalid(format!("{key} must be true or false"))),
-    }
-}
-
-/// Reads a string option; `null` counts as absent.
-fn opt_str<'a>(options: Option<&'a Document>, key: &str) -> Result<Option<&'a str>, AppError> {
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(Bson::String(value)) => Ok(Some(value.as_str())),
-        Some(_) => Err(AppError::invalid(format!("{key} must be a string"))),
-    }
-}
-
-/// Reads a document option; `null` counts as absent.
-fn opt_document<'a>(
-    options: Option<&'a Document>,
-    key: &str,
-) -> Result<Option<&'a Document>, AppError> {
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(value @ Bson::Document(_)) => Ok(value.as_document()),
-        Some(_) => Err(AppError::invalid(format!("{key} must be a document"))),
-    }
-}
-
-/// Reads a number of seconds as a duration, for `expireAfterSeconds`.
-fn opt_seconds(options: Option<&Document>, key: &str) -> Result<Option<Duration>, AppError> {
-    let seconds = match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => return Ok(None),
-        Some(Bson::Int32(value)) if *value >= 0 => f64::from(*value),
-        Some(Bson::Int64(value)) if *value >= 0 => *value as f64,
-        Some(Bson::Double(value)) if *value >= 0.0 => *value,
-        Some(_) => {
-            return Err(AppError::invalid(format!(
-                "{key} must be a number of seconds"
-            )));
-        }
-    };
-    Ok(Some(Duration::from_secs(seconds as u64)))
-}
-
-/// Reads a whole number option, as `bits` is.
-fn opt_u32(options: Option<&Document>, key: &str) -> Result<Option<u32>, AppError> {
-    let bad = || {
-        AppError::invalid(format!(
-            "{key} must be a whole number from 0 to {}",
-            u32::MAX
-        ))
-    };
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(Bson::Int32(value)) if *value >= 0 => Ok(Some(*value as u32)),
-        Some(Bson::Int64(value)) if (0..=i64::from(u32::MAX)).contains(value) => {
-            Ok(Some(*value as u32))
-        }
-        Some(Bson::Double(value))
-            if value.fract() == 0.0 && *value >= 0.0 && *value <= f64::from(u32::MAX) =>
-        {
-            Ok(Some(*value as u32))
-        }
-        Some(_) => Err(bad()),
-    }
-}
-
-/// Reads a number option, as `min` and `max` are.
-fn opt_f64(options: Option<&Document>, key: &str) -> Result<Option<f64>, AppError> {
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(Bson::Int32(value)) => Ok(Some(f64::from(*value))),
-        Some(Bson::Int64(value)) => Ok(Some(*value as f64)),
-        Some(Bson::Double(value)) => Ok(Some(*value)),
-        Some(_) => Err(AppError::invalid(format!("{key} must be a number"))),
-    }
-}
-
-/// Reads a version option the driver models as an enum, as `textIndexVersion` is.
-fn opt_version<T: serde::de::DeserializeOwned>(
-    options: Option<&Document>,
-    key: &str,
-) -> Result<Option<T>, AppError> {
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(value @ (Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))) => {
-            mongodb::bson::from_bson::<T>(value.clone())
-                .map(Some)
-                .map_err(|e| AppError::invalid(format!("Invalid {key}: {e}")))
-        }
-        Some(_) => Err(AppError::invalid(format!("{key} must be a whole number"))),
-    }
-}
-
-/// Reads an index hint: an index name or a key document.
-fn opt_hint(options: Option<&Document>, key: &str) -> Result<Option<Hint>, AppError> {
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(Bson::String(name)) => Ok(Some(Hint::Name(name.clone()))),
-        Some(Bson::Document(keys)) => Ok(Some(Hint::Keys(keys.clone()))),
-        Some(_) => Err(AppError::invalid(format!(
-            "{key} must be an index name or a key document"
-        ))),
-    }
-}
-
-/// Reads a collation document.
-fn opt_collation(options: Option<&Document>, key: &str) -> Result<Option<Collation>, AppError> {
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(Bson::Document(value)) => Ok(Some(
-            mongodb::bson::from_document(value.clone())
-                .map_err(|e| AppError::invalid(format!("Invalid {key}: {e}")))?,
-        )),
-        Some(_) => Err(AppError::invalid(format!("{key} must be a document"))),
-    }
-}
-
-/// Reads `returnDocument: 'before' | 'after'`.
-fn opt_return_document(
-    options: Option<&Document>,
-    key: &str,
-) -> Result<Option<ReturnDocument>, AppError> {
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(Bson::String(value)) if value == "after" => Ok(Some(ReturnDocument::After)),
-        Some(Bson::String(value)) if value == "before" => Ok(Some(ReturnDocument::Before)),
-        Some(_) => Err(AppError::invalid(format!(
-            "{key} must be 'before' or 'after'"
-        ))),
-    }
-}
-
-/// Reads `arrayFilters`, an array of filter documents.
-fn opt_array_filters(
-    options: Option<&Document>,
-    key: &str,
-) -> Result<Option<Vec<Document>>, AppError> {
-    let wrong = || AppError::invalid(format!("{key} must be an array of documents"));
-    match options.and_then(|o| o.get(key)) {
-        None | Some(Bson::Null) => Ok(None),
-        Some(Bson::Array(filters)) => filters
-            .iter()
-            .map(|filter| filter.as_document().cloned().ok_or_else(wrong))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        Some(_) => Err(wrong()),
-    }
-}
-
-/// The `update` argument of an update: a document of update operators or an array of pipeline
-/// stages.
 fn modification(update: &Bson) -> Result<UpdateModifications, AppError> {
     match update {
         Bson::Document(document) => Ok(UpdateModifications::Document(document.clone())),
@@ -339,19 +185,18 @@ fn modification(update: &Bson) -> Result<UpdateModifications, AppError> {
     }
 }
 
-/// Runs one `db.<collection>.<method>(…)` statement.
 async fn execute_method(
     client: &Client,
     database: &str,
     collection: &str,
     method: &Method,
-    comment: &str,
+    comment: OpComment<'_>,
 ) -> Result<WriteOutcome, AppError> {
     let coll = client.database(database).collection::<Document>(collection);
     match method {
         Method::InsertOne { document } => {
             let mut options = InsertOneOptions::default();
-            options.comment = Some(comment.into());
+            options.comment = Some(comment.tag());
             coll.insert_one(document).with_options(options).await?;
             Ok(WriteOutcome {
                 affected: 1,
@@ -360,10 +205,10 @@ async fn execute_method(
             })
         }
         Method::InsertMany { documents, options } => {
-            check_options(method, options.as_ref())?;
+            let o = method_options(method, options.as_ref())?;
             let mut insert_options = InsertManyOptions::default();
-            insert_options.ordered = opt_bool(options.as_ref(), "ordered")?;
-            insert_options.comment = Some(comment.into());
+            insert_options.ordered = o.bool("ordered")?;
+            insert_options.comment = Some(comment.tag());
             let result = coll
                 .insert_many(documents)
                 .with_options(insert_options)
@@ -380,10 +225,10 @@ async fn execute_method(
             update,
             options,
         } => {
-            check_options(method, options.as_ref())?;
+            let o = method_options(method, options.as_ref())?;
             let result = coll
                 .update_one(filter.clone(), modification(update)?)
-                .with_options(update_options(options.as_ref(), comment)?)
+                .with_options(update_options(&o, comment)?)
                 .await?;
             Ok(update_outcome("updateOne", collection, &result))
         }
@@ -392,10 +237,10 @@ async fn execute_method(
             update,
             options,
         } => {
-            check_options(method, options.as_ref())?;
+            let o = method_options(method, options.as_ref())?;
             let result = coll
                 .update_many(filter.clone(), modification(update)?)
-                .with_options(update_options(options.as_ref(), comment)?)
+                .with_options(update_options(&o, comment)?)
                 .await?;
             Ok(update_outcome("updateMany", collection, &result))
         }
@@ -404,16 +249,10 @@ async fn execute_method(
             replacement,
             options,
         } => {
-            check_options(method, options.as_ref())?;
-            let mut replace_options = ReplaceOptions::default();
-            replace_options.upsert = opt_bool(options.as_ref(), "upsert")?;
-            replace_options.collation = opt_collation(options.as_ref(), "collation")?;
-            replace_options.hint = opt_hint(options.as_ref(), "hint")?;
-            replace_options.let_vars = opt_document(options.as_ref(), "let")?.cloned();
-            replace_options.comment = Some(comment.into());
+            let o = method_options(method, options.as_ref())?;
             let result = coll
                 .replace_one(filter.clone(), replacement)
-                .with_options(replace_options)
+                .with_options(replace_options(&o, comment)?)
                 .await?;
             Ok(update_outcome("replaceOne", collection, &result))
         }
@@ -450,17 +289,17 @@ async fn execute_method(
             update,
             options,
         } => {
-            check_options(method, options.as_ref())?;
+            let o = method_options(method, options.as_ref())?;
             let mut find_options = FindOneAndUpdateOptions::default();
-            find_options.upsert = opt_bool(options.as_ref(), "upsert")?;
-            find_options.return_document = opt_return_document(options.as_ref(), "returnDocument")?;
-            find_options.projection = opt_document(options.as_ref(), "projection")?.cloned();
-            find_options.sort = opt_document(options.as_ref(), "sort")?.cloned();
-            find_options.array_filters = opt_array_filters(options.as_ref(), "arrayFilters")?;
-            find_options.collation = opt_collation(options.as_ref(), "collation")?;
-            find_options.hint = opt_hint(options.as_ref(), "hint")?;
-            find_options.let_vars = opt_document(options.as_ref(), "let")?.cloned();
-            find_options.comment = Some(comment.into());
+            find_options.upsert = o.bool("upsert")?;
+            find_options.return_document = o.return_document("returnDocument")?;
+            find_options.projection = o.document("projection")?.cloned();
+            find_options.sort = o.document("sort")?.cloned();
+            find_options.array_filters = o.array_filters("arrayFilters")?;
+            find_options.collation = o.collation("collation")?;
+            find_options.hint = o.hint("hint")?;
+            find_options.let_vars = o.document("let")?.cloned();
+            find_options.comment = Some(comment.tag());
             let document = coll
                 .find_one_and_update(filter.clone(), modification(update)?)
                 .with_options(find_options)
@@ -472,16 +311,16 @@ async fn execute_method(
             replacement,
             options,
         } => {
-            check_options(method, options.as_ref())?;
+            let o = method_options(method, options.as_ref())?;
             let mut find_options = FindOneAndReplaceOptions::default();
-            find_options.upsert = opt_bool(options.as_ref(), "upsert")?;
-            find_options.return_document = opt_return_document(options.as_ref(), "returnDocument")?;
-            find_options.projection = opt_document(options.as_ref(), "projection")?.cloned();
-            find_options.sort = opt_document(options.as_ref(), "sort")?.cloned();
-            find_options.collation = opt_collation(options.as_ref(), "collation")?;
-            find_options.hint = opt_hint(options.as_ref(), "hint")?;
-            find_options.let_vars = opt_document(options.as_ref(), "let")?.cloned();
-            find_options.comment = Some(comment.into());
+            find_options.upsert = o.bool("upsert")?;
+            find_options.return_document = o.return_document("returnDocument")?;
+            find_options.projection = o.document("projection")?.cloned();
+            find_options.sort = o.document("sort")?.cloned();
+            find_options.collation = o.collation("collation")?;
+            find_options.hint = o.hint("hint")?;
+            find_options.let_vars = o.document("let")?.cloned();
+            find_options.comment = Some(comment.tag());
             let document = coll
                 .find_one_and_replace(filter.clone(), replacement)
                 .with_options(find_options)
@@ -489,14 +328,14 @@ async fn execute_method(
             Ok(found_outcome("findOneAndReplace", collection, document))
         }
         Method::FindOneAndDelete { filter, options } => {
-            check_options(method, options.as_ref())?;
+            let o = method_options(method, options.as_ref())?;
             let mut find_options = FindOneAndDeleteOptions::default();
-            find_options.projection = opt_document(options.as_ref(), "projection")?.cloned();
-            find_options.sort = opt_document(options.as_ref(), "sort")?.cloned();
-            find_options.collation = opt_collation(options.as_ref(), "collation")?;
-            find_options.hint = opt_hint(options.as_ref(), "hint")?;
-            find_options.let_vars = opt_document(options.as_ref(), "let")?.cloned();
-            find_options.comment = Some(comment.into());
+            find_options.projection = o.document("projection")?.cloned();
+            find_options.sort = o.document("sort")?.cloned();
+            find_options.collation = o.collation("collation")?;
+            find_options.hint = o.hint("hint")?;
+            find_options.let_vars = o.document("let")?.cloned();
+            find_options.comment = Some(comment.tag());
             let document = coll
                 .find_one_and_delete(filter.clone())
                 .with_options(find_options)
@@ -507,15 +346,15 @@ async fn execute_method(
             operations,
             options,
         } => {
-            check_options(method, options.as_ref())?;
-            let ordered = opt_bool(options.as_ref(), "ordered")?.unwrap_or(true);
+            let o = method_options(method, options.as_ref())?;
+            let ordered = o.bool("ordered")?.unwrap_or(true);
             bulk_write(&coll, collection, operations, ordered, comment).await
         }
         Method::CreateIndex { keys, options } => {
-            check_options(method, options.as_ref())?;
+            let o = method_options(method, options.as_ref())?;
             let model = IndexModel::builder()
                 .keys(keys.clone())
-                .options(index_options(options.as_ref())?)
+                .options(index_options(&o)?)
                 .build();
             let result = coll
                 .create_index(model)
@@ -528,8 +367,8 @@ async fn execute_method(
             })
         }
         Method::CreateIndexes { keys, options } => {
-            check_options(method, options.as_ref())?;
-            let shared = index_options(options.as_ref())?;
+            let o = method_options(method, options.as_ref())?;
+            let shared = index_options(&o)?;
             let models = keys
                 .iter()
                 .map(|key| {
@@ -552,9 +391,7 @@ async fn execute_method(
                 document: None,
             })
         }
-        Method::DropIndex { index } => {
-            drop_index(&coll, database, collection, index, comment).await
-        }
+        Method::DropIndex { index } => drop_index(&coll, database, collection, index, comment).await,
         Method::DropIndexes => {
             coll.drop_indexes()
                 .with_options(drop_index_comment(comment))
@@ -565,6 +402,8 @@ async fn execute_method(
                 document: None,
             })
         }
+        // The driver's `drop` has no `comment` option, so a cancel cannot find this one in
+        // `$currentOp`; it still stops the run before the next statement.
         Method::Drop => {
             coll.drop().await?;
             Ok(WriteOutcome {
@@ -577,11 +416,11 @@ async fn execute_method(
             let mut command = doc! {
                 "renameCollection": format!("{database}.{collection}"),
                 "to": format!("{database}.{to}"),
-                "comment": comment,
             };
             if *drop_target {
                 command.insert("dropTarget", true);
             }
+            comment.apply(&mut command);
             client.database("admin").run_command(command).await?;
             Ok(WriteOutcome {
                 affected: 0,
@@ -589,9 +428,22 @@ async fn execute_method(
                 document: None,
             })
         }
+        // An aggregate whose pipeline has `$out` or `$merge`: the server writes while the cursor
+        // runs empty, so the whole pipeline is streamed and the counts are the server's. The
+        // options are the read path's document, mapped by the same helper.
+        Method::Aggregate { pipeline, options } => {
+            let o = Options::new("aggregate", options.as_ref());
+            let action = coll.aggregate(pipeline.clone()).comment(comment.tag());
+            let mut cursor = apply_aggregate_options(action, &o)?.await?;
+            while cursor.advance().await? {}
+            Ok(WriteOutcome {
+                affected: 0,
+                notice: format!("aggregate on {collection}: wrote the pipeline result"),
+                document: None,
+            })
+        }
         Method::Find(_)
         | Method::FindOne { .. }
-        | Method::Aggregate { .. }
         | Method::CountDocuments { .. }
         | Method::EstimatedDocumentCount
         | Method::Distinct { .. }
@@ -600,27 +452,35 @@ async fn execute_method(
     }
 }
 
-/// The options of `updateOne`/`updateMany`.
-fn update_options(options: Option<&Document>, comment: &str) -> Result<UpdateOptions, AppError> {
+fn update_options(o: &Options<'_>, comment: OpComment<'_>) -> Result<UpdateOptions, AppError> {
     let mut update = UpdateOptions::default();
-    update.upsert = opt_bool(options, "upsert")?;
-    update.array_filters = opt_array_filters(options, "arrayFilters")?;
-    update.collation = opt_collation(options, "collation")?;
-    update.hint = opt_hint(options, "hint")?;
-    update.let_vars = opt_document(options, "let")?.cloned();
-    update.comment = Some(comment.into());
+    update.upsert = o.bool("upsert")?;
+    update.array_filters = o.array_filters("arrayFilters")?;
+    update.collation = o.collation("collation")?;
+    update.hint = o.hint("hint")?;
+    update.let_vars = o.document("let")?.cloned();
+    update.comment = Some(comment.tag());
     Ok(update)
 }
 
+fn replace_options(o: &Options<'_>, comment: OpComment<'_>) -> Result<ReplaceOptions, AppError> {
+    let mut replace = ReplaceOptions::default();
+    replace.upsert = o.bool("upsert")?;
+    replace.collation = o.collation("collation")?;
+    replace.hint = o.hint("hint")?;
+    replace.let_vars = o.document("let")?.cloned();
+    replace.comment = Some(comment.tag());
+    Ok(replace)
+}
+
 /// The options of `deleteOne`/`deleteMany`: the parser takes no user options for them, so only
-/// the query id comment goes through.
-fn delete_options(comment: &str) -> DeleteOptions {
+/// the run's comment goes through.
+fn delete_options(comment: OpComment<'_>) -> DeleteOptions {
     let mut delete = DeleteOptions::default();
-    delete.comment = Some(comment.into());
+    delete.comment = Some(comment.tag());
     delete
 }
 
-/// Notice and counts of an update or replace.
 fn update_outcome(
     method: &str,
     collection: &str,
@@ -641,7 +501,6 @@ fn update_outcome(
     }
 }
 
-/// Notice and counts of a find-one-and-* that returned `document`.
 fn found_outcome(method: &str, collection: &str, document: Option<Document>) -> WriteOutcome {
     WriteOutcome {
         affected: u64::from(document.is_some()),
@@ -657,7 +516,6 @@ fn found_outcome(method: &str, collection: &str, document: Option<Document>) -> 
     }
 }
 
-/// The counts one bulkWrite operation adds to the result.
 #[derive(Default)]
 struct OpCounts {
     inserted: u64,
@@ -675,7 +533,7 @@ async fn bulk_write(
     collection: &str,
     operations: &[Document],
     ordered: bool,
-    comment: &str,
+    comment: OpComment<'_>,
 ) -> Result<WriteOutcome, AppError> {
     let mut total = OpCounts::default();
     let mut first_error = None;
@@ -709,12 +567,11 @@ async fn bulk_write(
     })
 }
 
-/// Runs one mongosh model of a `bulkWrite`, e.g. `{insertOne: {document: {...}}}`.
 async fn run_operation(
     coll: &Collection<Document>,
     operation: &Document,
     ordered: bool,
-    comment: &str,
+    comment: OpComment<'_>,
 ) -> Result<OpCounts, AppError> {
     if operation.len() != 1 {
         return Err(AppError::invalid(
@@ -732,10 +589,10 @@ async fn run_operation(
     };
     match model {
         "insertOne" => {
-            check_keys(model, Some(body), &["document"])?;
+            Options::new(model, Some(body)).check(&["document"])?;
             let document = operation_document(Some(body), "document", model)?;
             let mut options = InsertOneOptions::default();
-            options.comment = Some(comment.into());
+            options.comment = Some(comment.tag());
             coll.insert_one(document).with_options(options).await?;
             Ok(OpCounts {
                 inserted: 1,
@@ -743,11 +600,11 @@ async fn run_operation(
             })
         }
         "insertMany" => {
-            check_keys(model, Some(body), &["documents"])?;
+            Options::new(model, Some(body)).check(&["documents"])?;
             let documents = operation_documents(Some(body), "documents", model)?;
             let mut options = InsertManyOptions::default();
             options.ordered = Some(ordered);
-            options.comment = Some(comment.into());
+            options.comment = Some(comment.tag());
             let result = coll.insert_many(documents).with_options(options).await?;
             Ok(OpCounts {
                 inserted: result.inserted_ids.len() as u64,
@@ -755,30 +612,19 @@ async fn run_operation(
             })
         }
         "updateOne" | "updateMany" => {
-            check_keys(
-                model,
-                Some(body),
-                &[
-                    "filter",
-                    "update",
-                    "upsert",
-                    "arrayFilters",
-                    "collation",
-                    "hint",
-                    "let",
-                ],
-            )?;
+            let o = Options::new(model, Some(body));
+            o.check(&[&["filter", "update"], UPDATE_OPTIONS].concat())?;
             let filter = operation_document(Some(body), "filter", model)?;
             let update = body.get("update").ok_or_else(|| {
                 AppError::invalid(format!("{model} needs an update document or pipeline"))
             })?;
             let result = if model == "updateOne" {
                 coll.update_one(filter.clone(), modification(update)?)
-                    .with_options(update_options(Some(body), comment)?)
+                    .with_options(update_options(&o, comment)?)
                     .await?
             } else {
                 coll.update_many(filter.clone(), modification(update)?)
-                    .with_options(update_options(Some(body), comment)?)
+                    .with_options(update_options(&o, comment)?)
                     .await?
             };
             Ok(OpCounts {
@@ -789,29 +635,13 @@ async fn run_operation(
             })
         }
         "replaceOne" => {
-            check_keys(
-                model,
-                Some(body),
-                &[
-                    "filter",
-                    "replacement",
-                    "upsert",
-                    "collation",
-                    "hint",
-                    "let",
-                ],
-            )?;
+            let o = Options::new(model, Some(body));
+            o.check(&[&["filter", "replacement"], REPLACE_OPTIONS].concat())?;
             let filter = operation_document(Some(body), "filter", model)?;
             let replacement = operation_document(Some(body), "replacement", model)?;
-            let mut options = ReplaceOptions::default();
-            options.upsert = opt_bool(Some(body), "upsert")?;
-            options.collation = opt_collation(Some(body), "collation")?;
-            options.hint = opt_hint(Some(body), "hint")?;
-            options.let_vars = opt_document(Some(body), "let")?.cloned();
-            options.comment = Some(comment.into());
             let result = coll
                 .replace_one(filter.clone(), replacement)
-                .with_options(options)
+                .with_options(replace_options(&o, comment)?)
                 .await?;
             Ok(OpCounts {
                 matched: result.matched_count,
@@ -821,12 +651,13 @@ async fn run_operation(
             })
         }
         "deleteOne" | "deleteMany" => {
-            check_keys(model, Some(body), &["filter", "collation", "hint"])?;
+            let o = Options::new(model, Some(body));
+            o.check(&["filter", "collation", "hint"])?;
             let filter = operation_document(Some(body), "filter", model)?;
             let mut options = DeleteOptions::default();
-            options.collation = opt_collation(Some(body), "collation")?;
-            options.hint = opt_hint(Some(body), "hint")?;
-            options.comment = Some(comment.into());
+            options.collation = o.collation("collation")?;
+            options.hint = o.hint("hint")?;
+            options.comment = Some(comment.tag());
             let result = if model == "deleteOne" {
                 coll.delete_one(filter.clone())
                     .with_options(options)
@@ -847,16 +678,18 @@ async fn run_operation(
     }
 }
 
-/// The one document an operation model needs under `key`.
 fn operation_document<'a>(
     body: Option<&'a Document>,
     key: &str,
     model: &str,
 ) -> Result<&'a Document, AppError> {
-    opt_document(body, key)?.ok_or_else(|| AppError::invalid(format!("{model} needs {key}")))
+    body.and_then(|body| match body.get(key) {
+        None | Some(Bson::Null) => None,
+        Some(value) => value.as_document(),
+    })
+    .ok_or_else(|| AppError::invalid(format!("{model} needs {key}")))
 }
 
-/// The array of documents an operation model needs under `key`.
 fn operation_documents(
     body: Option<&Document>,
     key: &str,
@@ -878,50 +711,47 @@ fn operation_documents(
         .collect()
 }
 
-/// The shared index options of `createIndex`/`createIndexes`.
-fn index_options(options: Option<&Document>) -> Result<Option<IndexOptions>, AppError> {
-    let Some(options) = options else {
-        return Ok(None);
-    };
+fn index_options(o: &Options<'_>) -> Result<Option<IndexOptions>, AppError> {
     let mut index = IndexOptions::default();
-    index.name = opt_str(Some(options), "name")?.map(str::to_string);
-    index.unique = opt_bool(Some(options), "unique")?;
-    index.sparse = opt_bool(Some(options), "sparse")?;
-    index.expire_after = opt_seconds(Some(options), "expireAfterSeconds")?;
-    index.partial_filter_expression =
-        opt_document(Some(options), "partialFilterExpression")?.cloned();
-    index.collation = opt_collation(Some(options), "collation")?;
-    index.hidden = opt_bool(Some(options), "hidden")?;
-    index.weights = opt_document(Some(options), "weights")?.cloned();
-    index.default_language = opt_str(Some(options), "default_language")?.map(str::to_string);
-    index.wildcard_projection = opt_document(Some(options), "wildcardProjection")?.cloned();
-    index.language_override = opt_str(Some(options), "language_override")?.map(str::to_string);
-    index.text_index_version = opt_version(Some(options), "textIndexVersion")?;
-    index.sphere_2d_index_version = opt_version(Some(options), "2dsphereIndexVersion")?;
-    index.bits = opt_u32(Some(options), "bits")?;
-    index.min = opt_f64(Some(options), "min")?;
-    index.max = opt_f64(Some(options), "max")?;
-    index.storage_engine = opt_document(Some(options), "storageEngine")?.cloned();
+    index.name = o.string("name")?.map(str::to_string);
+    index.unique = o.bool("unique")?;
+    index.sparse = o.bool("sparse")?;
+    index.expire_after = o.seconds("expireAfterSeconds")?;
+    index.partial_filter_expression = o.document("partialFilterExpression")?.cloned();
+    index.collation = o.collation("collation")?;
+    index.hidden = o.bool("hidden")?;
+    index.weights = o.document("weights")?.cloned();
+    index.default_language = o.string("default_language")?.map(str::to_string);
+    index.wildcard_projection = o.document("wildcardProjection")?.cloned();
+    index.language_override = o.string("language_override")?.map(str::to_string);
+    index.text_index_version = o.version("textIndexVersion")?;
+    index.sphere_2d_index_version = o.version("2dsphereIndexVersion")?;
+    index.bits = o
+        .whole("bits", i64::from(u32::MAX))?
+        .map(|bits| bits as u32);
+    index.min = o.number("min")?;
+    index.max = o.number("max")?;
+    index.storage_engine = o.document("storageEngine")?.cloned();
     // The server ignores `background`; the driver keeps the field deprecated.
     #[allow(deprecated)]
     {
-        index.background = opt_bool(Some(options), "background")?;
+        index.background = o.bool("background")?;
     }
     Ok(Some(index))
 }
 
-/// The options of an index build: the query id as `comment`, so a cancel finds it in
-/// `$currentOp`. The build itself is not interrupted by a kill; the comment only names it.
-fn create_index_comment(comment: &str) -> CreateIndexOptions {
+/// The options of an index build: the run's comment, so a cancel finds it in `$currentOp`. The
+/// build itself is not interrupted by a kill; the comment only names it.
+fn create_index_comment(comment: OpComment<'_>) -> CreateIndexOptions {
     let mut options = CreateIndexOptions::default();
-    options.comment = Some(Bson::String(comment.to_string()));
+    options.comment = Some(comment.tag());
     options
 }
 
-/// The options of a drop: the query id as `comment`, so a cancel finds it in `$currentOp`.
-fn drop_index_comment(comment: &str) -> DropIndexOptions {
+/// The options of a drop: the run's comment, so a cancel finds it in `$currentOp`.
+fn drop_index_comment(comment: OpComment<'_>) -> DropIndexOptions {
     let mut options = DropIndexOptions::default();
-    options.comment = Some(Bson::String(comment.to_string()));
+    options.comment = Some(comment.tag());
     options
 }
 
@@ -932,7 +762,7 @@ async fn drop_index(
     database: &str,
     collection: &str,
     index: &Bson,
-    comment: &str,
+    comment: OpComment<'_>,
 ) -> Result<WriteOutcome, AppError> {
     match index {
         Bson::String(name) => {
@@ -946,15 +776,12 @@ async fn drop_index(
             })
         }
         Bson::Document(keys) => {
-            let command = doc! {
+            let mut command = doc! {
                 "dropIndexes": collection,
                 "index": keys.clone(),
-                "comment": comment,
             };
-            coll.client()
-                .database(database)
-                .run_command(command)
-                .await?;
+            comment.apply(&mut command);
+            coll.client().database(database).run_command(command).await?;
             Ok(WriteOutcome {
                 affected: 0,
                 notice: format!("dropIndex on {collection}: dropped {}", index_name(keys)),
@@ -975,7 +802,6 @@ fn index_name(keys: &Document) -> String {
         .join("_")
 }
 
-/// The name part of one key value: a sort direction or an index type like `text`.
 fn value_name(value: &Bson) -> String {
     match value {
         Bson::Int32(value) => value.to_string(),

@@ -29,7 +29,6 @@ pub struct Waiting<'a> {
 }
 
 impl Waiting<'_> {
-    /// True for approve. False for deny, and when the decision can never come.
     pub async fn decision(&mut self) -> bool {
         (&mut self.rx).await.unwrap_or(false)
     }
@@ -59,14 +58,13 @@ impl Approvals {
     }
 
     /// Sends the user's decision. `not_found` when no write waits under these ids: it timed
-    /// out, or its chat stopped.
+    /// out, its chat stopped, or its waiting side is already gone.
     pub fn decide(&self, chat_id: &str, call_id: &str, approve: bool) -> Result<(), AppError> {
         let key = (chat_id.to_string(), call_id.to_string());
         match self.lock().remove(&key) {
-            Some(tx) => {
-                let _ = tx.send(approve);
-                Ok(())
-            }
+            Some(tx) => tx
+                .send(approve)
+                .map_err(|_| AppError::not_found("This write no longer waits for a decision")),
             None => Err(AppError::not_found(
                 "This write no longer waits for a decision",
             )),

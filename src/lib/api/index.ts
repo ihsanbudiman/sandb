@@ -1,65 +1,67 @@
-import type { Backend } from './types';
-import { tauriBackend } from './tauri';
-import { mockBackend } from './mock';
+import { makeBackend, type Transport } from './backend';
+import type { Backend, Capabilities } from './types';
+import type { CommandName } from './generated/wire';
+import { tauriTransport } from './tauri';
+import { mockTransport } from './mock';
 
 // The bridge client is imported only behind the `import.meta.env.DEV` check, so a production build
 // drops it (and any bridge token) entirely.
-function bridgeBackend(): Backend {
-  const load = import('./http').then((m) => m.httpBackend);
+function bridgeTransport(): Transport {
+  let loaded: Promise<Transport> | undefined;
+  const transport = () => (loaded ??= import('./http').then((m) => m.httpTransport));
   return {
-    kind: 'bridge',
-    listConnections: () => load.then((b) => b.listConnections()),
-    createConnection: (input, password) => load.then((b) => b.createConnection(input, password)),
-    updateConnection: (id, input, password) => load.then((b) => b.updateConnection(id, input, password)),
-    duplicateConnection: (id, input, password) => load.then((b) => b.duplicateConnection(id, input, password)),
-    deleteConnection: (id) => load.then((b) => b.deleteConnection(id)),
-    reorderConnections: (ids) => load.then((b) => b.reorderConnections(ids)),
-    testConnection: (input, password, id) => load.then((b) => b.testConnection(input, password, id)),
-    listDatabases: (connId) => load.then((b) => b.listDatabases(connId)),
-    listSchemas: (connId, database) => load.then((b) => b.listSchemas(connId, database)),
-    listTables: (connId, database, schema) => load.then((b) => b.listTables(connId, database, schema)),
-    listColumns: (connId, database, schema, table) => load.then((b) => b.listColumns(connId, database, schema, table)),
-    tableProperties: (connId, database, schema, table) => load.then((b) => b.tableProperties(connId, database, schema, table)),
-    schemaSnapshot: (connId, database) => load.then((b) => b.schemaSnapshot(connId, database)),
-    runQuery: (request) => load.then((b) => b.runQuery(request)),
-    editableResult: (request) => load.then((b) => b.editableResult(request)),
-    applyEdits: (request) => load.then((b) => b.applyEdits(request)),
-    cellValue: (request) => load.then((b) => b.cellValue(request)),
-    cancelQuery: (queryId) => load.then((b) => b.cancelQuery(queryId)),
-    queryProgress: (queryId) => load.then((b) => b.queryProgress(queryId)),
-    commitTransaction: (tabId) => load.then((b) => b.commitTransaction(tabId)),
-    rollbackTransaction: (tabId) => load.then((b) => b.rollbackTransaction(tabId)),
-    tabStatus: (tabId) => load.then((b) => b.tabStatus(tabId)),
-    closeTabSession: (tabId) => load.then((b) => b.closeTabSession(tabId)),
-    quitApp: () => load.then((b) => b.quitApp()),
-    exportCsv: (connId, database, sql, tabId) => load.then((b) => b.exportCsv(connId, database, sql, tabId)),
-    exportResultSql: (connId, database, sql, schema, table, options, tabId) => load.then((b) => b.exportResultSql(connId, database, sql, schema, table, options, tabId)),
-    exportDocuments: (connId, database, sql, format, ejson) => load.then((b) => b.exportDocuments(connId, database, sql, format, ejson)),
-    tableDdl: (connId, database, schema, table) => load.then((b) => b.tableDdl(connId, database, schema, table)),
-    exportTableSql: (connId, database, schema, table, data) => load.then((b) => b.exportTableSql(connId, database, schema, table, data)),
-    savePdf: (name, pdf) => load.then((b) => b.savePdf(name, pdf)),
-    guardCheck: (engine, sql) => load.then((b) => b.guardCheck(engine, sql)),
-    classifyWrite: (engine, sql, database) => load.then((b) => b.classifyWrite(engine, sql, database)),
-    runAiRead: (connId, database, sql) => load.then((b) => b.runAiRead(connId, database, sql)),
-    getAiSettings: () => load.then((b) => b.getAiSettings()),
-    saveAiSettings: (settings) => load.then((b) => b.saveAiSettings(settings)),
-    setAiKey: (key) => load.then((b) => b.setAiKey(key)),
-    testAi: (settings, key) => load.then((b) => b.testAi(settings, key)),
-    listAiModels: (settings, key) => load.then((b) => b.listAiModels(settings, key)),
-    chatSend: (request, onEvent) => load.then((b) => b.chatSend(request, onEvent)),
-    chatCancel: (chatId) => load.then((b) => b.chatCancel(chatId)),
-    approveWrite: (chatId, id) => load.then((b) => b.approveWrite(chatId, id)),
-    denyWrite: (chatId, id) => load.then((b) => b.denyWrite(chatId, id)),
+    async call<T>(name: CommandName, args?: Record<string, unknown> | Uint8Array, headers?: Record<string, string>): Promise<T> {
+      return (await transport()).call<T>(name, args, headers);
+    },
+    async stream(name, args, onEvent) {
+      return (await transport()).stream(name, args, onEvent);
+    },
   };
 }
 
-// Tauri app → IPC; dev server with `VITE_BACKEND=bridge` → dev HTTP bridge; otherwise the in-memory mock.
+const desktop: Capabilities = {
+  fileExport: true,
+  quitPrompt: true,
+  unsavedFlag: true,
+  nativeMenu: true,
+  windowEffects: true,
+  pageUnload: false,
+  updates: true,
+  secretStorage: 'encrypted',
+  ai: true,
+};
+
+const bridge: Capabilities = {
+  fileExport: false,
+  quitPrompt: false,
+  unsavedFlag: false,
+  nativeMenu: false,
+  windowEffects: false,
+  pageUnload: true,
+  updates: false,
+  secretStorage: 'memory',
+  ai: true,
+};
+
+const demo: Capabilities = {
+  fileExport: false,
+  quitPrompt: false,
+  unsavedFlag: false,
+  nativeMenu: false,
+  windowEffects: false,
+  pageUnload: true,
+  updates: false,
+  secretStorage: 'none',
+  ai: false,
+};
+
 function pick(): Backend {
-  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) return tauriBackend;
-  if (import.meta.env.DEV && import.meta.env.VITE_BACKEND === 'bridge') return bridgeBackend();
-  return mockBackend;
+  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) return makeBackend(tauriTransport, desktop);
+  if (import.meta.env.DEV && import.meta.env.VITE_BACKEND === 'bridge') return makeBackend(bridgeTransport(), bridge);
+  return makeBackend(mockTransport, demo);
 }
 
 export const api: Backend = pick();
 
+export * from './generated/wire';
 export * from './types';

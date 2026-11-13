@@ -2,6 +2,7 @@
   import DOMPurify from 'dompurify';
   import { Marked, type Tokens } from 'marked';
   import { fenceDialect, sqlHtml } from '../highlight';
+  import { flashOnce } from '../flash.svelte';
 
   let { text, onrunsql, mongo = false }: { text: string; onrunsql?: (code: string, anchor: HTMLElement, mongo: boolean) => void; mongo?: boolean } = $props();
 
@@ -68,7 +69,7 @@
       try {
         await navigator.clipboard.writeText(code);
         btn.innerHTML = checkIcon;
-        setTimeout(() => (btn.innerHTML = copyIcon), 1200);
+        flashOnce(() => (btn.innerHTML = copyIcon));
       } catch (e) {
         console.warn('Copy failed.', e);
       }

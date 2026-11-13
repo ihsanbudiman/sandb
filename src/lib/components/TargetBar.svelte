@@ -1,36 +1,27 @@
 <script lang="ts">
   import { ChevronDown, Check, LoaderCircle } from '@lucide/svelte';
-  import { db, engines, envDot, envTag, canWrite, type Conn } from '../state.svelte';
-  import { api, ApiError } from '../api';
+  import { catalog, loadDatabases } from '../catalog.svelte';
+  import { db, engines, envDot, envTag, canWrite, type Conn } from '../connections.svelte';
   import ReadOnlyBadge from './ReadOnlyBadge.svelte';
 
   // The parent owns the switch: it asks about unsaved edits and pending transactions first.
   let { conn, database, onconn, ondb }: { conn: Conn; database: string; onconn: (c: Conn) => void; ondb: (name: string) => void } = $props();
 
   let menu = $state<'conn' | 'db' | null>(null);
-  // Per connection; refetched on every open so new databases show up, the cached list shows meanwhile.
-  const dbs = $state<Record<string, string[]>>({});
-  let loading = $state(false);
-  let loadError = $state<string | null>(null);
+  // The catalog keeps the list per connection; every open refetches it so new databases show up.
+  const list = $derived(catalog.databases[conn.id]);
+  const loading = $derived(list?.status === 'loading');
+  const loadError = $derived(list?.status === 'error' ? list.error : null);
 
   async function openDbs() {
     if (menu === 'db') return (menu = null);
     menu = 'db';
-    const id = conn.id;
-    loading = true;
-    loadError = null;
-    try {
-      dbs[id] = await api.listDatabases(id);
-    } catch (e) {
-      if (conn.id === id) loadError = ApiError.from(e).message;
-    } finally {
-      if (conn.id === id) loading = false;
-    }
+    await loadDatabases(conn.id, true);
   }
 
   // The tab's database stays pickable even when the list leaves it out (no access to list, or not loaded yet).
   const dbList = $derived.by(() => {
-    const l = dbs[conn.id] ?? [];
+    const l = list?.items ?? [];
     return l.includes(database) ? l : [database, ...l];
   });
 

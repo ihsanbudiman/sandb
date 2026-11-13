@@ -1,7 +1,7 @@
 /** SQL beautifier for the editor. */
 
 import { formatDialect, postgresql, mysql, sqlite } from 'sql-formatter';
-import { statementRanges, type Dialect } from './text';
+import { statementRanges, type SqlEngine } from './text';
 
 const dialects = { pg: postgresql, mysql, sqlite } as const;
 
@@ -10,7 +10,7 @@ const dialects = { pg: postgresql, mysql, sqlite } as const;
  * cuts the text first, so statements that run apart stay apart; a blank line separates them in the
  * result. Keyword case stays as written. Throws when the formatter cannot read a statement.
  */
-export function formatSql(text: string, dialect: Exclude<Dialect, 'mongo'>): string {
+export function formatSql(text: string, dialect: SqlEngine): string {
   try {
     return statementRanges(text, dialect, true)
       .map(([from, to]) => text.slice(from, to).trim())

@@ -1,189 +1,74 @@
 //! Result export: re-runs one plain-read statement without a row cap and streams it to a file,
 //! as CSV or as INSERT statements.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use futures_util::TryStreamExt;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::{Column, Database, Executor, Row};
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::core::connections::{self, Engine, Env};
+use crate::core::cell::{field, line};
+use crate::core::connections::{Connection, Env, target_database};
+use crate::core::db::conn::{describe_columns, Conn};
+use crate::core::db::ctx::Ctx;
 use crate::core::db::dump::{self, Inserts};
-use crate::core::db::pool::DbPool;
-use crate::core::db::query::{mysql_cell, pg_cell, sqlite_cell};
-use crate::core::db::session::{self, Conn};
+use crate::core::db::reader::{self, CellFn};
+use crate::core::db::session::{self, Settle};
+use crate::core::db::value::Full;
+use crate::core::engine::SqlEngine;
 use crate::core::error::AppError;
-use crate::core::mongo;
+use crate::core::export_file::ExportFile;
+use crate::core::result::{
+    ExportRequest, ExportResult, InsertMode, MAX_ROWS_PER_STATEMENT, SqlExportRequest, SqlOptions,
+};
 use crate::core::sql::{facts, split};
-use crate::core::state::AppState;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportRequest {
-    pub conn_id: String,
-    #[serde(default)]
-    pub database: Option<String>,
-    pub sql: String,
-    /// Production editor tab: the export reads inside the tab's open transaction.
-    #[serde(default)]
-    pub tab_id: Option<String>,
-}
-
-/// A result as INSERT statements into `table` (in `schema`, the PG schema or MySQL database,
-/// when set), for loading the rows into the same table in another database.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SqlExportRequest {
-    #[serde(flatten)]
-    pub query: ExportRequest,
-    #[serde(default)]
-    pub schema: Option<String>,
-    pub table: String,
-    #[serde(default)]
-    pub options: SqlOptions,
-}
-
-/// A MongoDB read as Extended JSON, one document after the other.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DocumentExportRequest {
-    #[serde(flatten)]
-    pub query: ExportRequest,
-    pub format: DocumentFormat,
-    pub ejson: EjsonFlavor,
-}
-
-/// How the documents are separated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DocumentFormat {
-    /// One JSON array of documents.
-    Json,
-    /// One document per line (newline-delimited JSON).
-    Ndjson,
-}
-
-/// How BSON values appear in JSON.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum EjsonFlavor {
-    /// Numbers as JSON numbers where the type survives, everything else as `{"$type": ...}`.
-    Relaxed,
-    /// Every value keeps its type.
-    Canonical,
-}
-
-/// What a row already in the target does to its INSERT.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum InsertMode {
-    /// Plain INSERT: the statement fails.
-    #[default]
-    Insert,
-    /// The row is skipped: PG `ON CONFLICT DO NOTHING`, MySQL `INSERT IGNORE`, SQLite
-    /// `INSERT OR IGNORE`.
-    Skip,
-    /// The row is updated: `ON CONFLICT (key) DO UPDATE`, MySQL `ON DUPLICATE KEY UPDATE`.
-    Upsert,
-}
-
-/// Column indexes are positions in the result, so repeated names stay apart.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct SqlOptions {
-    /// Result columns to write, in this order; `None` writes every column.
-    pub columns: Option<Vec<usize>>,
-    pub mode: InsertMode,
-    /// Conflict key of an upsert (result columns). MySQL finds the key itself and only
-    /// leaves these columns out of the update.
-    pub key: Vec<usize>,
-    pub rows_per_statement: usize,
-    /// `BEGIN;` … `COMMIT;` around the statements, so a failed row loads nothing.
-    pub transaction: bool,
-    /// The `-- sandb SQL export` comment block at the top.
-    pub header: bool,
-}
-
-impl Default for SqlOptions {
-    fn default() -> Self {
-        Self {
-            columns: None,
-            mode: InsertMode::Insert,
-            key: Vec::new(),
-            rows_per_statement: 100,
-            transaction: false,
-            header: true,
-        }
-    }
-}
-
-const MAX_ROWS_PER_STATEMENT: usize = 10_000;
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExportResult {
-    /// The user closed the save dialog; nothing was written.
-    pub cancelled: bool,
-    pub rows: u64,
-    pub path: String,
-}
-/// RFC 4180: quote when the field has a comma, quote, CR or LF; double inner quotes.
-pub fn escape(field: &str) -> std::borrow::Cow<'_, str> {
-    if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\"")).into()
-    } else {
-        field.into()
-    }
-}
-
-/// NULL → empty, bytes → base64, JSON values → compact JSON, the rest → their text.
-pub fn field(v: &Value) -> String {
-    match v {
-        Value::Null => String::new(),
-        Value::String(s) => s.clone(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::Object(o) => match o.get("$bytes") {
-            Some(Value::String(b64)) if o.contains_key("len") => b64.clone(),
-            _ => v.to_string(),
-        },
-        Value::Array(_) => v.to_string(),
-    }
-}
-
-pub fn line<'a>(fields: impl IntoIterator<Item = &'a str>) -> String {
-    let mut s = fields.into_iter().map(escape).collect::<Vec<_>>().join(",");
-    s.push_str("\r\n");
-    s
-}
-
-type CellFn<DB> = fn(&<DB as Database>::Row, usize, Option<usize>) -> Value;
 type SqlCellFn<DB> = fn(&mut String, &<DB as Database>::Row, usize) -> Result<(), AppError>;
 
-/// What the export writes for each row.
 enum Format {
     Csv,
     Sql(SqlPlan),
 }
 
 struct SqlPlan {
-    engine: Engine,
+    engine: SqlEngine,
     /// Quoted, maybe qualified, name.
     table: String,
     options: SqlOptions,
 }
 
+/// The conflict handling the SQL export writes, as the export dialog names it. The writer
+/// below builds the same text around its own column lists.
+pub struct ConflictText {
+    /// A row that is already in the target is skipped with this form.
+    pub skip: &'static str,
+    /// A row that is already in the target is updated with this clause.
+    pub upsert: &'static str,
+}
+
+pub fn conflict_text(engine: SqlEngine) -> ConflictText {
+    match engine {
+        SqlEngine::Mysql => ConflictText {
+            skip: "INSERT IGNORE",
+            upsert: "ON DUPLICATE KEY UPDATE",
+        },
+        SqlEngine::Pg => ConflictText {
+            skip: "ON CONFLICT DO NOTHING",
+            upsert: "ON CONFLICT (key) DO UPDATE",
+        },
+        SqlEngine::Sqlite => ConflictText {
+            skip: "INSERT OR IGNORE",
+            upsert: "ON CONFLICT (key) DO UPDATE",
+        },
+    }
+}
+
 impl SqlPlan {
     /// The written result columns, and the text before and after the rows of each statement,
     /// for a result with these column names.
-    fn parts(
-        &self,
-        names: &[&str],
-        ident: fn(&str) -> String,
-    ) -> Result<(Vec<usize>, String, String), AppError> {
+    fn parts(&self, names: &[&str]) -> Result<(Vec<usize>, String, String), AppError> {
         let o = &self.options;
+        let engine = self.engine;
         let cols: Vec<usize> = o
             .columns
             .clone()
@@ -194,36 +79,26 @@ impl SqlPlan {
                 i + 1
             )));
         }
-        let q = |i: &usize| ident(names[*i]);
+        let q = |i: &usize| engine.quote(names[*i]);
         let list = cols.iter().map(q).collect::<Vec<_>>().join(", ");
-        let verb = match (o.mode, self.engine) {
-            (InsertMode::Skip, Engine::Mysql) => "INSERT IGNORE INTO",
-            (InsertMode::Skip, Engine::Sqlite) => "INSERT OR IGNORE INTO",
-            _ => "INSERT INTO",
-        };
-        let head = format!("{verb} {} ({list}) VALUES", self.table);
+        let head = format!("{} {} ({list}) VALUES", engine.insert_verb(o.mode == InsertMode::Skip), self.table);
         let set: Vec<String> = cols
             .iter()
             .filter(|i| !o.key.contains(i))
-            .map(|i| {
-                let c = q(i);
-                match self.engine {
-                    Engine::Mysql => format!("{c} = VALUES({c})"),
-                    Engine::Pg | Engine::Sqlite | Engine::Mongo => format!("{c} = EXCLUDED.{c}"),
-                }
-            })
+            .map(|i| engine.upsert_assignment(&q(i)))
             .collect();
         let key = o.key.iter().map(q).collect::<Vec<_>>().join(", ");
-        let tail = match (o.mode, self.engine) {
-            (InsertMode::Insert, _)
-            | (InsertMode::Skip, Engine::Mysql | Engine::Sqlite | Engine::Mongo) => String::new(),
-            (InsertMode::Skip, Engine::Pg) => "\nON CONFLICT DO NOTHING".into(),
+        let tail = match (o.mode, engine) {
+            (InsertMode::Insert, _) | (InsertMode::Skip, SqlEngine::Mysql | SqlEngine::Sqlite) => {
+                String::new()
+            }
+            (InsertMode::Skip, SqlEngine::Pg) => "\nON CONFLICT DO NOTHING".into(),
             // Every column is in the key: nothing to update.
-            (InsertMode::Upsert, Engine::Mysql) if set.is_empty() => {
+            (InsertMode::Upsert, SqlEngine::Mysql) if set.is_empty() => {
                 let c = q(&cols[0]);
                 format!("\nON DUPLICATE KEY UPDATE {c} = {c}")
             }
-            (InsertMode::Upsert, Engine::Mysql) => {
+            (InsertMode::Upsert, SqlEngine::Mysql) => {
                 format!("\nON DUPLICATE KEY UPDATE {}", set.join(", "))
             }
             (InsertMode::Upsert, _) if set.is_empty() => {
@@ -236,19 +111,14 @@ impl SqlPlan {
         Ok((cols, head, tail))
     }
 
-    fn begin(&self) -> &'static str {
-        match self.engine {
-            Engine::Mysql => "START TRANSACTION;\n\n",
-            Engine::Pg | Engine::Sqlite | Engine::Mongo => "BEGIN;\n\n",
-        }
+    fn begin(&self) -> String {
+        format!("{};\n\n", self.engine.begin_transaction())
     }
 }
 
-/// How one engine's rows turn into CSV fields or SQL literals.
 struct Codec<DB: Database> {
     csv: CellFn<DB>,
     sql: SqlCellFn<DB>,
-    ident: fn(&str) -> String,
 }
 
 async fn stream<DB>(
@@ -288,7 +158,7 @@ where
         return Ok(0);
     };
     let names: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
-    let (cols, head, tail) = match plan.parts(&names, codec.ident) {
+    let (cols, head, tail) = match plan.parts(&names) {
         Ok(p) => p,
         Err(e) => {
             *left = true;
@@ -351,9 +221,7 @@ where
                     return Err(e.into());
                 }
             }
-            let fields: Vec<String> = (0..row.len())
-                .map(|i| field(&cell(&row, i, None)))
-                .collect();
+            let fields: Vec<String> = (0..row.len()).map(|i| field(&cell(&row, i))).collect();
             let bytes = line(fields.iter().map(String::as_str));
             if let Err(e) = out.write_all(bytes.as_bytes()).await {
                 *left = true;
@@ -365,49 +233,45 @@ where
     if n == 0 {
         // No row carried the column names, so ask the server. Some reads (e.g. SHOW) cannot be
         // described; the file is then empty.
-        if let Ok(d) = (&mut *conn).describe(sql).await {
-            let names: Vec<&str> = d.columns().iter().map(|c| c.name()).collect();
-            if !names.is_empty() {
-                out.write_all(line(names).as_bytes()).await?;
-            }
+        if let Some(columns) = describe_columns(&mut *conn, sql).await
+            && !columns.is_empty()
+        {
+            let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+            out.write_all(line(names).as_bytes()).await?;
         }
     }
     Ok(n)
 }
+
+/// Streams rows through whichever connection owns them: the tab session when it is on this
+/// target, else the pool.
+async fn stream_conn<W: AsyncWrite + Unpin>(
+    c: &mut Conn,
+    sql: &str,
+    out: &mut W,
+    format: &Format,
+    left: &mut bool,
+) -> Result<u64, AppError> {
+    match c {
+        Conn::Pg(o) => stream(o.connection(), sql, out, format, PG, left).await,
+        Conn::MySql(o) => stream(o.connection(), sql, out, format, MYSQL, left).await,
+        Conn::Sqlite(o) => stream(o.connection(), sql, out, format, SQLITE, left).await,
+    }
+}
+
 /// Rejects anything but one plain read, so the export never repeats a write. Call it before
 /// asking the user for a file.
-pub fn check(state: &AppState, req: &ExportRequest) -> Result<(), AppError> {
-    let conn = connections::get(state, &req.conn_id)?;
-    if conn.engine == Engine::Mongo {
-        return mongo::export::check(&mongo::parse::parse(&req.sql)?);
-    }
-    match split::split(conn.engine, &req.sql).as_slice() {
-        [sql] if facts::is_plain_read_sql(conn.engine, sql) => Ok(()),
+pub fn check(engine: SqlEngine, sql: &str) -> Result<(), AppError> {
+    match split::split(engine, sql).as_slice() {
+        [one] if facts::is_plain_read_sql(engine, one) => Ok(()),
         _ => Err(AppError::invalid(
             "Export needs exactly one read-only statement (a SELECT)",
         )),
     }
 }
 
-/// `check`, plus a MongoDB connection: Extended JSON is a MongoDB feature. Call it before asking
-/// the user for a file.
-pub fn check_documents(state: &AppState, req: &DocumentExportRequest) -> Result<(), AppError> {
-    let conn = connections::get(state, &req.query.conn_id)?;
-    if conn.engine != Engine::Mongo {
-        return Err(AppError::invalid(
-            "Extended JSON export needs a MongoDB connection",
-        ));
-    }
-    mongo::export::check(&mongo::parse::parse(&req.query.sql)?)
-}
-
-/// `check`, plus a table name and options that make sense for the connection's engine.
-pub fn check_sql(state: &AppState, req: &SqlExportRequest) -> Result<(), AppError> {
-    check(state, &req.query)?;
-    let engine = connections::get(state, &req.query.conn_id)?.engine;
-    if engine == Engine::Mongo {
-        return Err(AppError::unsupported_mongo());
-    }
+pub fn check_sql(engine: SqlEngine, req: &SqlExportRequest) -> Result<(), AppError> {
+    check(engine, &req.query.sql)?;
     if req.table.trim().is_empty() {
         return Err(AppError::invalid(
             "Name the table for the INSERT statements",
@@ -437,7 +301,7 @@ pub fn check_sql(state: &AppState, req: &SqlExportRequest) -> Result<(), AppErro
         if !unique(&o.key) {
             return Err(AppError::invalid("A key column is chosen twice"));
         }
-        if engine != Engine::Mysql && o.key.is_empty() {
+        if engine != SqlEngine::Mysql && o.key.is_empty() {
             return Err(AppError::invalid(
                 "Choose the key columns that find an existing row for the upsert",
             ));
@@ -451,54 +315,30 @@ pub fn check_sql(state: &AppState, req: &SqlExportRequest) -> Result<(), AppErro
     Ok(())
 }
 
-/// Hidden sibling of `path`, so the final rename stays on one file system.
-pub(crate) fn temp_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    path.with_file_name(format!(".{name}.{}.part", uuid::Uuid::new_v4()))
-}
-
 /// Streams the result as CSV to a temp file next to `path`, then renames it over `path`. On
 /// failure only the temp file is removed; an existing file at `path` is never touched.
 pub async fn export_csv(
-    state: &AppState,
+    ctx: &Ctx<'_>,
+    conn: &Connection,
+    engine: SqlEngine,
     req: ExportRequest,
     path: &Path,
 ) -> Result<ExportResult, AppError> {
-    let conn = connections::get(state, &req.conn_id)?;
-    if conn.engine == Engine::Mongo {
-        return mongo::export::export_csv(state, &conn, req, path).await;
-    }
-    export(state, req, Format::Csv, path).await
+    check(engine, &req.sql)?;
+    export(ctx, conn, engine, req, Format::Csv, path).await
 }
 
-/// As `export_csv`, as Extended JSON documents of the read.
-pub async fn export_documents(
-    state: &AppState,
-    req: DocumentExportRequest,
-    path: &Path,
-) -> Result<ExportResult, AppError> {
-    let conn = connections::get(state, &req.query.conn_id)?;
-    mongo::export::export_documents(state, &conn, req, path).await
-}
-
-/// As `export_csv`, as INSERT statements shaped by `req.options`.
 pub async fn export_sql(
-    state: &AppState,
+    ctx: &Ctx<'_>,
+    conn: &Connection,
+    engine: SqlEngine,
     req: SqlExportRequest,
     path: &Path,
 ) -> Result<ExportResult, AppError> {
-    check_sql(state, &req)?;
-    let engine = connections::get(state, &req.query.conn_id)?.engine;
-    let quote = match engine {
-        Engine::Mysql => dump::quote_bt,
-        Engine::Pg | Engine::Sqlite | Engine::Mongo => dump::quote_dq,
-    };
+    check_sql(engine, &req)?;
     let table = match req.schema.as_deref().filter(|s| !s.is_empty()) {
-        Some(s) => format!("{}.{}", quote(s), quote(&req.table)),
-        None => quote(&req.table),
+        Some(s) => format!("{}.{}", engine.quote(s), engine.quote(&req.table)),
+        None => engine.quote(&req.table),
     };
     let mut options = req.options;
     // The key only matters to an upsert.
@@ -510,151 +350,123 @@ pub async fn export_sql(
         table,
         options,
     };
-    export(state, req.query, Format::Sql(plan), path).await
+    export(ctx, conn, engine, req.query, Format::Sql(plan), path).await
 }
 
 async fn export(
-    state: &AppState,
+    ctx: &Ctx<'_>,
+    conn: &Connection,
+    engine: SqlEngine,
     req: ExportRequest,
     format: Format,
     path: &Path,
 ) -> Result<ExportResult, AppError> {
-    check(state, &req)?;
-    if !path.is_absolute() {
-        return Err(AppError::invalid("Choose a file to export to"));
-    }
-    let conn = connections::get(state, &req.conn_id)?;
-    let sql = split::split(conn.engine, &req.sql).remove(0);
-    let tmp = temp_path(path);
-    let file = tokio::fs::File::create(&tmp).await?;
-    let mut out = BufWriter::new(file);
+    let sql = split::split(engine, &req.sql).remove(0);
     // A production tab exports what its open transaction sees: the same session the run used.
     // Without one (no open transaction, or a session on another target) the pool's view is
     // the same committed data. Read-only connections never hold a session.
-    let database = connections::target_database(&conn, req.database.as_deref());
-    let mut session = None;
-    if conn.env == Env::Production
-        && !conn.read_only
-        && let Some(tab_id) = req.tab_id.as_deref()
-        && let Some(s) = state.sessions.take(tab_id)?
-    {
-        if s.conn_id == conn.id && s.database == database {
-            session = Some((tab_id.to_string(), s));
-        } else {
-            state.sessions.put(tab_id, s).await;
+    let database = target_database(conn, req.database.as_deref());
+    let mut file =
+        ExportFile::for_query(path, ctx.queries, &conn.id, &database, conn.engine).await?;
+    if let Format::Sql(plan) = &format {
+        if plan.options.header {
+            file.out()
+                .write_all(dump::header(conn, engine, &plan.table).as_bytes())
+                .await?;
+        }
+        if plan.options.transaction {
+            file.out().write_all(plan.begin().as_bytes()).await?;
         }
     }
     // Set when the export dropped its row stream mid-result (write to the file failed): the
     // server is still sending rows, so a session connection cannot be probed or kept.
     let mut left = false;
-    let res = async {
-        if let Format::Sql(plan) = &format {
-            if plan.options.header {
-                out.write_all(dump::header(&conn, &plan.table).as_bytes())
-                    .await?;
-            }
-            if plan.options.transaction {
-                out.write_all(plan.begin().as_bytes()).await?;
-            }
-        }
-        let n = match &mut session {
-            Some((_, s)) => match &mut s.conn {
-                Conn::Pg(c) => stream(&mut *c, &sql, &mut out, &format, PG, &mut left).await?,
-                Conn::MySql(c) => {
-                    stream(&mut *c, &sql, &mut out, &format, MYSQL, &mut left).await?
-                }
-                Conn::Sqlite(c) => {
-                    stream(&mut *c, &sql, &mut out, &format, SQLITE, &mut left).await?
-                }
-            },
-            None => {
-                let pool = connections::pool_for(state, &conn.id, req.database.as_deref())?;
-                match pool {
-                    DbPool::Pg(p) => {
-                        let mut c = p.acquire().await?;
-                        stream(&mut *c, &sql, &mut out, &format, PG, &mut left).await?
-                    }
-                    DbPool::MySql(p) => {
-                        let mut c = p.acquire().await?;
-                        stream(&mut *c, &sql, &mut out, &format, MYSQL, &mut left).await?
-                    }
-                    DbPool::Sqlite(p) => {
-                        let mut c = p.acquire().await?;
-                        stream(&mut *c, &sql, &mut out, &format, SQLITE, &mut left).await?
-                    }
-                }
-            }
-        };
-        if let Format::Sql(plan) = &format
-            && plan.options.transaction
-        {
-            out.write_all(b"\nCOMMIT;\n").await?;
-        }
-        out.flush().await?;
-        out.get_ref().sync_all().await?;
-        Ok::<_, AppError>(n)
-    }
-    .await;
-    let mut res = res;
-    if let Some((tab_id, mut s)) = session {
-        if left {
-            // As in `run_in_session`: probing first would drain the unfinished result behind
-            // the probe's timeout. Close the session (rolling its transaction back) and say so.
-            if s.tx_open
-                && let Err(e) = &mut res
+    let session_read = if conn.env == Env::Production && conn.may_write() {
+        Some(
+            session::with_tab(
+                ctx,
+                conn,
+                &database,
+                req.tab_id.as_deref(),
+                async |s| {
+                    let tx_open = s.tx_open;
+                    let r = stream_conn(&mut s.conn, &sql, file.out(), &format, &mut left).await;
+                    let settle = if left {
+                        Settle::Discard
+                    } else {
+                        Settle::Refresh
+                    };
+                    ((r, tx_open), settle)
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let res = match session_read {
+        Some(Some((r, tx_open))) => {
+            let mut r = r;
+            if left
+                && tx_open
+                && let Err(e) = &mut r
             {
                 e.message = format!(
                     "{} The open transaction was rolled back; its uncommitted changes are lost.",
                     e.message
                 );
             }
-            state.sessions.discard(&tab_id, Some(s)).await;
-        } else {
-            session::refresh(&mut s).await;
-            session::settle(state, &tab_id, s).await;
+            r
         }
-    }
-    drop(out);
-    let res = match res {
-        Ok(rows) => tokio::fs::rename(&tmp, path)
-            .await
-            .map(|()| rows)
-            .map_err(AppError::from),
-        Err(e) => Err(e),
+        _ => {
+            let pool = ctx.pool_for(conn, req.database.as_deref())?;
+            let mut c = Conn::acquire(&pool).await?;
+            let r = stream_conn(&mut c, &sql, file.out(), &format, &mut left).await;
+            c.settle(true).await;
+            r
+        }
     };
+    if let Format::Sql(plan) = &format
+        && plan.options.transaction
+    {
+        file.out().write_all(b"\nCOMMIT;\n").await?;
+    }
     match res {
-        Ok(rows) => Ok(ExportResult {
-            cancelled: false,
-            rows,
-            path: path.display().to_string(),
-        }),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            Err(e)
-        }
+        Ok(rows) => file.finish(rows).await,
+        Err(e) => Err(e),
     }
 }
 
 const PG: Codec<sqlx::Postgres> = Codec {
-    csv: pg_cell,
+    csv: reader::pg_cell::<Full>,
     sql: dump::push_pg_cell,
-    ident: dump::quote_dq,
 };
 const MYSQL: Codec<sqlx::MySql> = Codec {
-    csv: mysql_cell,
+    csv: reader::mysql_cell::<Full>,
     sql: dump::push_mysql_cell,
-    ident: dump::quote_bt,
 };
 const SQLITE: Codec<sqlx::Sqlite> = Codec {
-    csv: sqlite_cell,
+    csv: reader::sqlite_cell::<Full>,
     sql: dump::push_sqlite_cell,
-    ident: dump::quote_dq,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::core::cell::{escape, field};
+    use crate::core::db::pool::DbPool;
+    use crate::core::state::AppState;
+    use serde_json::{Value, json};
+
+    /// The tests run on one SQLite connection, so this wrapper routes for them.
+    async fn export_sql(
+        state: &AppState,
+        req: SqlExportRequest,
+        path: &Path,
+    ) -> Result<ExportResult, AppError> {
+        let conn = state.connection(&req.query.conn_id).unwrap();
+        super::export_sql(&state.db(), &conn, SqlEngine::Sqlite, req, path).await
+    }
 
     #[test]
     fn rfc4180_quoting() {
@@ -683,6 +495,7 @@ mod tests {
     #[tokio::test]
     async fn sql_export_copies_the_read_rows_to_another_database() {
         use crate::core::connections::{ConnectionInput, SslMode};
+        use crate::core::engine::Engine;
         use crate::core::error::ErrorCode;
         use crate::core::secrets::MemoryStore;
         use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
@@ -708,8 +521,8 @@ mod tests {
         );
         (&mut c).execute(sqlx::raw_sql(&setup)).await.unwrap();
         c.close().await.unwrap();
-        let conn = connections::create(
-            &st,
+        let conn = st
+            .create_connection(
             ConnectionInput {
                 name: "dev".into(),
                 engine: Engine::Sqlite,
@@ -759,7 +572,7 @@ mod tests {
         let q = "SELECT id, name, score, hex(data) FROM \"it's\" ORDER BY id";
         type R = (i64, Option<String>, Option<f64>, Option<String>);
         let got: Vec<R> = sqlx::query_as(q).fetch_all(&mut other).await.unwrap();
-        let DbPool::Sqlite(p) = connections::pool_for(&st, &conn.id, None).unwrap() else {
+        let DbPool::Sqlite(p) = st.pool_for(&conn, None).unwrap() else {
             unreachable!()
         };
         let want: Vec<R> = sqlx::query_as(
@@ -893,38 +706,33 @@ mod tests {
             },
         };
         let names = ["id", "name"];
-        let parts = |p: SqlPlan, ident| p.parts(&names, ident).unwrap();
-        let (_, head, tail) = parts(plan(Engine::Pg, InsertMode::Skip, vec![]), dump::quote_dq);
+        let parts = |p: SqlPlan| p.parts(&names).unwrap();
+        let (_, head, tail) = parts(plan(SqlEngine::Pg, InsertMode::Skip, vec![]));
         assert_eq!(head, "INSERT INTO t (\"id\", \"name\") VALUES");
         assert_eq!(tail, "\nON CONFLICT DO NOTHING");
         let (_, _, tail) = parts(
-            plan(Engine::Pg, InsertMode::Upsert, vec![0]),
-            dump::quote_dq,
+            plan(SqlEngine::Pg, InsertMode::Upsert, vec![0])
         );
         assert_eq!(
             tail,
             "\nON CONFLICT (\"id\") DO UPDATE SET \"name\" = EXCLUDED.\"name\""
         );
         let (_, _, tail) = parts(
-            plan(Engine::Pg, InsertMode::Upsert, vec![0, 1]),
-            dump::quote_dq,
+            plan(SqlEngine::Pg, InsertMode::Upsert, vec![0, 1])
         );
         assert_eq!(tail, "\nON CONFLICT (\"id\", \"name\") DO NOTHING");
         let (_, head, tail) = parts(
-            plan(Engine::Mysql, InsertMode::Skip, vec![]),
-            dump::quote_bt,
+            plan(SqlEngine::Mysql, InsertMode::Skip, vec![])
         );
         assert_eq!(head, "INSERT IGNORE INTO t (`id`, `name`) VALUES");
         assert_eq!(tail, "");
         let (_, _, tail) = parts(
-            plan(Engine::Mysql, InsertMode::Upsert, vec![0]),
-            dump::quote_bt,
+            plan(SqlEngine::Mysql, InsertMode::Upsert, vec![0])
         );
         assert_eq!(tail, "\nON DUPLICATE KEY UPDATE `name` = VALUES(`name`)");
         // MySQL finds the key itself: no key updates every column.
         let (_, _, tail) = parts(
-            plan(Engine::Mysql, InsertMode::Upsert, vec![]),
-            dump::quote_bt,
+            plan(SqlEngine::Mysql, InsertMode::Upsert, vec![])
         );
         assert_eq!(
             tail,

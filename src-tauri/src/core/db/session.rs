@@ -6,33 +6,13 @@
 //! closes or its target changes, or when the app exits. There is no timer.
 
 use std::collections::HashMap;
-use std::ptr;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
 
-use sqlx::mysql::{MySql, MySqlConnection};
-use sqlx::postgres::{PgConnection, Postgres};
-use sqlx::sqlite::{Sqlite, SqliteConnection};
-use sqlx::{Connection as _, Executor};
-
-use crate::core::connections::{self, Connection};
-use crate::core::db::pool::DbPool;
-use crate::core::db::query::CLOSE_TIMEOUT;
-use crate::core::error::{AppError, ErrorCode};
+use crate::core::connections::Connection;
+use crate::core::db::conn::{CLOSE_TIMEOUT, Conn, TX_TIMEOUT};
+use crate::core::db::ctx::Ctx;
+use crate::core::error::AppError;
 use crate::core::sql::facts::StatementKind;
-use crate::core::state::AppState;
-
-/// Bound for a commit / rollback / status probe on the session; the connection dies after it.
-const TX_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The session's own connection, detached from the pool: an open transaction may hold it for
-/// as long as the user takes to decide, and must not count against the pool's connections
-/// (a 6th tab would stall every run on that database otherwise). It never returns to the pool.
-pub enum Conn {
-    Pg(PgConnection),
-    MySql(MySqlConnection),
-    Sqlite(SqliteConnection),
-}
 
 /// One tab's dedicated session. `dirty` tracks "a statement that could have changed data ran":
 /// the pending probes (`pg_current_xact_id_if_assigned`, `innodb_trx`) only see write
@@ -44,20 +24,17 @@ pub struct TabSession {
     /// The session is inside the explicit transaction (verified after each statement that
     /// could end it, so MySQL implicit commits and user-typed COMMITs are seen).
     pub tx_open: bool,
-    /// The transaction ran a statement that could have changed data.
     pub dirty: bool,
     /// PG only: a statement failed inside the transaction, which is now aborted (25P02).
     pub aborted: bool,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabStatus {
-    /// The tab has a dedicated session on this target.
     pub open: bool,
-    /// An explicit transaction is open.
     pub tx_open: bool,
-    /// The transaction holds uncommitted changes.
     pub pending: bool,
     /// PG: the transaction aborted; only ROLLBACK helps.
     pub aborted: bool,
@@ -85,6 +62,12 @@ struct Sessions {
 #[derive(Default)]
 pub struct SessionRegistry {
     inner: Mutex<Sessions>,
+}
+
+/// The tab sessions behind the app state. The command layer hands `AppState`, which implements
+/// this; `db` cannot import `state` without a cycle, and the intents need only this.
+pub trait TabSessions {
+    fn tab_sessions(&self) -> &SessionRegistry;
 }
 
 fn in_use() -> AppError {
@@ -148,7 +131,6 @@ impl SessionRegistry {
         }
     }
 
-    /// The tab has a session, live or in use.
     pub fn has(&self, tab_id: &str) -> bool {
         self.lock().tabs.contains_key(tab_id)
     }
@@ -256,85 +238,94 @@ impl SessionRegistry {
     }
 }
 
-/// Closes the session's connection, rolling back whatever transaction it held.
 pub async fn close_session(s: TabSession) {
-    let _ = tokio::time::timeout(CLOSE_TIMEOUT, close_conn(s.conn)).await;
-}
-
-async fn close_conn(c: Conn) -> Result<(), sqlx::Error> {
-    match c {
-        Conn::Pg(c) => c.close().await,
-        Conn::MySql(c) => c.close().await,
-        Conn::Sqlite(c) => c.close().await,
-    }
+    s.conn.close().await;
 }
 
 /// Hands the session back after a command. It is kept only while it holds an open
 /// transaction on a live connection: without one there is nothing to commit, and the
 /// connection is closed rather than held (its SET / USE state must not reach the pool).
-pub async fn settle(state: &AppState, tab_id: &str, mut s: TabSession) {
-    if s.tx_open && conn_alive(&mut s.conn).await {
-        state.sessions.put(tab_id, s).await;
+async fn settle(ctx: &Ctx<'_>, tab_id: &str, mut s: TabSession) {
+    if s.tx_open && s.conn.alive(CLOSE_TIMEOUT).await {
+        ctx.sessions.put(tab_id, s).await;
     } else {
-        state.sessions.discard(tab_id, Some(s)).await;
-    }
-}
-
-/// `PoolConnection` does not expose whether its connection is still alive; every session is
-/// closed on the errors that kill it (Io / Protocol) or when a later statement fails.
-pub async fn conn_alive(c: &mut Conn) -> bool {
-    match c {
-        Conn::Pg(c) => alive::<Postgres>(c).await,
-        Conn::MySql(c) => alive::<MySql>(c).await,
-        Conn::Sqlite(c) => alive::<Sqlite>(c).await,
-    }
-}
-
-async fn alive<DB: sqlx::Database>(c: &mut DB::Connection) -> bool {
-    match tokio::time::timeout(CLOSE_TIMEOUT, c.ping()).await {
-        Ok(r) => match r {
-            Ok(()) => true,
-            // 25P02: the ping itself failed inside an aborted transaction, but the connection
-            // is alive — the session must survive so Rollback stays available.
-            Err(sqlx::Error::Database(e)) => e.code().as_deref() == Some("25P02"),
-            Err(_) => false,
-        },
-        Err(_) => false,
+        ctx.sessions.discard(tab_id, Some(s)).await;
     }
 }
 
 /// The tab's session for (`conn`, `database`), or a new one. A session on a stale target is
 /// closed (its transaction rolls back) and replaced. The caller owns the slot until it hands
-/// the session back (`settle`, `put`, `discard`).
+/// the session back (`finish`, `put`, `discard`).
 pub async fn for_tab(
-    state: &AppState,
+    ctx: &Ctx<'_>,
     conn: &Connection,
     database: &str,
     tab_id: &str,
 ) -> Result<TabSession, AppError> {
-    let old = match state.sessions.take_or_reserve(tab_id, &conn.id)? {
+    let old = match ctx.sessions.take_or_reserve(tab_id, &conn.id)? {
         Some(s) if s.conn_id == conn.id && s.database == database => return Ok(s),
         old => old,
     };
     if let Some(s) = old {
         close_session(s).await;
     }
-    match open(state, conn, database).await {
+    match open(ctx, conn, database).await {
         Ok(s) => Ok(s),
         Err(e) => {
-            state.sessions.discard(tab_id, None).await;
+            ctx.sessions.discard(tab_id, None).await;
             Err(e)
         }
     }
 }
 
-/// A pool connection, detached at once (see [`Conn`]).
-async fn open(state: &AppState, conn: &Connection, database: &str) -> Result<TabSession, AppError> {
-    let c = match connections::pool_for(state, &conn.id, Some(database))? {
-        DbPool::Pg(p) => Conn::Pg(p.acquire().await?.detach()),
-        DbPool::MySql(p) => Conn::MySql(p.acquire().await?.detach()),
-        DbPool::Sqlite(p) => Conn::Sqlite(p.acquire().await?.detach()),
+/// What to do with a tab session after a read that borrowed it.
+pub enum Settle {
+    /// Nothing changed: hand it back as it is.
+    Keep,
+    /// The read may have ended or dirtied the transaction: refresh it, then keep it while a
+    /// transaction is open and close it otherwise.
+    Refresh,
+    /// The connection cannot be trusted (a result was dropped mid-stream): close it, rolling
+    /// its transaction back.
+    Discard,
+}
+
+/// Runs `f` on the tab's session when it is on (`conn.id`, `database`) and returns `None`
+/// otherwise, so the caller reads through the pool. A session on another target is put back
+/// untouched: a read on another database must not roll back the tab's open transaction.
+pub async fn with_tab<T>(
+    ctx: &Ctx<'_>,
+    conn: &Connection,
+    database: &str,
+    tab_id: Option<&str>,
+    f: impl std::ops::AsyncFnOnce(&mut TabSession) -> (T, Settle),
+) -> Result<Option<T>, AppError> {
+    let Some(tab_id) = tab_id else {
+        return Ok(None);
     };
+    let Some(mut s) = ctx.sessions.take(tab_id)? else {
+        return Ok(None);
+    };
+    if s.conn_id != conn.id || s.database != database {
+        ctx.sessions.put(tab_id, s).await;
+        return Ok(None);
+    }
+    let (out, how) = f(&mut s).await;
+    match how {
+        Settle::Keep => ctx.sessions.put(tab_id, s).await,
+        Settle::Refresh => {
+            refresh(&mut s).await;
+            finish(ctx, tab_id, s, false).await;
+        }
+        Settle::Discard => ctx.sessions.discard(tab_id, Some(s)).await,
+    }
+    Ok(Some(out))
+}
+
+/// A pool connection, detached at once: the session must not count against the pool's
+/// connections while the user decides, and it never returns to it.
+async fn open(ctx: &Ctx<'_>, conn: &Connection, database: &str) -> Result<TabSession, AppError> {
+    let c = Conn::detached(&ctx.pool_for(conn, Some(database))?).await?;
     Ok(TabSession {
         conn_id: conn.id.clone(),
         database: database.to_string(),
@@ -345,228 +336,120 @@ async fn open(state: &AppState, conn: &Connection, database: &str) -> Result<Tab
     })
 }
 
-/// Opens the session's explicit transaction: before the first statement of a run that is not
-/// a plain read, and again when a statement ended it mid-run, so no later write autocommits.
-pub async fn begin(s: &mut TabSession) -> Result<(), AppError> {
-    match &mut s.conn {
-        Conn::Pg(c) => run_tx::<Postgres>(c, "BEGIN").await,
-        Conn::MySql(c) => run_tx::<MySql>(c, "START TRANSACTION").await,
-        Conn::Sqlite(c) => run_tx::<Sqlite>(c, "BEGIN").await,
-    }?;
+/// Opens the session's transaction when none is open and clears the probe flags for it: the
+/// start of every run that may write, so a run and a grid save cannot drift.
+pub async fn begin_if_needed(s: &mut TabSession) -> Result<(), AppError> {
+    if s.tx_open {
+        return Ok(());
+    }
+    s.conn.begin().await?;
     s.tx_open = true;
     s.dirty = false;
     s.aborted = false;
     Ok(())
 }
 
-/// COMMIT or ROLLBACK inside the session.
-pub async fn end_tx(s: &mut TabSession, commit: bool) -> Result<(), AppError> {
-    if !s.tx_open {
-        return Err(AppError::invalid("No transaction is open in this tab"));
-    }
-    let sql = if commit { "COMMIT" } else { "ROLLBACK" };
-    let r = match &mut s.conn {
-        Conn::Pg(c) => run_tx::<Postgres>(c, sql).await,
-        Conn::MySql(c) => run_tx::<MySql>(c, sql).await,
-        Conn::Sqlite(c) => run_tx::<Sqlite>(c, sql).await,
-    };
-    r.map_err(|e| {
-        AppError::new(
-            ErrorCode::Database,
-            format!(
-                "{} failed; the transaction may still be open",
-                if commit { "Commit" } else { "Rollback" }
-            ),
-        )
-        .with_detail(e.to_string())
-    })?;
-    s.tx_open = false;
-    s.dirty = false;
-    s.aborted = false;
-    Ok(())
-}
-
-async fn run_tx<DB>(c: &mut DB::Connection, sql: &str) -> Result<(), sqlx::Error>
-where
-    DB: sqlx::Database,
-    for<'x> &'x mut DB::Connection: Executor<'x, Database = DB>,
-{
-    match tokio::time::timeout(TX_TIMEOUT, c.execute(sqlx::raw_sql(sql))).await {
-        Ok(r) => {
-            r?;
-            Ok(())
-        }
-        // A timed-out COMMIT may still have landed; the session is closed by the caller's
-        // liveness check on error paths anyway.
-        Err(e) => Err(sqlx::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            e.to_string(),
-        ))),
-    }
-}
-
 /// Refreshes `tx_open` / `aborted` / `dirty` after a run. MySQL's probe doubles as the
 /// implicit-commit detector; PG's handles the aborted state (25P02 still counts as "in
-/// transaction").
+/// transaction") and the write transaction.
 pub async fn refresh(s: &mut TabSession) {
-    match &mut s.conn {
-        Conn::Pg(c) => {
-            // Simple protocol, so the probe is its own statement: outside a transaction it
-            // starts one and the clocks are equal; inside one, now() is the BEGIN. A second
-            // column reports the write xact (`pg_current_xact_id_if_assigned` is NULL in a
-            // read-only transaction), which is what "pending" means on PG.
-            match tokio::time::timeout(
-                TX_TIMEOUT,
-                c.fetch_one(sqlx::raw_sql(
-                    "SELECT now() <> statement_timestamp(), \
-                     pg_current_xact_id_if_assigned() IS NOT NULL",
-                )),
-            )
-            .await
-            {
-                Ok(Ok(row)) => {
-                    use sqlx::Row;
-                    let in_tx: bool = row.try_get(0).unwrap_or(false);
-                    let write_xact: bool = row.try_get(1).unwrap_or(false);
-                    s.tx_open = in_tx;
-                    s.dirty = (s.dirty || write_xact) && in_tx;
-                    s.aborted = false;
-                }
-                // 25P02: a statement failed inside the transaction — it is open and aborted.
-                Ok(Err(sqlx::Error::Database(e))) if e.code().as_deref() == Some("25P02") => {
-                    s.tx_open = true;
-                    s.aborted = true;
-                }
-                _ => {}
-            }
-        }
-        Conn::MySql(c) => {
-            if let Some(open) = mysql_in_transaction(c).await {
-                // The statement itself may have committed implicitly (DDL on MySQL).
-                s.tx_open = open;
-                s.dirty = s.dirty && open;
-            }
-        }
-        Conn::Sqlite(c) => {
-            if let Ok(mut h) = c.lock_handle().await {
-                // SAFETY: the locked handle gives exclusive access to the live connection.
-                let state = unsafe {
-                    libsqlite3_sys::sqlite3_txn_state(h.as_raw_handle().as_ptr(), ptr::null())
-                };
-                s.tx_open = state != libsqlite3_sys::SQLITE_TXN_NONE;
-                s.dirty = state == libsqlite3_sys::SQLITE_TXN_WRITE;
-            }
-        }
+    if let Some(tx) = s.conn.tx(TX_TIMEOUT).await {
+        s.dirty = tx.dirty(s.dirty);
+        s.tx_open = tx.open;
+        s.aborted = tx.aborted;
     }
 }
 
 /// Whether the transaction holds changes worth asking about ("pending"), asked of the server
 /// where the engine reports it precisely.
 pub async fn pending(s: &mut TabSession) -> bool {
-    if !s.tx_open {
-        return false;
+    if !s.tx_open || s.aborted {
+        return s.tx_open;
     }
-    match &mut s.conn {
-        Conn::Pg(c) => {
-            if s.aborted {
-                return true;
-            }
-            tokio::time::timeout(
-                TX_TIMEOUT,
-                c.fetch_one(sqlx::raw_sql(
-                    "SELECT pg_current_xact_id_if_assigned() IS NOT NULL",
-                )),
-            )
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .and_then(|row| sqlx::Row::try_get::<bool, _>(&row, 0).ok())
-            .unwrap_or(s.dirty)
-        }
-        Conn::MySql(c) => {
-            if !s.dirty {
-                return false;
-            }
-            innodb_trx_has_changes(c).await.unwrap_or(s.dirty)
-        }
-        Conn::Sqlite(_) => s.dirty,
-    }
-}
-
-/// The session's own `innodb_trx` row: present only while uncommitted locks or writes exist.
-/// Only asked after a write-capable statement (`s.dirty`).
-async fn innodb_trx_has_changes(c: &mut MySqlConnection) -> Option<bool> {
-    let n: i64 = sqlx::query_scalar(
-        "SELECT CAST(count(*) AS SIGNED) FROM information_schema.innodb_trx \
-         WHERE trx_mysql_thread_id = CONNECTION_ID()",
-    )
-    .fetch_one(&mut *c)
-    .await
-    .ok()?;
-    Some(n > 0)
-}
-
-/// MySQL/MariaDB: is the session inside a transaction. `@@in_transaction` exists only on
-/// MariaDB; on MySQL `SET TRANSACTION READ WRITE` fails with 25001 while a transaction is open
-/// (harmless on a read-write session: it only presets the next transaction's mode).
-async fn mysql_in_transaction(c: &mut MySqlConnection) -> Option<bool> {
-    tokio::time::timeout(TX_TIMEOUT, mysql_probe(c))
-        .await
-        .ok()
-        .flatten()
-}
-
-async fn mysql_probe(c: &mut MySqlConnection) -> Option<bool> {
-    if let Ok(v) = sqlx::query_scalar::<_, i64>("SELECT CAST(@@in_transaction AS SIGNED)")
-        .fetch_one(&mut *c)
-        .await
-    {
-        return Some(v != 0);
-    }
-    match c.execute(sqlx::raw_sql("SET TRANSACTION READ WRITE")).await {
-        Ok(_) => Some(false),
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("25001") => Some(true),
-        Err(_) => None,
-    }
+    s.conn.has_changes(s.dirty).await
 }
 
 /// Ends a transaction that holds nothing worth asking about, once a run is done: a plain
 /// read must not leave the tab idle in a transaction the user cannot end (Commit / Rollback
 /// are offered only for pending work) on a stale snapshot. ROLLBACK, not COMMIT: nothing is
 /// pending, so nothing is lost, and no write ever commits without the user deciding.
-pub async fn end_if_clean(s: &mut TabSession) {
-    if s.tx_open && !s.aborted && !pending(s).await && end_tx(s, false).await.is_err() {
-        // The connection is suspect; `settle` closes it, which rolls back on the server.
+async fn end_if_clean(s: &mut TabSession) {
+    if s.tx_open && !s.aborted && !pending(s).await {
+        // A failed ROLLBACK cannot change the outcome: `settle` closes a session that is not
+        // in a transaction, and closing rolls back on the server.
+        let _ = s.conn.end_tx(false).await;
         s.tx_open = false;
+        s.dirty = false;
+        s.aborted = false;
+    }
+}
+
+/// Hands the session back after a run: a lost connection is dropped (its transaction rolls
+/// back on the server, and its SET / USE state must not reach the pool), otherwise a
+/// transaction that holds nothing is ended and the session is kept.
+pub async fn finish(ctx: &Ctx<'_>, tab_id: &str, mut s: TabSession, lost: bool) {
+    if lost {
+        ctx.sessions.discard(tab_id, Some(s)).await;
+    } else {
+        end_if_clean(&mut s).await;
+        settle(ctx, tab_id, s).await;
+    }
+}
+
+pub async fn close_tab(state: &impl TabSessions, tab_id: &str) {
+    state.tab_sessions().close(tab_id).await;
+}
+
+/// Drops every tab session, e.g. when the user quits and accepted losing uncommitted work.
+pub async fn close_all(state: &impl TabSessions) {
+    for id in state.tab_sessions().pending_tab_ids() {
+        state.tab_sessions().close(&id).await;
     }
 }
 
 /// COMMIT (`commit: true`) or ROLLBACK the tab's transaction. The session closes either way:
 /// without a transaction it has nothing to keep, and a failed end must take its transaction
 /// with it.
-pub async fn end_tx_for(state: &AppState, tab_id: &str, commit: bool) -> Result<(), AppError> {
-    let mut s = state
-        .sessions
+pub async fn end_tx_for(
+    state: &impl TabSessions,
+    tab_id: &str,
+    commit: bool,
+) -> Result<(), AppError> {
+    let registry = state.tab_sessions();
+    let mut s = registry
         .take(tab_id)?
         .ok_or_else(|| AppError::not_found("No session for this tab"))?;
-    let r = end_tx(&mut s, commit).await;
-    state.sessions.discard(tab_id, Some(s)).await;
+    let r = s.conn.end_tx(commit).await.map_err(|e| {
+        AppError::new(
+            crate::core::error::ErrorCode::Database,
+            format!(
+                "{} failed; the transaction may still be open",
+                if commit { "Commit" } else { "Rollback" }
+            ),
+        )
+        .with_detail(e.message)
+    });
+    registry.discard(tab_id, Some(s)).await;
     r
 }
 
 /// Reports the tab's transaction state. `None` when the tab has no session (a session whose
 /// transaction ended or whose connection died is closed here).
-pub async fn status(state: &AppState, tab_id: &str) -> Result<Option<TabStatus>, AppError> {
-    let Some(mut s) = state.sessions.take(tab_id)? else {
+pub async fn status(
+    state: &impl TabSessions,
+    tab_id: &str,
+) -> Result<Option<TabStatus>, AppError> {
+    let registry = state.tab_sessions();
+    let Some(mut s) = registry.take(tab_id)? else {
         return Ok(None);
     };
-    if !conn_alive(&mut s.conn).await {
-        state.sessions.discard(tab_id, Some(s)).await;
+    if !s.conn.alive(CLOSE_TIMEOUT).await {
+        registry.discard(tab_id, Some(s)).await;
         return Ok(None);
     }
     refresh(&mut s).await;
     if !s.tx_open {
-        state.sessions.discard(tab_id, Some(s)).await;
+        registry.discard(tab_id, Some(s)).await;
         return Ok(None);
     }
     let out = TabStatus {
@@ -575,7 +458,7 @@ pub async fn status(state: &AppState, tab_id: &str) -> Result<Option<TabStatus>,
         pending: pending(&mut s).await,
         aborted: s.aborted,
     };
-    state.sessions.put(tab_id, s).await;
+    registry.put(tab_id, s).await;
     Ok(Some(out))
 }
 
@@ -591,7 +474,10 @@ pub fn may_write(kind: Option<StatementKind>) -> bool {
 
 /// The statement may end the open transaction: user transaction control, and on MySQL every
 /// statement with an implicit commit (DDL, LOCK, SET autocommit, CALL, GRANT, …). Plain DML
-/// and reads never do, so they skip the probe.
+/// and reads never do, so they skip the probe. Deliberately conservative: every `Other`
+/// statement is probed, so this is not the user-facing fact; the approval preview uses
+/// [`StatementFacts::implicit_commit`](crate::core::sql::facts::StatementFacts::implicit_commit),
+/// which names only the statements MySQL really commits at.
 pub fn may_end_tx(kind: Option<StatementKind>) -> bool {
     !matches!(
         kind,
@@ -615,15 +501,7 @@ pub fn implicit_commit_notice(
     i: usize,
     n: usize,
 ) -> String {
-    let ddl = matches!(
-        kind,
-        Some(
-            StatementKind::Create
-                | StatementKind::Alter
-                | StatementKind::Drop
-                | StatementKind::Truncate
-        )
-    );
+    let ddl = kind.is_some_and(StatementKind::is_ddl);
     let mut m = if n > 1 {
         format!("Statement {} of {n}: ", i + 1)
     } else {

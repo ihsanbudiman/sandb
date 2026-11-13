@@ -60,6 +60,7 @@ mongodb = "3.10"
 
 [dev-dependencies]
 tempfile = "3"
+ts-rs = { version = "12", features = ["serde-json-impl"] }
 
 # mongodb 3.10.0 with one change in `src/client/auth/scram.rs`: when the server ignores
 # `skipEmptyExchange` (Azure Cosmos DB for MongoDB) and its final SCRAM reply has `done: false`,

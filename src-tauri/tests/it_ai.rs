@@ -4,54 +4,28 @@
 //! Unreachable services FAIL; nothing is skipped.
 #![cfg(feature = "it")]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+mod common;
 
 use serde_json::Value;
 
-use sandb_lib::core::ai::session::{self, ChatEvent, ChatRequest, ChatRole, ChatSource, ChatTurn};
+use common::{Ctx, assert_terminal, recorded_with, text, tool, tool_contents};
+use sandb_lib::core::ai::event::ChatEvent;
+use sandb_lib::core::ai::session::{self, ChatRequest, ChatRole, ChatSource, ChatTurn};
 use sandb_lib::core::ai::settings::{self, AiSettings, Privacy};
 use sandb_lib::core::ai::tools;
-use sandb_lib::core::connections::{self, Connection, ConnectionInput, Engine, Env, SslMode};
-use sandb_lib::core::db::readonly::{self, ReadLimits};
-use sandb_lib::core::db::write;
+use sandb_lib::core::result::Source;
+use sandb_lib::core::result::ReadLimits;
+use sandb_lib::core::ops;
+use sandb_lib::core::engine::Engine;
 use sandb_lib::core::error::ErrorCode;
-use sandb_lib::core::secrets::MemoryStore;
-use sandb_lib::core::state::AppState;
 
 /// Tests that read or write `orders` row 1. `an_approved_write_commits` changes the row and puts
 /// it back, so a parallel test that compares the row before and after its run must not overlap it.
 static ORDER_1: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn mock_url() -> String {
-    std::env::var("SANDB_MOCK_LLM_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:58080/v1".into())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn env_test() -> HashMap<String, String> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdb/.env.test");
-    let raw =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
-}
-
-struct Ctx {
-    _dir: tempfile::TempDir,
-    st: AppState,
-    conn: Connection,
-}
-
 fn ai_settings(privacy: Privacy) -> AiSettings {
     AiSettings {
-        provider: "mock".into(),
-        base_url: mock_url(),
+        base_url: common::mock_url(),
         model: "mock-gpt".into(),
         privacy,
         ..Default::default()
@@ -59,37 +33,13 @@ fn ai_settings(privacy: Privacy) -> AiSettings {
 }
 
 fn setup(privacy: Privacy, read_only: bool) -> Ctx {
-    let e = env_test();
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
-    let input = ConnectionInput {
-        name: "it-ai-pg16".into(),
-        engine: Engine::Pg,
-        env: Env::Local,
-        host: "127.0.0.1".into(),
-        port: 55416,
-        database: "shop".into(),
-        user: e.get("SANDB_RW_USER").cloned().unwrap_or("sandb_rw".into()),
-        ssl: SslMode::Prefer,
-        file: String::new(),
-        ai_write: false,
-        read_only,
-        version: None,
-        uri: String::new(),
-        auth_source: String::new(),
-        topology: None,
-    };
-    let pw = e
-        .get("SANDB_RW_PASSWORD")
-        .cloned()
-        .expect("SANDB_RW_PASSWORD");
-    let conn = connections::create(&st, input, Some(pw)).unwrap();
-    settings::save(&st, ai_settings(privacy)).unwrap();
-    Ctx {
-        _dir: dir,
-        st,
-        conn,
-    }
+    let mut input = common::sql_input("ai-pg16", Engine::Pg, common::pg16(), false);
+    // AI writes on: each chat sends its own `allowWrites`, which the tests vary.
+    input.ai_write = true;
+    input.read_only = read_only;
+    let ctx = common::ctx("pg16", input, Some(common::rw_password()));
+    settings::save(&ctx.st, ai_settings(privacy)).unwrap();
+    ctx
 }
 
 fn request(ctx: &Ctx, chat_id: &str, message: &str, allow_writes: bool) -> ChatRequest {
@@ -121,52 +71,8 @@ async fn chat(ctx: &Ctx, message: &str, allow_writes: bool) -> Vec<ChatEvent> {
         },
     )
     .await;
-    assert!(!ctx.st.chats.is_running(&chat_id), "registry entry left");
+    assert!(!ctx.st.chats().is_running(&chat_id), "registry entry left");
     events
-}
-
-/// Exactly one terminal event, and it is the last one.
-fn assert_terminal(events: &[ChatEvent]) {
-    let terminal = events
-        .iter()
-        .filter(|e| matches!(e, ChatEvent::Done | ChatEvent::Error { .. }))
-        .count();
-    assert_eq!(terminal, 1, "{events:#?}");
-    assert!(
-        matches!(
-            events.last(),
-            Some(ChatEvent::Done | ChatEvent::Error { .. })
-        ),
-        "{events:#?}"
-    );
-}
-
-fn text(events: &[ChatEvent]) -> String {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            ChatEvent::Text { delta } => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The single tool call and its result.
-fn tool(events: &[ChatEvent]) -> (&str, &Value, &ChatEvent) {
-    let calls: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            ChatEvent::ToolCall { id, name, args } => Some((id, name, args)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(calls.len(), 1, "{events:#?}");
-    let (id, name, args) = calls[0];
-    let result = events
-        .iter()
-        .find(|e| matches!(e, ChatEvent::ToolResult { id: rid, .. } if rid == id))
-        .unwrap_or_else(|| panic!("no tool_result for {id}: {events:#?}"));
-    (name.as_str(), args, result)
 }
 
 #[tokio::test]
@@ -184,7 +90,6 @@ async fn list_scenario_lists_tables() {
         }
         _ => unreachable!(),
     }
-    // The model got the table list as JSON.
     let t = text(&events);
     assert!(t.starts_with("Tool result received: {"), "{t}");
     assert!(t.contains("\"tables\":[{"), "{t}");
@@ -303,13 +208,7 @@ async fn chart_scenario_sends_rows_to_the_ui_only() {
 }
 
 async fn order_1_status(ctx: &Ctx) -> Value {
-    let r = readonly::run_ai_read(
-        &ctx.st,
-        &ctx.conn.id,
-        None,
-        "SELECT status FROM orders WHERE id = 1",
-        ReadLimits::default(),
-    )
+    let r = ops::run_ai_read(&ctx.st, &ctx.conn.id, None, "SELECT status FROM orders WHERE id = 1", ReadLimits::default(), )
     .await
     .unwrap();
     r.rows[0][0].clone()
@@ -361,7 +260,7 @@ async fn chat_deciding(ctx: &Ctx, approve: bool) -> Vec<ChatEvent> {
         request(ctx, &chat_id, "write the change", true),
         |e| {
             if let ChatEvent::WritePreview { id, .. } = &e {
-                ctx.st.approvals.decide(&chat_id, id, approve).unwrap();
+                session::decide(&ctx.st, &chat_id, id, approve).unwrap();
             }
             events.push(e);
             true
@@ -380,7 +279,7 @@ fn preview_then_result(events: &[ChatEvent]) -> &ChatEvent {
     let preview = events
         .iter()
         .position(|e| matches!(e, ChatEvent::WritePreview { .. }))
-        .expect("write_preview");
+        .unwrap_or_else(|| panic!("no write_preview: {events:#?}"));
     let result_at = events.iter().position(|e| e == result).unwrap();
     assert!(preview < result_at, "preview must come before the result");
     match &events[preview] {
@@ -422,7 +321,7 @@ async fn an_approved_write_commits() {
         "UPDATE orders SET status = '{}' WHERE id = 1",
         before.as_str().unwrap().replace('\'', "''")
     );
-    write::run_approved(&ctx.st, &ctx.conn.id, "shop", &restore, &Default::default())
+    ops::run_approved_write(&ctx.st, &ctx.conn.id, "shop", &restore, &Default::default())
         .await
         .unwrap();
     match result {
@@ -466,7 +365,6 @@ async fn error_scenario_ends_with_ai_upstream() {
 async fn cancel_during_slow_stream_stops_fast() {
     let ctx = setup(Privacy::Results, false);
     let chat_id = "it-slow-chat";
-    let started = Instant::now();
     let mut events = Vec::new();
     session::run(
         &ctx.st,
@@ -482,16 +380,15 @@ async fn cancel_during_slow_stream_stops_fast() {
         },
     )
     .await;
-    let elapsed = started.elapsed();
     assert_terminal(&events);
     match events.last().unwrap() {
         ChatEvent::Error { error } => assert_eq!(error.code, ErrorCode::Cancelled),
         other => panic!("{other:?}"),
     }
-    // The slow scenario streams for 6 s; the cancel must end it right after the first chunk.
-    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    // The slow scenario streams twenty chunks; ending after the first is the signal that the
+    // cancel stopped it, without measuring the machine's speed.
     assert_eq!(text(&events), "chunk 1 ");
-    assert!(!ctx.st.chats.is_running(chat_id));
+    assert!(!ctx.st.chats().is_running(chat_id));
     // A cancel for an unknown or finished chat is not an error.
     session::cancel(&ctx.st, chat_id);
 }
@@ -502,7 +399,7 @@ async fn test_ai_checks_the_model() {
     let ok = settings::test(&ctx.st, ai_settings(Privacy::Results), Some(String::new()))
         .await
         .unwrap();
-    assert!(ok.model_count >= 1);
+    assert_eq!(ok.model_count, 1, "the mock lists exactly one model");
     let wrong = AiSettings {
         model: "no-such-model".into(),
         ..ai_settings(Privacy::Results)
@@ -518,52 +415,11 @@ async fn test_ai_checks_the_model() {
     assert!(e.detail.as_deref().unwrap().contains("mock-gpt"));
 }
 
-/// Request bodies the mock recorded whose user messages contain `marker`.
-async fn recorded_with(marker: &str) -> Vec<Value> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let root = mock_url();
-    let root = root.strip_suffix("/v1").unwrap_or(&root);
-    let bytes = reqwest::get(format!("{root}/_requests"))
-        .await
-        .expect("mock /_requests")
-        .error_for_status()
-        .expect("mock /_requests status (is the mock up to date?)")
-        .bytes()
-        .await
-        .unwrap();
-    let all: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
-    all.into_iter()
-        .filter(|b| {
-            b["messages"].as_array().is_some_and(|m| {
-                m.iter().any(|m| {
-                    m["role"] == "user" && m["content"].as_str().is_some_and(|c| c.contains(marker))
-                })
-            })
-        })
-        .collect()
-}
-
-/// The `tool` message contents of the recorded requests.
-fn tool_contents(bodies: &[Value]) -> Vec<Value> {
-    bodies
-        .iter()
-        .flat_map(|b| b["messages"].as_array().cloned().unwrap_or_default())
-        .filter(|m| m["role"] == "tool")
-        .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
-        .collect()
-}
-
 #[tokio::test]
 async fn schema_privacy_never_sends_rows() {
     let count = {
         let ctx = setup(Privacy::Results, false);
-        let r = readonly::run_ai_read(
-            &ctx.st,
-            &ctx.conn.id,
-            None,
-            "SELECT count(*) FROM orders",
-            ReadLimits::default(),
-        )
+        let r = ops::run_ai_read(&ctx.st, &ctx.conn.id, None, "SELECT count(*) FROM orders", ReadLimits::default(), )
         .await
         .unwrap();
         r.rows[0][0].clone()
@@ -630,13 +486,7 @@ async fn schema_privacy_hides_query_error_text() {
     let args = serde_json::json!({ "sql": sql }).to_string();
     for privacy in [Privacy::Schema, Privacy::Results] {
         let ctx = setup(privacy, false);
-        let email = readonly::run_ai_read(
-            &ctx.st,
-            &ctx.conn.id,
-            None,
-            "SELECT email FROM customers ORDER BY id LIMIT 1",
-            ReadLimits::default(),
-        )
+        let email = ops::run_ai_read(&ctx.st, &ctx.conn.id, None, "SELECT email FROM customers ORDER BY id LIMIT 1", ReadLimits::default(), )
         .await
         .unwrap()
         .rows[0][0]
@@ -644,7 +494,7 @@ async fn schema_privacy_hides_query_error_text() {
             .unwrap()
             .to_string();
         let ai = ai_settings(privacy);
-        let sources = [tools::Source {
+        let sources = [Source {
             id: "db1".into(),
             conn: ctx.conn.clone(),
             database: "shop".into(),

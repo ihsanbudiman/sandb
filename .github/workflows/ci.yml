@@ -1,0 +1,67 @@
+name: CI
+
+# Every push and pull request: type-check, build the frontend, lint and unit-test the Rust core,
+# then every integration suite against the throwaway testdb stack.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Tauri 2 and the system SQLite the Rust core links against on Linux.
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf \
+            libsqlite3-dev lsof
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Frontend type-check
+        run: pnpm check
+
+      - name: Frontend build
+        run: pnpm build
+
+      - name: Rust lints
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-features --all-targets -- -D warnings
+
+      - name: Rust unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --bins --all-features
+
+      - name: SQLite fixture
+        run: pnpm db:sqlite
+
+      # The stack is throwaway (tmpfs), started from the same .env.test the tests read.
+      - name: Test databases
+        run: pnpm db:up
+
+      - name: Integration tests
+        run: pnpm test:it
+
+      - name: Stop the test databases
+        if: always()
+        run: pnpm db:down

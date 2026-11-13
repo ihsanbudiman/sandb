@@ -5,9 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use mongodb::bson::{Bson, Document, spec::BinarySubtype};
+use mongodb::bson::{Bson, Document};
 
-use crate::core::db::introspect::ColumnInfo;
+use crate::core::mongo::value::type_name;
+use crate::core::result::ColumnInfo;
 
 /// Full column browse: documents read per collection.
 pub const SAMPLE_DOCS: i64 = 1000;
@@ -20,7 +21,6 @@ pub const SNAPSHOT_SAMPLE_BYTES: usize = 1024 * 1024;
 /// Deepest path kept: `a.b.c.d.e` has depth 5. A document at that depth still shows as `object`.
 pub const MAX_DEPTH: usize = 5;
 
-/// Counts for one path: how many documents have the path and how many have each BSON type.
 #[derive(Default)]
 struct FieldStats {
     docs: u32,
@@ -36,7 +36,6 @@ pub struct FieldSummary {
 }
 
 impl FieldSummary {
-    /// Merges one sampled document. Keeps no reference to it.
     pub fn add(&mut self, doc: &Document) {
         self.docs += 1;
         // One element can repeat a path and add new types; count each (path, type) at most once
@@ -57,24 +56,14 @@ impl FieldSummary {
         }
     }
 
-    /// Documents merged so far.
-    pub fn docs(&self) -> u32 {
-        self.docs
-    }
-
     pub fn into_columns(self) -> Vec<ColumnInfo> {
         let FieldSummary { docs, order, stats } = self;
         let mut columns: Vec<ColumnInfo> = order
             .into_iter()
             .filter_map(|name| {
                 let field = stats.get(&name)?;
-                let mut types: Vec<(&String, &u32)> = field.types.iter().collect();
-                types.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-                let data_type = types
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" | ");
+                let data_type =
+                    type_labels(field.types.iter().map(|(name, n)| (name.as_str(), *n)));
                 Some(ColumnInfo {
                     is_pk: name == "_id",
                     pk_ordinal: (name == "_id").then_some(1),
@@ -95,9 +84,8 @@ impl FieldSummary {
         columns
     }
 
-    /// Records `(path, type)` for the current document and descends into embedded documents and
-    /// arrays of documents. `depth` is the number of segments of the keys of `doc` (a top-level
-    /// key has depth 1, an array element adds none).
+    /// `depth` is the number of segments of the keys of `doc` (a top-level key has depth 1, an
+    /// array element adds none).
     fn merge_document(
         &mut self,
         doc: &Document,
@@ -175,7 +163,6 @@ impl FieldSummary {
         }
     }
 
-    /// Stats of `path`, registering it in first-seen order on first use.
     fn stats_mut(&mut self, path: String) -> &mut FieldStats {
         if !self.stats.contains_key(&path) {
             self.order.push(path.clone());
@@ -184,33 +171,16 @@ impl FieldSummary {
     }
 }
 
-/// BSON type name as shown in the UI, e.g. "int32", "objectId".
-pub fn type_name(v: &Bson) -> &'static str {
-    match v {
-        Bson::Double(_) => "double",
-        Bson::String(_) => "string",
-        Bson::Document(_) => "object",
-        Bson::Array(_) => "array",
-        // Only the standard UUID subtype (0x04) is a uuid; the legacy subtype stays binData.
-        Bson::Binary(binary) if binary.subtype == BinarySubtype::Uuid => "uuid",
-        Bson::Binary(_) => "binData",
-        Bson::ObjectId(_) => "objectId",
-        Bson::Boolean(_) => "bool",
-        Bson::DateTime(_) => "date",
-        Bson::Null => "null",
-        Bson::Undefined => "undefined",
-        Bson::RegularExpression(_) => "regex",
-        Bson::DbPointer(_) => "dbPointer",
-        Bson::JavaScriptCode(_) => "javascript",
-        Bson::Symbol(_) => "symbol",
-        Bson::JavaScriptCodeWithScope(_) => "javascriptWithScope",
-        Bson::Int32(_) => "int32",
-        Bson::Int64(_) => "int64",
-        Bson::Timestamp(_) => "timestamp",
-        Bson::Decimal128(_) => "decimal128",
-        Bson::MinKey => "minKey",
-        Bson::MaxKey => "maxKey",
-    }
+/// The types of one path as the UI shows them: most frequent first, ties by name, joined with
+/// ` | `. The grid's column types use the same join.
+pub(crate) fn type_labels<'a>(counts: impl IntoIterator<Item = (&'a str, u32)>) -> String {
+    let mut labels: Vec<(&str, u32)> = counts.into_iter().collect();
+    labels.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    labels
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// The `bsonType` names of one property schema, as a string or an array. JSON schema names map to
@@ -242,7 +212,7 @@ fn validator_type(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mongodb::bson::{Binary, doc};
+    use mongodb::bson::{Binary, doc, spec::BinarySubtype};
 
     fn column<'a>(columns: &'a [ColumnInfo], name: &str) -> &'a ColumnInfo {
         columns
@@ -410,7 +380,7 @@ mod tests {
         summary.add(&doc! { "name": "x" });
         summary.add_validator(&doc! { "other": { "bsonType": "int" } });
         summary.add_validator(&Document::new());
-        assert_eq!(summary.docs(), 1);
+        assert_eq!(summary.docs, 1);
         assert_eq!(summary.into_columns().len(), 1);
     }
 

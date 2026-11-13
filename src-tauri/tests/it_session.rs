@@ -5,152 +5,83 @@
 //! sandb-test stack (`pnpm db:up`); unreachable databases FAIL, nothing is skipped.
 #![cfg(feature = "it")]
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+mod common;
+
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde_json::json;
 use sqlx::Connection as _;
 
-use sandb_lib::core::connections::{self, Connection, ConnectionInput, Engine, Env, SslMode};
-use sandb_lib::core::db::edit::{self, ApplyEditsRequest, EditKind, EditOperation};
-use sandb_lib::core::db::export::{self, ExportRequest};
-use sandb_lib::core::db::query::{self, QueryRun, RunRequest};
+use common::Ctx;
+use sandb_lib::core::connections::{ConnectionInput, Env};
+use sandb_lib::core::result::{ApplyEditsRequest, EditKind, EditOperation, TypedValue};
+use sandb_lib::core::result::ExportRequest;
+use sandb_lib::core::result::{QueryRun, RunRequest};
 use sandb_lib::core::db::session::{self, TabStatus};
+use sandb_lib::core::engine::Engine;
+use sandb_lib::core::ops;
 use sandb_lib::core::error::{AppError, ErrorCode};
-use sandb_lib::core::secrets::MemoryStore;
-use sandb_lib::core::state::AppState;
 
-const PG16: u16 = 55416;
-const MYSQL: u16 = 53384;
-const MARIADB: u16 = 53311;
-const NET: [(&str, Engine, u16); 4] = [
-    ("pg16", Engine::Pg, PG16),
-    ("pg13", Engine::Pg, 55413),
-    ("mysql", Engine::Mysql, MYSQL),
-    ("mariadb", Engine::Mysql, MARIADB),
-];
-
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
-}
-
-fn env_test() -> HashMap<String, String> {
-    let p = root().join("testdb/.env.test");
-    let raw =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
-}
-
-fn rw() -> (String, String) {
-    let e = env_test();
-    (
-        e.get("SANDB_RW_USER").cloned().unwrap_or("sandb_rw".into()),
-        e.get("SANDB_RW_PASSWORD")
-            .cloned()
-            .expect("SANDB_RW_PASSWORD"),
-    )
-}
-
-struct Ctx {
-    _dir: tempfile::TempDir,
-    st: AppState,
-    conn: Connection,
-    label: String,
-}
-
-fn state() -> (tempfile::TempDir, AppState) {
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
-    (dir, st)
-}
-
-fn input(engine: Engine, port: u16, env: Env, file: &std::path::Path) -> ConnectionInput {
-    let (user, _) = rw();
-    ConnectionInput {
-        name: format!("it-{engine:?}-{port}-{env:?}"),
-        engine,
-        env,
-        host: "127.0.0.1".into(),
-        port,
-        database: "shop".into(),
-        user,
-        ssl: SslMode::Prefer,
-        file: file.to_string_lossy().into_owned(),
-        ai_write: false,
-        read_only: false,
-        version: None,
-        uri: String::new(),
-        auth_source: String::new(),
-        topology: None,
-    }
+fn input(engine: Engine, port: u16, env: Env, file: &Path) -> ConnectionInput {
+    let mut i = if engine == Engine::Sqlite {
+        common::sqlite_input(file, false)
+    } else {
+        common::sql_input("session", engine, port, false)
+    };
+    i.name = format!("it-{engine:?}-{port}-{env:?}");
+    i.env = env;
+    i
 }
 
 /// A Production connection on `engine`; for SQLite a temp copy of the fixture.
 fn prod_ctx(label: &str, engine: Engine, port: u16) -> Ctx {
-    let (dir, st) = state();
-    let (_, pw) = rw();
-    let (file, password) = if engine == Engine::Sqlite {
-        let src = root().join("testdb/sqlite/shop.db");
-        let f = dir.path().join("shop.db");
-        std::fs::copy(&src, &f).unwrap_or_else(|e| {
-            panic!(
-                "missing fixture {} (run `pnpm db:sqlite`): {e}",
-                src.display()
-            )
-        });
-        (f, None)
+    if engine == Engine::Sqlite {
+        let (dir, st) = common::state();
+        let file = dir.path().join("shop.db");
+        std::fs::copy(common::sqlite_fixture(), &file).unwrap();
+        common::ctx_in(
+            dir,
+            st,
+            label,
+            input(engine, port, Env::Production, &file),
+            None,
+        )
     } else {
-        (PathBuf::new(), Some(pw))
-    };
-    let conn =
-        connections::create(&st, input(engine, port, Env::Production, &file), password).unwrap();
-    Ctx {
-        _dir: dir,
-        st,
-        conn,
-        label: label.into(),
+        common::ctx(
+            label,
+            input(engine, port, Env::Production, Path::new("")),
+            Some(common::rw_password()),
+        )
     }
 }
 
 fn prod(engine: Engine, port: u16) -> Vec<Ctx> {
-    NET.iter()
-        .filter(|(_, e, p)| *e == engine && (port == 0 || *p == port))
-        .map(|(l, e, p)| prod_ctx(l, *e, *p))
+    common::sqlnet()
+        .into_iter()
+        .filter(|n| n.engine == engine && (port == 0 || n.port == port))
+        .map(|n| prod_ctx(n.label, n.engine, n.port))
         .collect()
 }
 
 fn prod_all() -> Vec<Ctx> {
-    let mut v: Vec<Ctx> = NET.iter().map(|(l, e, p)| prod_ctx(l, *e, *p)).collect();
+    let mut v: Vec<Ctx> = common::sqlnet()
+        .into_iter()
+        .map(|n| prod_ctx(n.label, n.engine, n.port))
+        .collect();
     v.push(prod_ctx("sqlite", Engine::Sqlite, 0));
     v
 }
 
-fn scratch() -> String {
-    format!(
-        "it_ses_{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..12]
-    )
-}
-
 fn req(c: &Ctx, sql: &str, tab_id: Option<&str>) -> RunRequest {
-    RunRequest {
-        conn_id: c.conn.id.clone(),
-        database: None,
-        sql: sql.into(),
-        query_id: uuid::Uuid::new_v4().to_string(),
-        limit: None,
-        tab_id: tab_id.map(str::to_string),
-        sort: None,
-    }
+    let mut r = common::req(&c.conn, sql);
+    r.tab_id = tab_id.map(str::to_string);
+    r
 }
 
 /// A run inside the tab's production session (manual commit).
 async fn run_tab(c: &Ctx, sql: &str, tab: &str) -> Result<QueryRun, AppError> {
-    query::run(&c.st, req(c, sql, Some(tab))).await
+    ops::run_query(&c.st, req(c, sql, Some(tab))).await
 }
 
 async fn run_tab_ok(c: &Ctx, sql: &str, tab: &str) -> QueryRun {
@@ -164,7 +95,7 @@ async fn run_tab_ok(c: &Ctx, sql: &str, tab: &str) -> QueryRun {
 
 /// A run outside any tab session: another session of the same user.
 async fn run_other(c: &Ctx, sql: &str) -> QueryRun {
-    query::run(&c.st, req(c, sql, None))
+    ops::run_query(&c.st, req(c, sql, None))
         .await
         .unwrap_or_else(|e| panic!("{}: other-session `{sql}` failed: {e:?}", c.label))
 }
@@ -184,15 +115,47 @@ async fn rollback(c: &Ctx, tab: &str) -> Result<(), AppError> {
 }
 
 fn cell(r: &QueryRun, row: usize, col: usize) -> serde_json::Value {
-    r.statements.last().unwrap().rows[row][col].clone()
+    common::cell(r, row, col)
+}
+
+/// Waits until `tab` is a live session with work, instead of sleeping a guessed interval.
+async fn wait_pending(c: &Ctx, tab: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !c.st.sessions().pending_tab_ids().iter().any(|t| t == tab) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{}: tab {tab} never became pending",
+            c.label
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits until the run/save with `query_id` is registered, then cancels it.
+async fn cancel_started(c: &Ctx, query_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while ops::query_progress(&c.st, query_id).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{}: {query_id} never started",
+            c.label
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    ops::cancel_query(&c.st, query_id)
+        .await
+        .expect("cancel the save");
 }
 
 /// Creates the scratch table outside a session (autocommit), and drops it at the end of `body`.
 async fn with_scratch(c: &Ctx, body: impl AsyncFnOnce(&Ctx, &str)) {
-    let t = scratch();
+    let t = common::scratch();
     run_other(c, &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)")).await;
     body(c, &t).await;
-    let _ = run_other(c, &format!("DROP TABLE IF EXISTS {t}")).await;
+    // A failed drop is a test failure; during unwinding it would abort the process.
+    if !std::thread::panicking() {
+        run_other(c, &format!("DROP TABLE IF EXISTS {t}")).await;
+    }
 }
 
 /// The core guarantee of manual commit: a write in tab A is invisible to another session
@@ -250,9 +213,9 @@ async fn write_is_invisible_until_commit_and_rollback_discards() {
 /// the user commits after run 3+.
 #[tokio::test]
 async fn session_survives_several_runs() {
-    for c in prod(Engine::Pg, PG16)
+    for c in prod(Engine::Pg, common::pg16())
         .into_iter()
-        .chain(prod(Engine::Mysql, MYSQL))
+        .chain(prod(Engine::Mysql, common::mysql()))
         .chain(std::iter::once(prod_ctx("sqlite", Engine::Sqlite, 0)))
     {
         let l = &c.label;
@@ -300,9 +263,9 @@ async fn session_survives_several_runs() {
 /// result must carry the notice.
 #[tokio::test]
 async fn mysql_ddl_commits_implicitly() {
-    for c in prod(Engine::Mysql, MYSQL)
+    for c in prod(Engine::Mysql, common::mysql())
         .into_iter()
-        .chain(prod(Engine::Mysql, MARIADB))
+        .chain(prod(Engine::Mysql, common::mariadb()))
     {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
@@ -338,7 +301,7 @@ async fn mysql_ddl_commits_implicitly() {
 /// stays open (Rollback available), and Rolling back restores it.
 #[tokio::test]
 async fn pg_aborted_transaction_keeps_rollback_available() {
-    for c in prod(Engine::Pg, PG16).into_iter() {
+    for c in prod(Engine::Pg, common::pg16()).into_iter() {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
             run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
@@ -371,7 +334,7 @@ async fn pg_aborted_transaction_keeps_rollback_available() {
 /// the next write would autocommit silently.
 #[tokio::test]
 async fn user_typed_commit_inside_a_run_is_seen() {
-    for c in prod(Engine::Pg, PG16).into_iter() {
+    for c in prod(Engine::Pg, common::pg16()).into_iter() {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
             run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1); COMMIT"), "tab").await;
@@ -421,11 +384,11 @@ async fn clean_runs_leave_no_transaction() {
 /// `close_tab_session` discards the pending work (rollback on close).
 #[tokio::test]
 async fn close_session_discards_pending_work() {
-    for c in prod(Engine::Pg, PG16).into_iter() {
+    for c in prod(Engine::Pg, common::pg16()).into_iter() {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
             run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
-            c.st.sessions.close("tab").await;
+            c.st.sessions().close("tab").await;
             assert_eq!(status(c, "tab").await, None, "{l}: session was not dropped");
             let other = run_other(c, &format!("SELECT count(*) AS n FROM {t}")).await;
             assert_eq!(
@@ -444,7 +407,7 @@ async fn close_session_discards_pending_work() {
 /// Commit / rollback on a tab with no open transaction is a clear error, not a silent no-op.
 #[tokio::test]
 async fn commit_and_rollback_need_an_open_transaction() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     for r in [commit(&c, "none").await, rollback(&c, "none").await] {
         let e = r.unwrap_err();
         assert_eq!(e.code, ErrorCode::NotFound, "{e:?}");
@@ -458,7 +421,7 @@ async fn commit_and_rollback_need_an_open_transaction() {
 /// Switching the tab's database closes the old session (its pending work rolls back).
 #[tokio::test]
 async fn switching_database_rolls_back_the_old_session() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     let l = &c.label;
     with_scratch(&c, async |c: &Ctx, t: &str| {
         run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
@@ -466,7 +429,7 @@ async fn switching_database_rolls_back_the_old_session() {
         // insert is rolled back when the old session dies.
         let mut r = req(c, "SELECT 1", Some("tab"));
         r.database = Some("shop_staging".into());
-        query::run(&c.st, r)
+        ops::run_query(&c.st, r)
             .await
             .unwrap_or_else(|e| panic!("{l}: run on the new target failed: {e:?}"));
         let other = run_other(c, &format!("SELECT count(*) AS n FROM {t}")).await;
@@ -482,7 +445,7 @@ async fn switching_database_rolls_back_the_old_session() {
 /// A write in tab A is invisible to tab B on the same connection: separate sessions.
 #[tokio::test]
 async fn tabs_on_one_connection_have_separate_sessions() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     let l = &c.label;
     with_scratch(&c, async |c: &Ctx, t: &str| {
         run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab-a").await;
@@ -507,13 +470,9 @@ async fn tabs_on_one_connection_have_separate_sessions() {
 /// Non-Production connections keep phase-2 autocommit behaviour even when a run names a tab.
 #[tokio::test]
 async fn non_production_runs_stay_autocommit() {
-    let (dir, st) = state();
-    let (_, pw) = rw();
-    let conn = connections::create(
-        &st,
-        input(Engine::Pg, PG16, Env::Local, &PathBuf::new()),
-        Some(pw),
-    )
+    let (dir, st) = common::state();
+    let pw = common::rw_password();
+    let conn = st.create_connection(input(Engine::Pg, common::pg16(), Env::Local, Path::new("")), Some(pw), )
     .unwrap();
     let c = Ctx {
         _dir: dir,
@@ -521,12 +480,9 @@ async fn non_production_runs_stay_autocommit() {
         conn,
         label: "pg16-local".into(),
     };
-    let t = scratch();
+    let t = common::scratch();
     run_other(&c, &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)")).await;
-    query::run(
-        &c.st,
-        req(&c, &format!("INSERT INTO {t} VALUES (1, 1)"), Some("tab")),
-    )
+    ops::run_query(&c.st, req(&c, &format!("INSERT INTO {t} VALUES (1, 1)"), Some("tab")), )
     .await
     .unwrap();
     let other = run_other(&c, &format!("SELECT count(*) AS n FROM {t}")).await;
@@ -543,11 +499,11 @@ async fn non_production_runs_stay_autocommit() {
 /// work, writes are refused by the read-only pre-check.
 #[tokio::test]
 async fn production_read_only_never_opens_a_session() {
-    let (dir, st) = state();
-    let (_, pw) = rw();
-    let mut i = input(Engine::Pg, PG16, Env::Production, &PathBuf::new());
+    let (dir, st) = common::state();
+    let pw = common::rw_password();
+    let mut i = input(Engine::Pg, common::pg16(), Env::Production, Path::new(""));
     i.read_only = true;
-    let conn = connections::create(&st, i, Some(pw)).unwrap();
+    let conn = st.create_connection(i, Some(pw)).unwrap();
     let c = Ctx {
         _dir: dir,
         st,
@@ -575,7 +531,7 @@ async fn production_read_only_never_opens_a_session() {
 /// uncommitted rows.
 #[tokio::test]
 async fn load_more_reruns_inside_the_tab_session() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     let l = &c.label;
     with_scratch(&c, async |c: &Ctx, t: &str| {
         run_other(
@@ -586,12 +542,12 @@ async fn load_more_reruns_inside_the_tab_session() {
         run_tab_ok(c, &format!("INSERT INTO {t} VALUES (6, 6)"), "tab").await;
         let mut r = req(c, &format!("SELECT id FROM {t} ORDER BY id"), Some("tab"));
         r.limit = Some(3);
-        let first = query::run(&c.st, r).await.unwrap();
+        let first = ops::run_query(&c.st, r).await.unwrap();
         assert!(first.statements[0].truncated, "{l}");
         // "Load more" is the same read at a higher limit, in the same session.
         let mut r = req(c, &format!("SELECT id FROM {t} ORDER BY id"), Some("tab"));
         r.limit = Some(100);
-        let more = query::run(&c.st, r).await.unwrap();
+        let more = ops::run_query(&c.st, r).await.unwrap();
         assert_eq!(
             more.statements[0].row_count, 6,
             "{l}: the uncommitted row is missing"
@@ -599,7 +555,7 @@ async fn load_more_reruns_inside_the_tab_session() {
         // Another session pages the same table but never sees row 6.
         let mut r = req(c, &format!("SELECT id FROM {t} ORDER BY id"), None);
         r.limit = Some(100);
-        let outside = query::run(&c.st, r).await.unwrap();
+        let outside = ops::run_query(&c.st, r).await.unwrap();
         assert_eq!(outside.statements[0].row_count, 5, "{l}");
         rollback(c, "tab").await.unwrap();
     })
@@ -610,7 +566,7 @@ async fn load_more_reruns_inside_the_tab_session() {
 /// cutting the connection off: the pending work survives and Commit still lands it.
 #[tokio::test]
 async fn limited_read_keeps_pending_work_committable() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     let l = &c.label;
     with_scratch(&c, async |c: &Ctx, t: &str| {
         run_other(
@@ -621,7 +577,7 @@ async fn limited_read_keeps_pending_work_committable() {
         run_tab_ok(c, &format!("INSERT INTO {t} VALUES (6, 6)"), "tab").await;
         let mut r = req(c, &format!("SELECT id FROM {t} ORDER BY id"), Some("tab"));
         r.limit = Some(3);
-        let r = query::run(&c.st, r).await.unwrap();
+        let r = ops::run_query(&c.st, r).await.unwrap();
         assert!(r.statements[0].truncated, "{l}");
         assert_eq!(r.statements[0].row_count, 3, "{l}");
         // The drain left the transaction usable: the write is still pending and commits.
@@ -637,7 +593,7 @@ async fn limited_read_keeps_pending_work_committable() {
 /// does not.
 #[tokio::test]
 async fn export_reads_inside_the_tab_transaction() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     let l = &c.label;
     with_scratch(&c, async |c: &Ctx, t: &str| {
         run_other(c, &format!("INSERT INTO {t} VALUES (1, 1)")).await;
@@ -645,7 +601,7 @@ async fn export_reads_inside_the_tab_transaction() {
 
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("inside.csv");
-        let r = export::export_csv(
+        let r = ops::export_csv(
             &c.st,
             ExportRequest {
                 conn_id: c.conn.id.clone(),
@@ -660,7 +616,7 @@ async fn export_reads_inside_the_tab_transaction() {
         assert_eq!(r.rows, 2, "{l}: the export must include the pending row");
 
         let file2 = dir.path().join("outside.csv");
-        let r = export::export_csv(
+        let r = ops::export_csv(
             &c.st,
             ExportRequest {
                 conn_id: c.conn.id.clone(),
@@ -681,20 +637,27 @@ async fn export_reads_inside_the_tab_transaction() {
 /// Bound for a call that must not hang (pool close waiting on a lent-out connection).
 const NO_HANG: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Editing or deleting a connection with a live tab session neither hangs nor commits: the
-/// session closes first (rolling back), then the pool.
+/// Renaming a connection keeps a live tab session (its transaction stays open). An edit that
+/// reconnects, or a delete, neither hangs nor commits: the session closes first (rolling back),
+/// then the pool.
 #[tokio::test]
 async fn conn_edit_and_delete_with_a_live_session_do_not_hang() {
-    for c in prod(Engine::Pg, PG16)
+    for c in prod(Engine::Pg, common::pg16())
         .into_iter()
-        .chain(prod(Engine::Mysql, MYSQL))
+        .chain(prod(Engine::Mysql, common::mysql()))
     {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
             run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
-            let mut i = input(c.conn.engine, c.conn.port, Env::Production, &PathBuf::new());
+            let mut i = input(c.conn.engine, c.conn.port, Env::Production, Path::new(""));
             i.name = format!("{} edited", c.conn.name);
-            tokio::time::timeout(NO_HANG, connections::update(&c.st, &c.conn.id, i, None))
+            c.st.update_connection(&c.conn.id, i.clone(), None).await.unwrap();
+            assert!(
+                status(c, "tab").await.is_some(),
+                "{l}: a rename closed the session"
+            );
+            let pw = Some(common::rw_password());
+            tokio::time::timeout(NO_HANG, c.st.update_connection(&c.conn.id, i, pw))
                 .await
                 .unwrap_or_else(|_| panic!("{l}: update hung on the live session"))
                 .unwrap();
@@ -709,15 +672,15 @@ async fn conn_edit_and_delete_with_a_live_session_do_not_hang() {
         .await;
         // Delete with a pending write in a session (on a table that is gone afterwards: the
         // scratch table is dropped through a second connection first).
-        let t = scratch();
+        let t = common::scratch();
         run_other(&c, &format!("CREATE TABLE {t} (id int PRIMARY KEY)")).await;
         run_tab_ok(&c, &format!("INSERT INTO {t} VALUES (1)"), "tab").await;
         let other = prod_ctx(&c.label, c.conn.engine, c.conn.port);
-        tokio::time::timeout(NO_HANG, connections::delete(&c.st, &c.conn.id))
+        tokio::time::timeout(NO_HANG, c.st.delete_connection(&c.conn.id))
             .await
             .unwrap_or_else(|_| panic!("{l}: delete hung on the live session"))
             .unwrap();
-        assert!(c.st.sessions.pending_tab_ids().is_empty(), "{l}");
+        assert!(c.st.sessions().pending_tab_ids().is_empty(), "{l}");
         let r = run_other(&other, &format!("SELECT count(*) AS n FROM {t}")).await;
         assert_eq!(cell(&r, 0, 0), json!(0), "{l}: the delete committed");
         run_other(&other, &format!("DROP TABLE {t}")).await;
@@ -728,24 +691,25 @@ async fn conn_edit_and_delete_with_a_live_session_do_not_hang() {
 /// hands back dies instead of returning as a ghost on the old settings.
 #[tokio::test]
 async fn conn_edit_during_a_run_leaves_no_ghost() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     let l = &c.label;
     with_scratch(&c, async |c: &Ctx, t: &str| {
         run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
         let (run, edit) = tokio::join!(run_tab(c, "SELECT pg_sleep(1.5)", "tab"), async {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            wait_pending(c, "tab").await;
             assert_eq!(
-                c.st.sessions.pending_tab_ids(),
+                c.st.sessions().pending_tab_ids(),
                 vec!["tab".to_string()],
                 "{l}: a running tab must count as pending"
             );
-            let i = input(Engine::Pg, PG16, Env::Production, &PathBuf::new());
-            tokio::time::timeout(NO_HANG, connections::update(&c.st, &c.conn.id, i, None)).await
+            let i = input(Engine::Pg, common::pg16(), Env::Production, Path::new(""));
+            let pw = Some(common::rw_password());
+            tokio::time::timeout(NO_HANG, c.st.update_connection(&c.conn.id, i, pw)).await
         });
         run.unwrap_or_else(|e| panic!("{l}: run failed: {e:?}"));
         edit.unwrap_or_else(|_| panic!("{l}: update hung")).unwrap();
         assert!(
-            !c.st.sessions.has("tab"),
+            !c.st.sessions().has("tab"),
             "{l}: ghost session after the run"
         );
         let other = run_other(c, &format!("SELECT count(*) AS n FROM {t}")).await;
@@ -762,17 +726,17 @@ async fn conn_edit_during_a_run_leaves_no_ghost() {
 /// work is rolled back, and the tab works again with a fresh session.
 #[tokio::test]
 async fn close_during_a_run_leaves_no_ghost() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     let l = &c.label;
     with_scratch(&c, async |c: &Ctx, t: &str| {
         run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
         let (run, ()) = tokio::join!(run_tab(c, "SELECT pg_sleep(1)", "tab"), async {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            c.st.sessions.close("tab").await;
+            wait_pending(c, "tab").await;
+            c.st.sessions().close("tab").await;
         });
         run.unwrap_or_else(|e| panic!("{l}: run failed: {e:?}"));
         assert!(
-            !c.st.sessions.has("tab"),
+            !c.st.sessions().has("tab"),
             "{l}: ghost session after the run"
         );
         let other = run_other(c, &format!("SELECT count(*) AS n FROM {t}")).await;
@@ -789,9 +753,9 @@ async fn close_during_a_run_leaves_no_ghost() {
 /// works instead of reporting "in use by another run".
 #[tokio::test]
 async fn failed_commit_frees_the_tab() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
     let l = &c.label;
-    let t = scratch();
+    let t = common::scratch();
     run_other(
         &c,
         &format!("CREATE TABLE {t} (id int UNIQUE DEFERRABLE INITIALLY DEFERRED)"),
@@ -801,7 +765,7 @@ async fn failed_commit_frees_the_tab() {
     let e = commit(&c, "tab").await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Database, "{l}: {e:?}");
     assert!(
-        !c.st.sessions.has("tab"),
+        !c.st.sessions().has("tab"),
         "{l}: stale slot after the failed commit"
     );
     run_tab_ok(&c, &format!("INSERT INTO {t} VALUES (2)"), "tab").await;
@@ -846,9 +810,9 @@ async fn write_after_a_typed_commit_stays_pending() {
 /// instead of autocommitting.
 #[tokio::test]
 async fn mysql_write_after_implicit_commit_stays_pending() {
-    for c in prod(Engine::Mysql, MYSQL)
+    for c in prod(Engine::Mysql, common::mysql())
         .into_iter()
-        .chain(prod(Engine::Mysql, MARIADB))
+        .chain(prod(Engine::Mysql, common::mariadb()))
     {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
@@ -896,9 +860,9 @@ async fn mysql_write_after_implicit_commit_stays_pending() {
 /// size neither stall nor block a pooled read.
 #[tokio::test]
 async fn many_open_transactions_do_not_exhaust_the_pool() {
-    for c in prod(Engine::Pg, PG16)
+    for c in prod(Engine::Pg, common::pg16())
         .into_iter()
-        .chain(prod(Engine::Mysql, MYSQL))
+        .chain(prod(Engine::Mysql, common::mysql()))
     {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
@@ -924,13 +888,9 @@ async fn many_open_transactions_do_not_exhaust_the_pool() {
 
 /// A Local connection on `engine`; the save runs in autocommit, no tab session.
 fn local_ctx(label: &str, engine: Engine, port: u16) -> Ctx {
-    let (dir, st) = state();
-    let (_, pw) = rw();
-    let conn = connections::create(
-        &st,
-        input(engine, port, Env::Local, &PathBuf::new()),
-        Some(pw),
-    )
+    let (dir, st) = common::state();
+    let pw = common::rw_password();
+    let conn = st.create_connection(input(engine, port, Env::Local, Path::new("")), Some(pw), )
     .unwrap();
     Ctx {
         _dir: dir,
@@ -942,10 +902,11 @@ fn local_ctx(label: &str, engine: Engine, port: u16) -> Ctx {
 
 /// A direct PG connection that holds a row lock, so a save's statement waits for it.
 async fn locker() -> sqlx::PgConnection {
-    let (user, pw) = rw();
+    let user = common::rw_user();
+    let pw = common::rw_password();
     let opts = sqlx::postgres::PgConnectOptions::new()
         .host("127.0.0.1")
-        .port(PG16)
+        .port(common::pg16())
         .username(&user)
         .password(&pw)
         .database("shop");
@@ -975,20 +936,16 @@ fn save(c: &Ctx, table: &str, new: &str, id: Option<&str>, tab: Option<&str>) ->
             kind: EditKind::Update,
             pk: BTreeMap::from([("id".into(), json!(1))]),
             set: BTreeMap::from([("v".into(), json!(new))]),
-            old: BTreeMap::from([("v".into(), json!("a"))]),
+            old: BTreeMap::from([("v".into(), TypedValue { ty: "string".into(), value: Some("a".into()) })]),
             document: None,
         }],
     }
 }
 
-fn value_of(r: &QueryRun) -> serde_json::Value {
-    cell(r, 0, 0)
-}
-
 #[tokio::test]
 async fn a_cancelled_save_rolls_back_and_needs_no_reconnect() {
-    let c = local_ctx("pg16", Engine::Pg, PG16);
-    let t = scratch();
+    let c = local_ctx("pg16", Engine::Pg, common::pg16());
+    let t = common::scratch();
     run_other(
         &c,
         &format!("CREATE TABLE {t} (id int PRIMARY KEY, v text)"),
@@ -1004,29 +961,26 @@ async fn a_cancelled_save_rolls_back_and_needs_no_reconnect() {
         .unwrap();
 
     let id = uuid::Uuid::new_v4().to_string();
-    let saving = edit::apply_edits(&c.st, save(&c, &t, "b", Some(&id), None));
-    let cancelling = async {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        query::cancel(&c.st, &id).await.expect("cancel the save");
-    };
+    let saving = ops::apply_edits(&c.st, save(&c, &t, "b", Some(&id), None));
+    let cancelling = async { cancel_started(&c, &id).await };
     let (r, ()) = tokio::join!(saving, cancelling);
     let e = r.expect_err("the blocked save must be cancelled");
     assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
 
     sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
     assert_eq!(
-        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        common::cell(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await, 0, 0),
         json!("a"),
         "a cancelled save leaves no change"
     );
 
     // The cancelled statement's connection was closed, not returned: the pool opens a new one.
-    let ok = edit::apply_edits(&c.st, save(&c, &t, "b", None, None))
+    let ok = ops::apply_edits(&c.st, save(&c, &t, "b", None, None))
         .await
         .expect("the next save works");
     assert!(ok.failed.is_none(), "{ok:?}");
     assert_eq!(
-        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        common::cell(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await, 0, 0),
         json!("b")
     );
     run_other(&c, &format!("DROP TABLE {t}")).await;
@@ -1034,8 +988,8 @@ async fn a_cancelled_save_rolls_back_and_needs_no_reconnect() {
 
 #[tokio::test]
 async fn a_cancelled_save_keeps_the_tab_transaction() {
-    let c = prod_ctx("pg16", Engine::Pg, PG16);
-    let t = scratch();
+    let c = prod_ctx("pg16", Engine::Pg, common::pg16());
+    let t = common::scratch();
     run_other(
         &c,
         &format!("CREATE TABLE {t} (id int PRIMARY KEY, v text)"),
@@ -1050,15 +1004,12 @@ async fn a_cancelled_save_keeps_the_tab_transaction() {
         .await
         .unwrap();
 
-    let tab = scratch();
+    let tab = common::scratch();
     // The user has uncommitted work in the tab: the cancelled save must not lose it.
     run_tab_ok(&c, &format!("INSERT INTO {t} VALUES (2, 'tab')"), &tab).await;
     let id = uuid::Uuid::new_v4().to_string();
-    let saving = edit::apply_edits(&c.st, save(&c, &t, "b", Some(&id), Some(&tab)));
-    let cancelling = async {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        query::cancel(&c.st, &id).await.expect("cancel the save");
-    };
+    let saving = ops::apply_edits(&c.st, save(&c, &t, "b", Some(&id), Some(&tab)));
+    let cancelling = async { cancel_started(&c, &id).await };
     let (r, ()) = tokio::join!(saving, cancelling);
     let e = r.expect_err("the blocked save must be cancelled");
     assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
@@ -1068,29 +1019,29 @@ async fn a_cancelled_save_keeps_the_tab_transaction() {
     assert!(st.open && st.tx_open && st.pending && !st.aborted, "{st:?}");
     let inside = run_tab_ok(&c, &format!("SELECT v FROM {t} WHERE id = 2"), &tab).await;
     assert_eq!(
-        value_of(&inside),
+        common::cell(&inside, 0, 0),
         json!("tab"),
         "the tab's own write survives"
     );
 
     sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
     assert_eq!(
-        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        common::cell(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await, 0, 0),
         json!("a"),
         "a cancelled save leaves no change"
     );
 
-    let ok = edit::apply_edits(&c.st, save(&c, &t, "c", None, Some(&tab)))
+    let ok = ops::apply_edits(&c.st, save(&c, &t, "c", None, Some(&tab)))
         .await
         .expect("the next save in the tab works");
     assert!(ok.failed.is_none(), "{ok:?}");
     commit(&c, &tab).await.expect("commit the tab");
     assert_eq!(
-        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        common::cell(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await, 0, 0),
         json!("c")
     );
     assert_eq!(
-        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 2")).await),
+        common::cell(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 2")).await, 0, 0),
         json!("tab")
     );
     run_other(&c, &format!("DROP TABLE {t}")).await;
@@ -1099,7 +1050,7 @@ async fn a_cancelled_save_keeps_the_tab_transaction() {
 #[tokio::test]
 async fn a_cancelled_save_keeps_a_sqlite_tab_transaction() {
     let c = prod_ctx("sqlite", Engine::Sqlite, 0);
-    let t = scratch();
+    let t = common::scratch();
     run_other(
         &c,
         &format!("CREATE TABLE {t} (id int PRIMARY KEY, v text)"),
@@ -1109,8 +1060,8 @@ async fn a_cancelled_save_keeps_a_sqlite_tab_transaction() {
 
     // The tab's own write goes to a TEMP table: it keeps the transaction non-empty without
     // holding the main database's write lock.
-    let work = scratch();
-    let tab = scratch();
+    let work = common::scratch();
+    let tab = common::scratch();
     run_tab_ok(&c, &format!("CREATE TEMP TABLE {work} (x int)"), &tab).await;
     run_tab_ok(&c, &format!("INSERT INTO {work} VALUES (1)"), &tab).await;
 
@@ -1127,11 +1078,8 @@ async fn a_cancelled_save_keeps_a_sqlite_tab_transaction() {
         .unwrap();
 
     let id = uuid::Uuid::new_v4().to_string();
-    let saving = edit::apply_edits(&c.st, save(&c, &t, "b", Some(&id), Some(&tab)));
-    let cancelling = async {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        query::cancel(&c.st, &id).await.expect("cancel the save");
-    };
+    let saving = ops::apply_edits(&c.st, save(&c, &t, "b", Some(&id), Some(&tab)));
+    let cancelling = async { cancel_started(&c, &id).await };
     let (r, ()) = tokio::join!(saving, cancelling);
     let e = r.expect_err("the blocked save must be cancelled");
     assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
@@ -1140,20 +1088,20 @@ async fn a_cancelled_save_keeps_a_sqlite_tab_transaction() {
     let st = status(&c, &tab).await.expect("the tab session");
     assert!(st.open && st.tx_open && st.pending && !st.aborted, "{st:?}");
     let inside = run_tab_ok(&c, &format!("SELECT count(*) FROM {work}"), &tab).await;
-    assert_eq!(value_of(&inside), json!(1), "the tab's own write survives");
+    assert_eq!(common::cell(&inside, 0, 0), json!(1), "the tab's own write survives");
 
     sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
     assert_eq!(
-        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        common::cell(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await, 0, 0),
         json!("a"),
         "a cancelled save leaves no change"
     );
-    edit::apply_edits(&c.st, save(&c, &t, "c", None, Some(&tab)))
+    ops::apply_edits(&c.st, save(&c, &t, "c", None, Some(&tab)))
         .await
         .expect("the next save in the tab works");
     commit(&c, &tab).await.expect("commit the tab");
     assert_eq!(
-        value_of(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await),
+        common::cell(&run_other(&c, &format!("SELECT v FROM {t} WHERE id = 1")).await, 0, 0),
         json!("c")
     );
     run_other(&c, &format!("DROP TABLE {t}")).await;

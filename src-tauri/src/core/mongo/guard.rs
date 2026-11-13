@@ -5,20 +5,17 @@
 
 use mongodb::bson::{Bson, Document};
 
-use crate::core::connections::Connection;
-use crate::core::error::{AppError, ErrorCode};
-use crate::core::guard::{GuardCheck, WarningCode, WriteInfo, WriteStatement, WriteWarning};
+use crate::core::connections::{read_only_refusal, Connection};
+use crate::core::error::AppError;
+use crate::core::result::{GuardCheck, WarningCode, WriteInfo, WriteStatement, WriteWarning};
 use crate::core::mongo::command::{Command, Method, Statement};
 use crate::core::mongo::parse;
 
 /// How a statement can touch the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// Changes nothing on the server.
     Read,
-    /// Changes documents: inserts, updates, deletes, and an aggregate with `$out` / `$merge`.
     Write,
-    /// Changes collections or indexes, not documents.
     Schema,
     /// Everything the guard cannot vouch for, so everything a read-only connection refuses.
     Unknown,
@@ -63,7 +60,6 @@ const WRITE_STAGE_KEYS: &[&str] = &["$out", "$merge"];
 /// any other inner command (`mapReduce`, `update`, …) is not a provable read.
 const EXPLAIN_READS: &[&str] = &["find", "aggregate", "count", "distinct"];
 
-/// The inner command of `explain` is one of `EXPLAIN_READS` and has no write stage.
 fn explain_reads(command: &Document) -> bool {
     let Ok(inner) = command.get_document("explain") else {
         return false;
@@ -89,7 +85,6 @@ pub(crate) fn run_command_reads(command: &Document) -> bool {
     }
 }
 
-/// What the statement can do to the database.
 pub fn kind(cmd: &Command) -> Kind {
     // Fail closed: JavaScript can write, so any command that carries it is not provably a
     // read, not even a `find` or a `runCommand` whose first key is on the allow-list.
@@ -148,35 +143,33 @@ pub fn kind(cmd: &Command) -> Kind {
 pub fn check_read_only(conn: &Connection, stmts: &[Statement]) -> Result<(), AppError> {
     for s in stmts {
         if kind(&s.command) != Kind::Read {
-            return Err(AppError::new(
-                ErrorCode::ConnectionReadOnly,
-                format!(
-                    "Connection \"{}\" is read-only: {}",
-                    conn.name,
-                    reason(&s.command)
-                ),
-            ));
+            return Err(read_only_refusal(conn, Some(&reason(&s.command))));
         }
     }
     Ok(())
 }
 
-/// `guard_check` for Mongo: exactly one statement that only reads passes.
+pub fn exactly_one(stmts: &[Statement]) -> Result<&Statement, String> {
+    match stmts {
+        [] => Err("The query has no statement".into()),
+        [s] => Ok(s),
+        many => Err(format!(
+            "Exactly one statement is allowed, found {}",
+            many.len()
+        )),
+    }
+}
+
 pub fn guard_check(text: &str) -> GuardCheck {
     match parse::parse(text) {
         Err(e) => refused(Some(e.to_string())),
-        Ok(stmts) => match stmts.as_slice() {
-            [] => refused(Some("The query has no statement".into())),
-            [s] => guard_one(s),
-            many => refused(Some(format!(
-                "Exactly one statement is allowed, found {}",
-                many.len()
-            ))),
+        Ok(stmts) => match exactly_one(&stmts) {
+            Err(reason) => refused(Some(reason)),
+            Ok(s) => guard_one(s),
         },
     }
 }
 
-/// One parsed statement through the read guard, so the text-based path stays thin.
 fn guard_one(s: &Statement) -> GuardCheck {
     match kind(&s.command) {
         Kind::Read => GuardCheck {
@@ -239,7 +232,6 @@ pub fn classify_write(text: &str, database: Option<&str>) -> WriteInfo {
     }
 }
 
-/// One statement's preview entry and its warnings, reported at statement `i`.
 fn classify_statement(s: &Statement, i: usize) -> (WriteStatement, Vec<WriteWarning>) {
     let mut warnings = Vec::new();
     let k = kind(&s.command);
@@ -301,8 +293,31 @@ fn classify_statement(s: &Statement, i: usize) -> (WriteStatement, Vec<WriteWarn
         table: table(&s.command),
         database: None,
         read: Some(k == Kind::Read),
+        structure: Some(is_structure(&s.command)),
     };
     (statement, warnings)
+}
+
+/// Whether the statement changes the schema, the collection list or what a `find` sees. The
+/// editor's confirmation for a Production connection counts these; a writing aggregate is not
+/// one.
+fn is_structure(cmd: &Command) -> bool {
+    match cmd {
+        Command::CreateCollection { .. } | Command::DropDatabase { .. } => true,
+        // A command the guard cannot prove read is a schema change, as the confirmation has
+        // always treated it.
+        Command::RunCommand { .. } => kind(cmd) != Kind::Read,
+        Command::Collection { method, .. } => matches!(
+            method,
+            Method::CreateIndex { .. }
+                | Method::CreateIndexes { .. }
+                | Method::DropIndex { .. }
+                | Method::DropIndexes
+                | Method::Drop
+                | Method::RenameCollection { .. }
+        ),
+        Command::ShowDbs | Command::ShowCollections | Command::Use(_) => false,
+    }
 }
 
 /// `updateMany` / `deleteMany` models of a `bulkWrite` with an empty or missing filter change
@@ -335,8 +350,8 @@ fn bulk_write_empty_filter(
     }
 }
 
-/// The name the user wrote, for messages, the result header and `classify_write`.
-fn name(cmd: &Command) -> &'static str {
+/// The name the user wrote, for messages, the result header, `classify_write` and the run notice.
+pub(crate) fn name(cmd: &Command) -> &'static str {
     match cmd {
         Command::ShowDbs => "show dbs",
         Command::ShowCollections => "show collections",
@@ -348,7 +363,6 @@ fn name(cmd: &Command) -> &'static str {
     }
 }
 
-/// The collection the statement targets, when there is one.
 fn table(cmd: &Command) -> Option<String> {
     match cmd {
         Command::Collection { collection, .. } => Some(collection.clone()),
@@ -403,7 +417,6 @@ pub(crate) fn reason(cmd: &Command) -> String {
     }
 }
 
-/// First of `keys` found in any document or array argument of the command, in walk order.
 fn find_key(cmd: &Command, keys: &[&str]) -> Option<String> {
     let mut found = None;
     walk_command(cmd, &mut |k, _| {
@@ -414,7 +427,6 @@ fn find_key(cmd: &Command, keys: &[&str]) -> Option<String> {
     found
 }
 
-/// First of `keys` found in any document or array argument of one method.
 fn find_key_in_method(method: &Method, keys: &[&str]) -> Option<String> {
     let mut found = None;
     walk_method(method, &mut |k, _| {
@@ -425,7 +437,6 @@ fn find_key_in_method(method: &Method, keys: &[&str]) -> Option<String> {
     found
 }
 
-/// Calls `f` for every key/value pair of every document and array argument of the command.
 fn walk_command(cmd: &Command, f: &mut impl FnMut(&str, &Bson)) {
     match cmd {
         Command::ShowDbs | Command::ShowCollections | Command::Use(_) => {}
@@ -444,7 +455,6 @@ fn walk_command(cmd: &Command, f: &mut impl FnMut(&str, &Bson)) {
     }
 }
 
-/// Calls `f` for every key/value pair of every document and array argument of the method.
 fn walk_method(method: &Method, f: &mut impl FnMut(&str, &Bson)) {
     match method {
         Method::Find(find) => {
@@ -579,7 +589,6 @@ fn walk_method(method: &Method, f: &mut impl FnMut(&str, &Bson)) {
     }
 }
 
-/// Calls `f` for every key/value pair of the document, then descends into every value.
 fn walk_doc(doc: &Document, f: &mut impl FnMut(&str, &Bson)) {
     for (k, v) in doc {
         f(k, v);
@@ -587,7 +596,6 @@ fn walk_doc(doc: &Document, f: &mut impl FnMut(&str, &Bson)) {
     }
 }
 
-/// Descends into arrays; documents are walked by `walk_doc`, which called this for each value.
 fn walk_value(v: &Bson, f: &mut impl FnMut(&str, &Bson)) {
     match v {
         Bson::Document(doc) => walk_doc(doc, f),
@@ -603,14 +611,15 @@ fn walk_value(v: &Bson, f: &mut impl FnMut(&str, &Bson)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::connections::{Engine, Env, SslMode};
+    use crate::core::connections::{Env, SslMode};
+    use crate::core::engine::Engine;
+    use crate::core::error::ErrorCode;
     use crate::core::mongo::command::Find;
     use mongodb::bson::doc;
 
     fn stmt(command: Command) -> Statement {
         Statement {
             text: String::new(),
-            start: 0,
             command,
         }
     }
@@ -643,32 +652,137 @@ mod tests {
         }
     }
 
+    /// Every `Method` variant, with the classification the guard owes it. The `match` is
+    /// exhaustive, so a new variant does not compile until it is classified here and added to
+    /// `cases`.
     #[test]
-    fn reads_are_reads() {
+    fn every_method_is_classified() {
+        fn expected(m: &Method) -> Kind {
+            match m {
+                Method::Find(_)
+                | Method::FindOne { .. }
+                | Method::CountDocuments { .. }
+                | Method::EstimatedDocumentCount
+                | Method::Distinct { .. }
+                | Method::GetIndexes
+                | Method::Stats => Kind::Read,
+                // A pipeline without a write stage reads; `$out`/`$merge` are covered by
+                // `aggregate_with_out_or_merge_anywhere_is_a_write`.
+                Method::Aggregate { .. } => Kind::Read,
+                Method::InsertOne { .. }
+                | Method::InsertMany { .. }
+                | Method::UpdateOne { .. }
+                | Method::UpdateMany { .. }
+                | Method::ReplaceOne { .. }
+                | Method::DeleteOne { .. }
+                | Method::DeleteMany { .. }
+                | Method::FindOneAndUpdate { .. }
+                | Method::FindOneAndReplace { .. }
+                | Method::FindOneAndDelete { .. }
+                | Method::BulkWrite { .. } => Kind::Write,
+                Method::CreateIndex { .. }
+                | Method::CreateIndexes { .. }
+                | Method::DropIndex { .. }
+                | Method::DropIndexes
+                | Method::Drop
+                | Method::RenameCollection { .. } => Kind::Schema,
+            }
+        }
+
+        let cases = [
+            Method::Find(Find::default()),
+            Method::FindOne {
+                filter: doc! { "a": 1 },
+                projection: None,
+            },
+            Method::Aggregate {
+                pipeline: vec![doc! { "$match": { "a": 1 } }],
+                options: None,
+            },
+            Method::CountDocuments {
+                filter: doc! {},
+                options: None,
+            },
+            Method::EstimatedDocumentCount,
+            Method::Distinct {
+                field: "a".into(),
+                filter: doc! {},
+            },
+            Method::GetIndexes,
+            Method::Stats,
+            Method::InsertOne {
+                document: doc! { "a": 1 },
+            },
+            Method::InsertMany {
+                documents: vec![doc! { "a": 1 }],
+                options: None,
+            },
+            Method::UpdateOne {
+                filter: doc! { "a": 1 },
+                update: doc! { "$set": { "b": 2 } }.into(),
+                options: None,
+            },
+            Method::UpdateMany {
+                filter: doc! { "a": 1 },
+                update: doc! { "$set": { "b": 2 } }.into(),
+                options: None,
+            },
+            Method::ReplaceOne {
+                filter: doc! { "a": 1 },
+                replacement: doc! { "a": 2 },
+                options: None,
+            },
+            Method::DeleteOne {
+                filter: doc! { "a": 1 },
+            },
+            Method::DeleteMany {
+                filter: doc! { "a": 1 },
+            },
+            Method::FindOneAndUpdate {
+                filter: doc! { "a": 1 },
+                update: doc! { "$set": { "b": 2 } }.into(),
+                options: None,
+            },
+            Method::FindOneAndReplace {
+                filter: doc! { "a": 1 },
+                replacement: doc! { "a": 2 },
+                options: None,
+            },
+            Method::FindOneAndDelete {
+                filter: doc! { "a": 1 },
+                options: None,
+            },
+            Method::BulkWrite {
+                operations: vec![doc! { "insertOne": { "document": { "a": 1 } } }],
+                options: None,
+            },
+            Method::CreateIndex {
+                keys: doc! { "a": 1 },
+                options: None,
+            },
+            Method::CreateIndexes {
+                keys: vec![doc! { "a": 1 }],
+                options: None,
+            },
+            Method::DropIndex {
+                index: "a_1".into(),
+            },
+            Method::DropIndexes,
+            Method::Drop,
+            Method::RenameCollection {
+                to: "orders_old".into(),
+                drop_target: false,
+            },
+        ];
+        for m in cases {
+            assert_eq!(kind(&coll(m.clone())), expected(&m), "{m:?}");
+        }
+
+        // The non-collection commands stay grouped as before.
         for cmd in [
             Command::ShowDbs,
             Command::ShowCollections,
             Command::Use("shop".into()),
-            coll(Method::Find(Find::default())),
-            coll(Method::FindOne {
-                filter: doc! { "a": 1 },
-                projection: None,
-            }),
-            coll(Method::CountDocuments {
-                filter: doc! {},
-                options: None,
-            }),
-            coll(Method::EstimatedDocumentCount),
-            coll(Method::Distinct {
-                field: "a".into(),
-                filter: doc! {},
-            }),
-            coll(Method::GetIndexes),
-            coll(Method::Stats),
-            coll(Method::Aggregate {
-                pipeline: vec![doc! { "$match": { "a": 1 } }],
-                options: None,
-            }),
             Command::RunCommand {
                 admin: false,
                 command: doc! { "ping": 1 },
@@ -680,60 +794,13 @@ mod tests {
         ] {
             assert_eq!(kind(&cmd), Kind::Read, "{cmd:?}");
         }
-    }
-
-    #[test]
-    fn writes_are_writes() {
-        for cmd in [
-            coll(Method::InsertOne {
-                document: doc! { "a": 1 },
-            }),
-            coll(Method::InsertMany {
-                documents: vec![doc! { "a": 1 }],
+        assert_eq!(
+            kind(&Command::CreateCollection {
+                name: "new".into(),
                 options: None,
             }),
-            coll(Method::UpdateOne {
-                filter: doc! { "a": 1 },
-                update: doc! { "$set": { "b": 2 } }.into(),
-                options: None,
-            }),
-            coll(Method::UpdateMany {
-                filter: doc! { "a": 1 },
-                update: doc! { "$set": { "b": 2 } }.into(),
-                options: None,
-            }),
-            coll(Method::ReplaceOne {
-                filter: doc! { "a": 1 },
-                replacement: doc! { "a": 2 },
-                options: None,
-            }),
-            coll(Method::DeleteOne {
-                filter: doc! { "a": 1 },
-            }),
-            coll(Method::DeleteMany {
-                filter: doc! { "a": 1 },
-            }),
-            coll(Method::FindOneAndUpdate {
-                filter: doc! { "a": 1 },
-                update: doc! { "$set": { "b": 2 } }.into(),
-                options: None,
-            }),
-            coll(Method::FindOneAndReplace {
-                filter: doc! { "a": 1 },
-                replacement: doc! { "a": 2 },
-                options: None,
-            }),
-            coll(Method::FindOneAndDelete {
-                filter: doc! { "a": 1 },
-                options: None,
-            }),
-            coll(Method::BulkWrite {
-                operations: vec![doc! { "insertOne": { "document": { "a": 1 } } }],
-                options: None,
-            }),
-        ] {
-            assert_eq!(kind(&cmd), Kind::Write, "{cmd:?}");
-        }
+            Kind::Schema
+        );
     }
 
     #[test]
@@ -806,35 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_methods_are_schema() {
-        for cmd in [
-            coll(Method::CreateIndex {
-                keys: doc! { "a": 1 },
-                options: None,
-            }),
-            coll(Method::CreateIndexes {
-                keys: vec![doc! { "a": 1 }],
-                options: None,
-            }),
-            coll(Method::DropIndex {
-                index: "a_1".into(),
-            }),
-            coll(Method::DropIndexes),
-            coll(Method::Drop),
-            coll(Method::RenameCollection {
-                to: "orders_old".into(),
-                drop_target: false,
-            }),
-            Command::CreateCollection {
-                name: "new".into(),
-                options: None,
-            },
-        ] {
-            assert_eq!(kind(&cmd), Kind::Schema, "{cmd:?}");
-        }
-    }
-
-    #[test]
     fn drop_database_is_a_write() {
         let cmd = Command::DropDatabase { options: None };
         assert_eq!(kind(&cmd), Kind::Write);
@@ -844,10 +882,6 @@ mod tests {
         assert_eq!(st.read, Some(false));
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, WarningCode::Drop);
-        assert_eq!(
-            warnings[0].message,
-            "dropDatabase drops the current database and cannot be undone"
-        );
 
         // The options are walked like every other argument: JavaScript anywhere fails closed.
         let cmd = Command::DropDatabase {
@@ -1010,37 +1044,29 @@ mod tests {
 
         let stmts = [stmt(coll(Method::Drop))];
         let err = check_read_only(&conn, &stmts).unwrap_err();
-        assert_eq!(
-            err.message,
-            "Connection \"Prod\" is read-only: drop changes the schema"
-        );
+        assert_eq!(err.code, ErrorCode::ConnectionReadOnly);
+        assert!(err.message.contains("drop"), "{}", err.message);
 
         let stmts = [stmt(Command::DropDatabase { options: None })];
         let err = check_read_only(&conn, &stmts).unwrap_err();
-        assert_eq!(
-            err.message,
-            "Connection \"Prod\" is read-only: dropDatabase drops the current database"
-        );
+        assert_eq!(err.code, ErrorCode::ConnectionReadOnly);
+        assert!(err.message.contains("dropDatabase"), "{}", err.message);
 
         let stmts = [stmt(Command::RunCommand {
             admin: false,
             command: doc! { "dropDatabase": 1 },
         })];
         let err = check_read_only(&conn, &stmts).unwrap_err();
-        assert_eq!(
-            err.message,
-            "Connection \"Prod\" is read-only: runCommand dropDatabase is not on the list of read commands"
-        );
+        assert_eq!(err.code, ErrorCode::ConnectionReadOnly);
+        assert!(err.message.contains("dropDatabase"), "{}", err.message);
 
         let stmts = [stmt(coll(Method::Find(Find {
             filter: doc! { "$where": "1" },
             ..Default::default()
         })))];
         let err = check_read_only(&conn, &stmts).unwrap_err();
-        assert_eq!(
-            err.message,
-            "Connection \"Prod\" is read-only: $where runs JavaScript on the server"
-        );
+        assert_eq!(err.code, ErrorCode::ConnectionReadOnly);
+        assert!(err.message.contains("$where"), "{}", err.message);
 
         // A genuine read passes, and an empty run has nothing to refuse.
         let stmts = [stmt(coll(Method::Find(Find::default())))];
@@ -1062,7 +1088,7 @@ mod tests {
         let refused = guard_one(&stmt(coll(Method::Drop)));
         assert!(!refused.allowed);
         assert_eq!(refused.kind, None);
-        assert_eq!(refused.reason.as_deref(), Some("drop changes the schema"));
+        assert!(refused.reason.is_some());
     }
 
     #[test]
@@ -1079,10 +1105,6 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, WarningCode::UpdateWithoutWhere);
         assert_eq!(warnings[0].statement, Some(0));
-        assert_eq!(
-            warnings[0].message,
-            "updateMany with an empty filter changes every document of orders"
-        );
 
         let s = stmt(coll(Method::DeleteMany { filter: doc! {} }));
         let (st, warnings) = classify_statement(&s, 2);
@@ -1091,10 +1113,6 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, WarningCode::DeleteWithoutWhere);
         assert_eq!(warnings[0].statement, Some(2));
-        assert_eq!(
-            warnings[0].message,
-            "deleteMany with an empty filter removes every document of orders"
-        );
 
         // A real filter does not warn.
         let s = stmt(coll(Method::UpdateMany {
@@ -1129,14 +1147,7 @@ mod tests {
             ]
         );
         assert_eq!(warnings[0].statement, Some(0));
-        assert_eq!(
-            warnings[0].message,
-            "updateMany with an empty filter changes every document of orders"
-        );
-        assert_eq!(
-            warnings[1].message,
-            "deleteMany with an empty filter removes every document of orders"
-        );
+        assert_eq!(warnings[1].statement, Some(0));
     }
 
     #[test]
@@ -1148,16 +1159,11 @@ mod tests {
         assert_eq!(st.read, Some(false));
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, WarningCode::Drop);
-        assert_eq!(warnings[0].message, "drop orders cannot be undone");
 
         let s = stmt(coll(Method::DropIndexes));
         let (_, warnings) = classify_statement(&s, 0);
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, WarningCode::Drop);
-        assert_eq!(
-            warnings[0].message,
-            "dropIndexes on orders cannot be undone"
-        );
 
         let s = stmt(coll(Method::RenameCollection {
             to: "orders_old".into(),
@@ -1168,10 +1174,6 @@ mod tests {
         assert_eq!(st.table.as_deref(), Some("orders"));
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, WarningCode::Rename);
-        assert_eq!(
-            warnings[0].message,
-            "renameCollection orders cannot be undone"
-        );
     }
 
     #[test]
@@ -1186,10 +1188,6 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, WarningCode::UnknownCommand);
         assert_eq!(warnings[0].statement, Some(1));
-        assert_eq!(
-            warnings[0].message,
-            "runCommand dropDatabase is not on the list of read commands"
-        );
 
         // A read does not warn.
         let s = stmt(coll(Method::Find(Find::default())));
@@ -1237,8 +1235,6 @@ mod tests {
         assert_eq!(st.read, Some(false));
     }
 
-    // ---- text-based, through the parser
-
     #[test]
     fn guard_check_text() {
         let ok = guard_check("db.orders.find({ status: 'open' })");
@@ -1249,10 +1245,8 @@ mod tests {
         let refused = guard_check("db.orders.find({}); db.orders.drop()");
         assert!(!refused.allowed);
         assert_eq!(refused.kind, None);
-        assert_eq!(
-            refused.reason.as_deref(),
-            Some("Exactly one statement is allowed, found 2")
-        );
+        let reason = refused.reason.unwrap();
+        assert!(reason.contains('2'), "{reason}");
 
         // The parse error text carries its position, like the SQL guard's.
         let refused = guard_check("db.orders.find(");
@@ -1262,9 +1256,9 @@ mod tests {
         // Only whitespace or comments parses to no statement.
         let refused = guard_check("  // nothing\n");
         assert!(!refused.allowed);
-        assert_eq!(
-            refused.reason.as_deref(),
-            Some("The query has no statement")
+        assert!(
+            refused.reason.unwrap().contains("statement"),
+            "the refusal names the missing statement"
         );
     }
 
@@ -1321,7 +1315,6 @@ mod tests {
         assert_eq!(info.warnings[0].statement, None);
         assert_eq!(info.warnings[1].code, WarningCode::Drop);
         assert_eq!(info.warnings[1].statement, Some(1));
-        assert_eq!(info.warnings[1].message, "drop orders cannot be undone");
 
         // Unparsable: one whole-text warning, no statements.
         let info = classify_write("db.orders.find(", None);

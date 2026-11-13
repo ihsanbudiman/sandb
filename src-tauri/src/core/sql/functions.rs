@@ -1,13 +1,13 @@
 //! Built-in functions that only compute a value from their arguments: no writes, locks,
 //! sequences, session settings, sleeps, file or network access. One list per dialect, shared by
-//! the editor's plain-read check and the AI guard. Names are lowercase and unqualified: a
-//! schema-qualified or quoted-uppercase name never matches, so it counts as unknown.
+//! the editor's plain-read check and the AI guard, plus the [`AMPLIFYING`] overlay the AI read
+//! adds. Names are lowercase and unqualified: a schema-qualified or quoted-uppercase name never
+//! matches, so it counts as unknown.
 
-use crate::core::connections::Engine;
+use crate::core::engine::SqlEngine;
 
 /// Available (and pure) on every engine, or harmless where the engine lacks them.
 const COMMON: &[&str] = &[
-    // aggregates
     "count",
     "sum",
     "avg",
@@ -27,13 +27,11 @@ const COMMON: &[&str] = &[
     "variance",
     "var_pop",
     "var_samp",
-    // conditional
     "coalesce",
     "nullif",
     "ifnull",
     "greatest",
     "least",
-    // string
     "lower",
     "upper",
     "length",
@@ -67,7 +65,6 @@ const COMMON: &[&str] = &[
     "hex",
     "unhex",
     "quote",
-    // math
     "round",
     "floor",
     "ceil",
@@ -99,7 +96,6 @@ const COMMON: &[&str] = &[
     "random",
     "rand",
     "div",
-    // casts and date/time
     "cast",
     "convert",
     "extract",
@@ -118,7 +114,6 @@ const COMMON: &[&str] = &[
     "to_date",
     "to_timestamp",
     "to_number",
-    // JSON
     "json_extract",
     "json_unquote",
     "json_object",
@@ -135,7 +130,6 @@ const COMMON: &[&str] = &[
     "jsonb_build_object",
     "json_build_array",
     "jsonb_build_array",
-    // window
     "row_number",
     "rank",
     "dense_rank",
@@ -147,7 +141,6 @@ const COMMON: &[&str] = &[
     "first_value",
     "last_value",
     "nth_value",
-    // session identity (read only)
     "current_user",
     "session_user",
     "user",
@@ -439,13 +432,30 @@ const SQLITE: &[&str] = &[
     "pragma_foreign_key_list",
 ];
 
-/// `name` (as collected by the facts walker: unquoted parts lowercased) is a pure built-in of `engine`.
-pub fn is_pure(engine: Engine, name: &str) -> bool {
+/// Functions on the allow-list that build arbitrarily large values: the row cap and the
+/// per-cell preview cap are applied after the value is in memory, so `repeat('x', 500000000)`
+/// can exhaust it. The AI read refuses them; the editor still pages and exports such queries.
+const AMPLIFYING: &[&str] = &[
+    "repeat",
+    "lpad",
+    "rpad",
+    "space",
+    "zeroblob",
+    "randomblob",
+    "format",
+    "printf",
+];
+
+/// Whether the AI read refuses this function although [`is_pure`] accepts it.
+pub(crate) fn is_amplifying(name: &str) -> bool {
+    AMPLIFYING.contains(&name)
+}
+
+pub fn is_pure(engine: SqlEngine, name: &str) -> bool {
     let specific = match engine {
-        Engine::Pg => PG,
-        Engine::Mysql => MYSQL,
-        Engine::Sqlite => SQLITE,
-        Engine::Mongo => &[],
+        SqlEngine::Pg => PG,
+        SqlEngine::Mysql => MYSQL,
+        SqlEngine::Sqlite => SQLITE,
     };
     COMMON.contains(&name) || specific.contains(&name)
 }
@@ -496,7 +506,7 @@ mod tests {
     #[test]
     fn no_side_effect_function_is_listed() {
         for f in NEVER {
-            for e in [Engine::Pg, Engine::Mysql, Engine::Sqlite] {
+            for e in [SqlEngine::Pg, SqlEngine::Mysql, SqlEngine::Sqlite] {
                 assert!(!is_pure(e, f), "{f} is listed for {e:?}");
             }
         }

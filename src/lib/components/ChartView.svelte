@@ -1,6 +1,6 @@
 <script lang="ts">
   import { echarts, chartOption, themeColors } from '../charts';
-  import type { ChartPart } from '../chat.svelte';
+  import type { ChartPart } from '../chatModel';
   import { ui } from '../state.svelte';
 
   let { part }: { part: ChartPart } = $props();

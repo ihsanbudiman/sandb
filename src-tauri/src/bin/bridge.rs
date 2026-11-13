@@ -1,59 +1,50 @@
-//! Dev-only HTTP bridge: serves the same core over `127.0.0.1` so the browser UI (Vite) can be
-//! tested end to end without the Tauri shell. Never part of a release build (`dev-bridge` feature).
+//! Dev-only HTTP bridge: serves the same command table over `127.0.0.1` so the browser UI
+//! (Vite) can be tested end to end without the Tauri shell. Never part of a release build
+//! (`dev-bridge` feature). It adds only its own concerns: a bearer token, CORS for the dev
+//! origin, and the chat stream as Server-Sent Events.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Router;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use axum::{Json, Router};
 use serde_json::Value;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use sandb_lib::core::ai::session::{self as chat, ChatEvent, ChatRequest};
-use sandb_lib::core::ai::settings::{self as ai_settings, AiSettings};
-use sandb_lib::core::connections::{self, ConnectionInput, Engine};
-use sandb_lib::core::db::edit::{self, ApplyEditsRequest, CellValueRequest, EditableRequest};
-use sandb_lib::core::db::query::{self, RunRequest};
-use sandb_lib::core::db::readonly::{self, ReadLimits};
-use sandb_lib::core::db::session;
-use sandb_lib::core::db::{dump, introspect};
+use sandb_lib::commands;
+use sandb_lib::core::ai::event::ChatEvent;
+use sandb_lib::core::ai::session as chat;
 use sandb_lib::core::error::{AppError, ErrorCode};
-use sandb_lib::core::guard;
 use sandb_lib::core::secrets::MemoryStore;
 use sandb_lib::core::state::AppState;
 
-const ALLOWED_ORIGIN: &str = "http://localhost:5199";
+// Dev config, one place per side: the TS defaults live in `src/lib/api/devConfig.ts`.
+/// The Vite dev server's port; `vite.config.ts` reads the same variable.
+const DEV_PORT_ENV: &str = "SANDB_DEV_PORT";
+const DEFAULT_DEV_PORT: u16 = 5199;
+/// The bridge's port; it must match the default in `src/lib/api/devConfig.ts`.
+const PORT_ENV: &str = "SANDB_BRIDGE_PORT";
 const DEFAULT_PORT: u16 = 58123;
-
-struct Ctx {
-    state: AppState,
-    token: String,
-}
+/// The bearer token the frontend sends; the client's variable is `VITE_BRIDGE_TOKEN`.
+const TOKEN_ENV: &str = "SANDB_BRIDGE_TOKEN";
 
 #[tokio::main]
 async fn main() {
-    let token = match std::env::var("SANDB_BRIDGE_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => t,
+    let token: Arc<str> = match std::env::var(TOKEN_ENV) {
+        Ok(t) if !t.trim().is_empty() => Arc::from(t),
         _ => {
-            eprintln!("bridge: SANDB_BRIDGE_TOKEN is not set; refusing to start");
+            eprintln!("bridge: {TOKEN_ENV} is not set; refusing to start");
             std::process::exit(2);
         }
     };
-    let port = match std::env::var("SANDB_BRIDGE_PORT") {
-        Ok(p) => p.parse::<u16>().unwrap_or_else(|_| {
-            eprintln!("bridge: SANDB_BRIDGE_PORT must be a port number");
-            std::process::exit(2);
-        }),
-        Err(_) => DEFAULT_PORT,
-    };
+    let port = env_port(PORT_ENV, DEFAULT_PORT);
+    let dev_port = env_port(DEV_PORT_ENV, DEFAULT_DEV_PORT);
     // A temp dir unless told otherwise, so the bridge never touches the app's real data.
     let (data_dir, _tmp_guard) = match std::env::var_os("SANDB_DATA_DIR") {
         Some(d) => (std::path::PathBuf::from(d), None),
@@ -66,22 +57,19 @@ async fn main() {
         eprintln!("bridge: cannot open data dir {}: {e}", data_dir.display());
         std::process::exit(1);
     });
-    let ctx = Arc::new(Ctx { state, token });
 
     let cors = CorsLayer::new()
         // `list` (not a single exact value) so other origins get no allow-origin header at all.
-        .allow_origin(AllowOrigin::list([HeaderValue::from_static(
-            ALLOWED_ORIGIN,
-        )]))
+        .allow_origin(AllowOrigin::list([dev_origin(dev_port)]))
         .allow_methods([Method::POST, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
 
     // CORS is outermost so preflights are answered and even a 401 is readable by the allowed origin.
     let app = Router::new()
-        .route("/api/{command}", post(dispatch))
-        .layer(middleware::from_fn_with_state(ctx.clone(), auth))
+        .route("/api/{command}", post(route))
+        .layer(middleware::from_fn_with_state(token, auth))
         .layer(cors)
-        .with_state(ctx);
+        .with_state(Arc::new(state));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -99,446 +87,124 @@ async fn main() {
         .expect("bridge server failed");
 }
 
+fn env_port(name: &str, default: u16) -> u16 {
+    match std::env::var(name) {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!("bridge: {name} must be a port number");
+            std::process::exit(2);
+        }),
+        Err(_) => default,
+    }
+}
+
+fn dev_origin(dev_port: u16) -> HeaderValue {
+    HeaderValue::from_str(&format!("http://localhost:{dev_port}"))
+        .expect("the dev origin is a valid header value")
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-async fn auth(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Response {
+async fn auth(State(token): State<Arc<str>>, req: Request, next: Next) -> Response {
     let ok = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|t| ct_eq(t.as_bytes(), ctx.token.as_bytes()));
+        .is_some_and(|t| ct_eq(t.as_bytes(), token.as_bytes()));
     if !ok {
-        let body =
-            serde_json::json!({"code": "unauthorized", "message": "Missing or wrong bridge token"});
-        return (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+        return reply::<()>(Err(AppError::new(
+            ErrorCode::Unauthorized,
+            "Missing or wrong bridge token",
+        )));
     }
     next.run(req).await
 }
 
-fn status_of(e: &AppError) -> StatusCode {
-    match e.code {
-        ErrorCode::NotFound => StatusCode::NOT_FOUND,
-        ErrorCode::InvalidInput | ErrorCode::Unsupported => StatusCode::BAD_REQUEST,
-        ErrorCode::AuthFailed | ErrorCode::Database | ErrorCode::ModelNotFound => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
-        ErrorCode::ConnectFailed | ErrorCode::AiUpstream | ErrorCode::AiProtocol => {
-            StatusCode::BAD_GATEWAY
-        }
-        ErrorCode::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        ErrorCode::Cancelled | ErrorCode::WriteDenied => StatusCode::CONFLICT,
-        ErrorCode::GuardRejected
-        | ErrorCode::ReadOnlyViolation
-        | ErrorCode::ConnectionReadOnly
-        | ErrorCode::WriteBlocked => StatusCode::FORBIDDEN,
-        ErrorCode::SecretStore | ErrorCode::Io | ErrorCode::Internal => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
-    }
-}
-
 fn reply<T: serde::Serialize>(r: Result<T, AppError>) -> Response {
     match r {
-        Ok(v) => axum::Json(v).into_response(),
-        Err(e) => (status_of(&e), axum::Json(e)).into_response(),
+        Ok(v) => Json(v).into_response(),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.code.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(e)).into_response()
+        }
     }
-}
-
-fn args<T: DeserializeOwned>(v: Value) -> Result<T, AppError> {
-    serde_json::from_value(v)
-        .map_err(|e| AppError::invalid("Invalid arguments").with_detail(e.to_string()))
-}
-
-#[derive(Deserialize)]
-struct Create {
-    input: ConnectionInput,
-    password: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Update {
-    id: String,
-    input: ConnectionInput,
-    password: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Duplicate {
-    id: String,
-    input: Option<ConnectionInput>,
-    password: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Id {
-    id: String,
-}
-
-#[derive(Deserialize)]
-struct Ids {
-    ids: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct Test {
-    input: ConnectionInput,
-    password: Option<String>,
-    id: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ConnArgs {
-    conn_id: String,
-    #[serde(default)]
-    database: String,
-    #[serde(default)]
-    schema: Option<String>,
-    #[serde(default)]
-    table: String,
-}
-
-#[derive(Deserialize)]
-struct RunArgs {
-    request: RunRequest,
-}
-
-#[derive(Deserialize)]
-struct EditableArgs {
-    request: EditableRequest,
-}
-
-#[derive(Deserialize)]
-struct ApplyEditsArgs {
-    request: ApplyEditsRequest,
-}
-
-#[derive(Deserialize)]
-struct CellValueArgs {
-    request: CellValueRequest,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TabArgs {
-    tab_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CancelArgs {
-    query_id: String,
-}
-
-#[derive(Deserialize)]
-struct SqlArgs {
-    engine: Engine,
-    sql: String,
-    #[serde(default)]
-    database: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AiReadArgs {
-    conn_id: String,
-    #[serde(default)]
-    database: Option<String>,
-    sql: String,
-}
-
-#[derive(Deserialize)]
-struct AiSettingsArgs {
-    settings: AiSettings,
-}
-
-#[derive(Deserialize)]
-struct AiKeyArgs {
-    #[serde(default)]
-    key: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TestAiArgs {
-    settings: AiSettings,
-    #[serde(default)]
-    key: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ChatArgs {
-    request: ChatRequest,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChatCancelArgs {
-    chat_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WriteDecisionArgs {
-    chat_id: String,
-    id: String,
 }
 
 /// `chat_send` as `text/event-stream`: one `data: <ChatEvent JSON>` per event. The chat runs in
 /// its own task; a closed response drops the receiver, which stops the chat.
-fn chat_stream(ctx: Arc<Ctx>, request: ChatRequest) -> Response {
+fn chat_stream(state: Arc<AppState>, request: chat::ChatRequest) -> Response {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
     tokio::spawn(async move {
-        chat::run(&ctx.state, request, move |e| tx.send(e).is_ok()).await;
+        chat::run(&state, request, move |e| tx.send(e).is_ok()).await;
     });
     let events = futures_util::stream::unfold(rx, |mut rx| async move {
         let ev = rx.recv().await?;
-        let data = serde_json::to_string(&ev).unwrap_or_default();
-        Some((Ok::<_, Infallible>(Event::default().data(data)), rx))
+        Some((Ok::<_, Infallible>(Event::default().data(frame(&ev))), rx))
     });
     Sse::new(events).into_response()
 }
 
-async fn dispatch(
-    State(ctx): State<Arc<Ctx>>,
+/// One SSE data frame. An event that cannot be serialized becomes an `ai_protocol` error event
+/// instead of an empty frame the client would report as a protocol error.
+fn frame(ev: &ChatEvent) -> String {
+    serde_json::to_string(ev).unwrap_or_else(|e| {
+        let fallback = ChatEvent::Error {
+            error: AppError::new(
+                ErrorCode::AiProtocol,
+                "The bridge could not encode a chat event",
+            )
+            .with_detail(e.to_string()),
+        };
+        serde_json::to_string(&fallback).unwrap_or_else(|_| {
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "code": "ai_protocol",
+                    "message": "The bridge could not encode a chat event",
+                },
+            })
+            .to_string()
+        })
+    })
+}
+
+async fn route(
+    State(state): State<Arc<AppState>>,
     Path(command): Path<String>,
-    body: Option<axum::Json<Value>>,
+    body: Option<Json<Value>>,
 ) -> Response {
-    let body = body
-        .map(|b| b.0)
-        .unwrap_or(Value::Object(Default::default()));
-    let st = &ctx.state;
-    match command.as_str() {
-        "list_connections" => reply(Ok(connections::list(st))),
-        "create_connection" => reply(
-            async {
-                let a: Create = args(body)?;
-                connections::create(st, a.input, a.password)
-            }
-            .await,
-        ),
-        "update_connection" => reply(
-            async {
-                let a: Update = args(body)?;
-                connections::update(st, &a.id, a.input, a.password).await
-            }
-            .await,
-        ),
-        "duplicate_connection" => reply(
-            async {
-                let a: Duplicate = args(body)?;
-                connections::duplicate(st, &a.id, a.input, a.password)
-            }
-            .await,
-        ),
-        "delete_connection" => reply(
-            async {
-                let a: Id = args(body)?;
-                connections::delete(st, &a.id).await
-            }
-            .await,
-        ),
-        "reorder_connections" => {
-            reply(args::<Ids>(body).and_then(|a| connections::reorder(st, &a.ids)))
-        }
-        "test_connection" => reply(
-            async {
-                let a: Test = args(body)?;
-                connections::test(st, a.input, a.password, a.id.as_deref()).await
-            }
-            .await,
-        ),
-        "list_databases" => reply(
-            async {
-                let a: ConnArgs = args(body)?;
-                introspect::list_databases(st, &a.conn_id).await
-            }
-            .await,
-        ),
-        "list_schemas" => reply(
-            async {
-                let a: ConnArgs = args(body)?;
-                introspect::list_schemas(st, &a.conn_id, &a.database).await
-            }
-            .await,
-        ),
-        "list_tables" => reply(
-            async {
-                let a: ConnArgs = args(body)?;
-                introspect::list_tables(st, &a.conn_id, &a.database, a.schema.as_deref()).await
-            }
-            .await,
-        ),
-        "list_columns" => reply(
-            async {
-                let a: ConnArgs = args(body)?;
-                introspect::list_columns(st, &a.conn_id, &a.database, a.schema.as_deref(), &a.table)
-                    .await
-            }
-            .await,
-        ),
-        "table_properties" => reply(
-            async {
-                let a: ConnArgs = args(body)?;
-                introspect::table_properties(
-                    st,
-                    &a.conn_id,
-                    &a.database,
-                    a.schema.as_deref(),
-                    &a.table,
-                )
-                .await
-            }
-            .await,
-        ),
-        "schema_snapshot" => reply(
-            async {
-                let a: ConnArgs = args(body)?;
-                introspect::schema_snapshot(st, &a.conn_id, &a.database).await
-            }
-            .await,
-        ),
-        "table_ddl" => reply(
-            async {
-                let a: ConnArgs = args(body)?;
-                dump::table_ddl(st, &a.conn_id, &a.database, a.schema.as_deref(), &a.table).await
-            }
-            .await,
-        ),
-        "run_query" => reply(
-            async {
-                let a: RunArgs = args(body)?;
-                query::run(st, a.request).await
-            }
-            .await,
-        ),
-        "editable_result" => reply(
-            async {
-                let a: EditableArgs = args(body)?;
-                edit::editable_result(st, a.request).await
-            }
-            .await,
-        ),
-        "apply_edits" => reply(
-            async {
-                let a: ApplyEditsArgs = args(body)?;
-                edit::apply_edits(st, a.request).await
-            }
-            .await,
-        ),
-        "cell_value" => reply(
-            async {
-                let a: CellValueArgs = args(body)?;
-                edit::cell_value(st, a.request).await
-            }
-            .await,
-        ),
-        "cancel_query" => reply(
-            async {
-                let a: CancelArgs = args(body)?;
-                query::cancel(st, &a.query_id).await
-            }
-            .await,
-        ),
-        "query_progress" => {
-            reply(args::<CancelArgs>(body).map(|a| query::progress(st, &a.query_id)))
-        }
-        "commit_transaction" => reply(
-            async {
-                let a: TabArgs = args(body)?;
-                session::end_tx_for(st, &a.tab_id, true).await
-            }
-            .await,
-        ),
-        "rollback_transaction" => reply(
-            async {
-                let a: TabArgs = args(body)?;
-                session::end_tx_for(st, &a.tab_id, false).await
-            }
-            .await,
-        ),
-        "tab_status" => reply(
-            async {
-                let a: TabArgs = args(body)?;
-                session::status(st, &a.tab_id).await
-            }
-            .await,
-        ),
-        "close_tab_session" => reply(
-            async {
-                let a: TabArgs = args(body)?;
-                st.sessions.close(&a.tab_id).await;
-                Ok(())
-            }
-            .await,
-        ),
-        // Same session cleanup as the desktop quit, but the bridge keeps serving: other
-        // browser tabs may still use it.
-        "quit_app" => {
-            for id in st.sessions.pending_tab_ids() {
-                st.sessions.close(&id).await;
-            }
-            reply(Ok::<_, AppError>(()))
-        }
-        "guard_check" => reply(args::<SqlArgs>(body).map(|a| guard::guard_check(&a.sql, a.engine))),
-        "classify_write" => reply(
-            args::<SqlArgs>(body)
-                .map(|a| guard::classify_write(&a.sql, a.engine, a.database.as_deref())),
-        ),
-        "run_ai_read" => reply(
-            async {
-                let a: AiReadArgs = args(body)?;
-                readonly::run_ai_read(
-                    st,
-                    &a.conn_id,
-                    a.database.as_deref(),
-                    &a.sql,
-                    ReadLimits::default(),
-                )
-                .await
-            }
-            .await,
-        ),
-        "get_ai_settings" => reply(ai_settings::get(st)),
-        "save_ai_settings" => {
-            reply(args::<AiSettingsArgs>(body).and_then(|a| ai_settings::save(st, a.settings)))
-        }
-        "set_ai_key" => {
-            reply(args::<AiKeyArgs>(body).and_then(|a| ai_settings::set_key(st, a.key)))
-        }
-        "test_ai" => reply(
-            async {
-                let a: TestAiArgs = args(body)?;
-                ai_settings::test(st, a.settings, a.key).await
-            }
-            .await,
-        ),
-        "list_ai_models" => reply(
-            async {
-                let a: TestAiArgs = args(body)?;
-                ai_settings::models(st, a.settings, a.key).await
-            }
-            .await,
-        ),
-        "chat_send" => match args::<ChatArgs>(body) {
-            Ok(a) => chat_stream(ctx.clone(), a.request),
-            Err(e) => reply::<()>(Err(e)),
-        },
-        "chat_cancel" => reply(args::<ChatCancelArgs>(body).map(|a| chat::cancel(st, &a.chat_id))),
-        "approve_write" => reply(
-            args::<WriteDecisionArgs>(body)
-                .and_then(|a| st.approvals.decide(&a.chat_id, &a.id, true)),
-        ),
-        "deny_write" => reply(
-            args::<WriteDecisionArgs>(body)
-                .and_then(|a| st.approvals.decide(&a.chat_id, &a.id, false)),
-        ),
-        // No export_csv, export_result_sql, export_documents, export_table_sql or save_pdf: the bridge never writes files on request;
-        // the browser UI downloads the file client-side instead.
-        _ => reply::<()>(Err(AppError::not_found(format!(
-            "Unknown command {command}"
-        )))),
+    let Some(Json(body)) = body else {
+        return reply::<()>(Err(AppError::invalid(
+            "The request needs a JSON body with the command's arguments",
+        )));
+    };
+    if command == commands::CHAT_SEND {
+        return match serde_json::from_value::<commands::ChatSendArgs>(body) {
+            Ok(args) => chat_stream(state, args.request),
+            Err(e) => reply::<()>(Err(AppError::invalid(format!("Invalid arguments: {e}")))),
+        };
+    }
+    reply(commands::dispatch(&state, &command, body).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errors_use_the_one_status_mapping() {
+        let unauthorized = reply::<()>(Err(AppError::new(
+            ErrorCode::Unauthorized,
+            "Missing or wrong bridge token",
+        )));
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let native = reply::<()>(Err(AppError::new(
+            ErrorCode::Unsupported,
+            "save_pdf is only available in the desktop app",
+        )));
+        assert_eq!(native.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -13,7 +13,6 @@ export function parseChangelog(md: string): Release[] {
   return out;
 }
 
-/** Compares two `x.y.z` versions: negative, zero or positive. */
 export function compareVersions(a: string, b: string) {
   const pa = a.split('.').map(Number);
   const pb = b.split('.').map(Number);

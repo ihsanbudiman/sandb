@@ -2,8 +2,19 @@
 
 import type { Engine } from '../api';
 
-/** The engine of the text. MongoDB never reaches these helpers; its text would split as plain SQL. */
-export type Dialect = Engine;
+/** The engines whose text these helpers read. MongoDB's mongosh never comes here. */
+export type SqlEngine = Exclude<Engine, 'mongo'>;
+
+/** The engine of SQL text; mongosh never reaches these helpers, its text would split as plain SQL. */
+export type Dialect = SqlEngine;
+
+const READ_KINDS: Record<string, true> = { select: true, with: true, show: true, explain: true, describe: true };
+
+export function statementKind(sql: string): 'read' | 'write' | 'empty' {
+  const first = sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim().split(/\s+/)[0]?.toLowerCase() ?? '';
+  if (!first) return 'empty';
+  return READ_KINDS[first] ? 'read' : 'write';
+}
 
 /**
  * Cuts the text at `;` outside strings, quoted names, comments and Postgres dollar quotes, like the
@@ -91,15 +102,8 @@ export function appendStatement(existing: string, sql: string, dialect: Dialect)
   return `${existing.slice(0, end)};${existing.slice(end).trimEnd()}\n\n${sql}`;
 }
 
-/** The statement range around `pos`; undefined when the document holds none. */
 export function statementRangeAt(doc: string, pos: number, dialect: Dialect): [number, number] | undefined {
   return statementRanges(doc, dialect).find(([from, to]) => pos >= from && pos <= to);
-}
-
-/** The statement around `pos`; '' when the document holds none. */
-export function statementTextAt(doc: string, pos: number, dialect: Dialect): string {
-  const range = statementRangeAt(doc, pos, dialect);
-  return range ? doc.slice(range[0], range[1]) : '';
 }
 
 /**

@@ -4,18 +4,25 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::ai::client::{AiClient, Api};
+use crate::core::ai::client::{AiClient, Provider};
 use crate::core::error::{AppError, ErrorCode};
+use crate::core::result::{DEFAULT_MAX_ROWS, DEFAULT_TIMEOUT, ReadLimits};
+use crate::core::secrets::AI_KEY_ACCOUNT;
 use crate::core::state::AppState;
 
-/// Secret store account of the AI API key.
-pub const AI_KEY_ACCOUNT: &str = "ai:api_key";
+/// The `settings.json` section the AI settings live in.
+const SECTION: &str = "ai";
 pub const MAX_ROWS_LIMIT: u32 = 10_000;
 pub const TIMEOUT_SEC_LIMIT: u64 = 300;
+/// API root of a fresh install (a local Ollama); the settings page shows it before the first load.
+pub const DEFAULT_AI_BASE_URL: &str = "http://localhost:11434/v1";
+/// Model of a fresh install.
+pub const DEFAULT_AI_MODEL: &str = "llama3.1:8b";
 /// Model ids put in the `model_not_found` detail.
 const LISTED_MODELS: usize = 20;
 
 /// What a query tool result may send to the model.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Privacy {
@@ -27,12 +34,11 @@ pub enum Privacy {
 }
 
 /// Missing fields take their default, so older or partial files still load.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct AiSettings {
-    /// Wire format: `anthropic` for an Anthropic-compatible server, `openai` for an
-    /// OpenAI-compatible one. Older files hold other labels (`ollama`, `custom`, …); they load as `openai`.
-    pub provider: String,
+    pub provider: Provider,
     /// API root, e.g. `http://localhost:11434/v1`. No trailing `/`.
     pub base_url: String,
     pub model: String,
@@ -46,17 +52,18 @@ pub struct AiSettings {
 impl Default for AiSettings {
     fn default() -> Self {
         Self {
-            provider: "openai".into(),
-            base_url: "http://localhost:11434/v1".into(),
-            model: "llama3.1:8b".into(),
+            provider: Provider::OpenAi,
+            base_url: DEFAULT_AI_BASE_URL.into(),
+            model: DEFAULT_AI_MODEL.into(),
             privacy: Privacy::Results,
-            max_rows: 500,
-            timeout_sec: 15,
+            max_rows: DEFAULT_MAX_ROWS as u32,
+            timeout_sec: DEFAULT_TIMEOUT.as_secs(),
         }
     }
 }
 
 /// The settings as the UI sees them. The key itself never leaves the backend.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiSettingsView {
@@ -65,6 +72,7 @@ pub struct AiSettingsView {
     pub has_key: bool,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiTestResult {
@@ -73,22 +81,14 @@ pub struct AiTestResult {
 }
 
 impl AiSettings {
-    pub fn api(&self) -> Api {
-        if self.provider == "anthropic" {
-            Api::Anthropic
-        } else {
-            Api::OpenAi
+    pub fn read_limits(&self) -> ReadLimits {
+        ReadLimits {
+            max_rows: self.max_rows as usize,
+            timeout: std::time::Duration::from_secs(self.timeout_sec),
         }
     }
 
-    /// Trims the text fields and checks the limits. The base URL loses its trailing `/`.
-    /// Any provider other than `anthropic` becomes `openai`.
     pub fn normalized(mut self) -> Result<Self, AppError> {
-        self.provider = match self.provider.trim() {
-            "anthropic" => "anthropic",
-            _ => "openai",
-        }
-        .to_string();
         self.model = self.model.trim().to_string();
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
         if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
@@ -111,26 +111,33 @@ impl AiSettings {
 }
 
 pub fn load(state: &AppState) -> Result<AiSettings, AppError> {
-    Ok(state.store.load_settings()?.ai)
+    state.store.load_section(SECTION)
 }
 
-/// The stored key; `None` when there is none or it is empty.
-pub fn stored_key(state: &AppState) -> Result<Option<String>, AppError> {
-    Ok(state.secrets.get(AI_KEY_ACCOUNT)?.filter(|k| !k.is_empty()))
+/// The key one AI call sends: `None` (the chat) reads the stored key, `Some` (the settings
+/// page) is the caller's, trimmed; an empty one means no key.
+fn key_for(state: &AppState, key: Option<String>) -> Result<Option<String>, AppError> {
+    match key {
+        None => Ok(state.secrets.get(AI_KEY_ACCOUNT)?.filter(|k| !k.is_empty())),
+        Some(k) => Ok(Some(k.trim().to_string()).filter(|k| !k.is_empty())),
+    }
+}
+
+/// The one construction of the HTTP client: the API root and provider of `settings`, with the
+/// key one call sends. Every AI entry (model list, settings test, chat) builds its client here.
+fn client_of(settings: &AiSettings, key: Option<String>) -> Result<AiClient, AppError> {
+    AiClient::new(settings.provider, &settings.base_url, key)
 }
 
 pub fn get(state: &AppState) -> Result<AiSettingsView, AppError> {
     Ok(AiSettingsView {
         settings: load(state)?,
-        has_key: stored_key(state)?.is_some(),
+        has_key: key_for(state, None)?.is_some(),
     })
 }
 
 pub fn save(state: &AppState, settings: AiSettings) -> Result<AiSettingsView, AppError> {
-    let settings = settings.normalized()?;
-    let mut file = state.store.load_settings()?;
-    file.ai = settings;
-    state.store.save_settings(&file)?;
+    state.store.save_section(SECTION, &settings.normalized()?)?;
     get(state)
 }
 
@@ -142,14 +149,6 @@ pub fn set_key(state: &AppState, key: Option<String>) -> Result<(), AppError> {
     }
 }
 
-/// `key`: `None` uses the stored key, `Some("")` sends no key.
-fn resolve_key(state: &AppState, key: Option<String>) -> Result<Option<String>, AppError> {
-    match key {
-        None => stored_key(state),
-        Some(k) => Ok(Some(k.trim().to_string()).filter(|k| !k.is_empty())),
-    }
-}
-
 /// Model ids of `settings` (saved or not), sorted, without duplicates. The model field is not
 /// checked. `key`: as in [`test`].
 pub async fn models(
@@ -158,7 +157,7 @@ pub async fn models(
     key: Option<String>,
 ) -> Result<Vec<String>, AppError> {
     let settings = settings.normalized()?;
-    let client = AiClient::new(settings.api(), &settings.base_url, resolve_key(state, key)?)?;
+    let client = client_of(&settings, key_for(state, key)?)?;
     let mut models = client.list_models().await?;
     models.sort_by(|a, b| {
         a.to_lowercase()
@@ -177,27 +176,50 @@ pub async fn test(
     key: Option<String>,
 ) -> Result<AiTestResult, AppError> {
     let settings = settings.normalized()?;
-    if settings.model.is_empty() {
-        return Err(AppError::invalid("Enter a model name"));
-    }
-    let client = AiClient::new(settings.api(), &settings.base_url, resolve_key(state, key)?)?;
+    require_model(&settings.model)?;
+    let client = client_of(&settings, key_for(state, key)?)?;
     let started = Instant::now();
     let models = client.list_models().await?;
     let latency_ms = started.elapsed().as_millis() as u64;
-    check_model(&settings.model, &models)?;
+    check_model(settings.provider, &settings.model, &models)?;
     Ok(AiTestResult {
         latency_ms,
         model_count: models.len(),
     })
 }
 
-/// `model_not_found` unless `model` is one of `models`. Ollama lists `llama3` as
-/// `llama3:latest` and accepts either name, so that entry counts too.
-pub fn check_model(model: &str, models: &[String]) -> Result<(), AppError> {
-    if models
-        .iter()
-        .any(|m| m == model || m.strip_suffix(":latest") == Some(model))
-    {
+/// The settings and client of one chat: the saved settings, the one key rule, and a model the
+/// server lists, so a chat cannot start on a model that only exists in the settings file.
+pub async fn for_chat(state: &AppState) -> Result<(AiSettings, AiClient), AppError> {
+    let settings = load(state)?.normalized()?;
+    require_model(&settings.model)?;
+    let client = client_of(&settings, key_for(state, None)?)?;
+    check_model(
+        settings.provider,
+        &settings.model,
+        &client.list_models().await?,
+    )?;
+    Ok((settings, client))
+}
+
+fn require_model(model: &str) -> Result<(), AppError> {
+    if model.is_empty() {
+        Err(AppError::invalid("Choose an AI model in Settings first"))
+    } else {
+        Ok(())
+    }
+}
+
+/// `model_not_found` unless `model` is one of `models`. A provider may list a name with a
+/// suffix it adds itself (see `Provider::model_suffixes`); either name is accepted.
+pub fn check_model(provider: Provider, model: &str, models: &[String]) -> Result<(), AppError> {
+    if models.iter().any(|m| {
+        m == model
+            || provider
+                .model_suffixes()
+                .iter()
+                .any(|suffix| m.strip_suffix(suffix) == Some(model))
+    }) {
         return Ok(());
     }
     let count = models.len();
@@ -288,6 +310,49 @@ mod tests {
         assert_eq!(s.privacy, Privacy::Schema);
         assert_eq!(s.base_url, AiSettings::default().base_url);
         assert_eq!(s.max_rows, 500);
+        assert_eq!(s.provider, Provider::OpenAi);
+    }
+
+    /// Older files hold provider labels that are not enum values; every label but `anthropic`
+    /// is an OpenAI-compatible server, and saving writes the two labels back.
+    #[test]
+    fn provider_labels_collapse_to_the_wire_format() {
+        for (label, provider) in [
+            ("ollama", Provider::OpenAi),
+            ("custom", Provider::OpenAi),
+            ("anthropic", Provider::Anthropic),
+            (" openai ", Provider::OpenAi),
+        ] {
+            let s: AiSettings =
+                serde_json::from_str(&format!(r#"{{"provider": "{label}"}}"#)).unwrap();
+            assert_eq!(s.provider, provider, "{label}");
+        }
+        for (provider, label) in [
+            (Provider::OpenAi, "openai"),
+            (Provider::Anthropic, "anthropic"),
+        ] {
+            let s = AiSettings {
+                provider,
+                ..Default::default()
+            };
+            let v = serde_json::to_value(s).unwrap();
+            assert_eq!(v["provider"], label);
+        }
+    }
+
+    #[test]
+    fn read_limits_come_from_the_saved_numbers() {
+        let s = AiSettings {
+            max_rows: 42,
+            timeout_sec: 7,
+            ..Default::default()
+        };
+        let limits = s.read_limits();
+        assert_eq!(limits.max_rows, 42);
+        assert_eq!(limits.timeout, std::time::Duration::from_secs(7));
+        // One default: the settings default and the read path share their numbers.
+        let d = AiSettings::default().read_limits();
+        assert_eq!(d, ReadLimits::default());
     }
 
     #[test]
@@ -354,9 +419,10 @@ mod tests {
 
     #[test]
     fn model_check() {
+        let openai = Provider::OpenAi;
         let models: Vec<String> = (0..25).map(|i| format!("m{i}")).collect();
-        assert!(check_model("m3", &models).is_ok());
-        let e = check_model("nope", &models).unwrap_err();
+        assert!(check_model(openai, "m3", &models).is_ok());
+        let e = check_model(openai, "nope", &models).unwrap_err();
         assert_eq!(e.code, ErrorCode::ModelNotFound);
         assert_eq!(
             e.message,
@@ -365,17 +431,20 @@ mod tests {
         let detail = e.detail.unwrap();
         assert_eq!(detail.split(", ").count(), 20);
         assert!(detail.starts_with("m0, m1"));
-        let e = check_model("x", &["only".into()]).unwrap_err();
+        let e = check_model(openai, "x", &["only".into()]).unwrap_err();
         assert_eq!(
             e.message,
             "Model \"x\" is not on this server. The server lists 1 model."
         );
         let ollama = ["llama3:latest".to_string(), "qwen2.5:7b".to_string()];
-        assert!(check_model("llama3", &ollama).is_ok());
-        assert!(check_model("llama3:latest", &ollama).is_ok());
-        assert!(check_model("qwen2.5:7b", &ollama).is_ok());
-        assert!(check_model("qwen2.5", &ollama).is_err());
-        assert!(check_model("llama", &ollama).is_err());
+        assert!(check_model(openai, "llama3", &ollama).is_ok());
+        assert!(check_model(openai, "llama3:latest", &ollama).is_ok());
+        assert!(check_model(openai, "qwen2.5:7b", &ollama).is_ok());
+        assert!(check_model(openai, "qwen2.5", &ollama).is_err());
+        assert!(check_model(openai, "llama", &ollama).is_err());
+        // The implicit tag is the OpenAI-compatible provider's rule; Anthropic lists exact ids.
+        assert!(check_model(Provider::Anthropic, "llama3", &ollama).is_err());
+        assert!(check_model(Provider::Anthropic, "llama3:latest", &ollama).is_ok());
     }
 
     #[tokio::test]

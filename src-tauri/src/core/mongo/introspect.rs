@@ -5,19 +5,20 @@
 use futures_util::TryStreamExt;
 use mongodb::bson::{Bson, Document, RawDocumentBuf, doc};
 use mongodb::error::{Error as MongoError, ErrorKind};
-use mongodb::results::CollectionType;
 use mongodb::{Client, Database};
 
-use crate::core::db::introspect::{
-    self, ColumnInfo, IndexInfo, MongoCollectionInfo, MongoCollectionKind, MongoCollectionStats,
-    MongoIndexInfo, SNAPSHOT_MAX_COLUMNS, SNAPSHOT_MAX_TABLES, SchemaSnapshot, SnapRow, SnapTable,
-    TableInfo, TableKind, TableProperties,
-};
 use crate::core::error::AppError;
+use crate::core::mongo::options::whole_number;
+use crate::core::mongo::reply;
 use crate::core::mongo::schema::{
     FieldSummary, SAMPLE_BYTES, SAMPLE_DOCS, SNAPSHOT_SAMPLE_BYTES, SNAPSHOT_SAMPLE_DOCS,
 };
-use crate::core::mongo::shell;
+use crate::core::mongo::value;
+use crate::core::result::{
+    group_snapshot, not_found_table, ColumnInfo, IndexInfo, MongoCollectionInfo,
+    MongoCollectionKind, MongoCollectionStats, MongoIndexInfo, SchemaSnapshot, SnapRow, SnapTable,
+    TableInfo, TableKind, TableProperties, SNAPSHOT_MAX_COLUMNS, SNAPSHOT_MAX_TABLES,
+};
 
 /// MongoDB `Unauthorized`: the authenticated user may not run the command.
 const UNAUTHORIZED: i32 = 13;
@@ -28,19 +29,26 @@ fn unauthorized(e: &MongoError) -> bool {
     matches!(&*e.kind, ErrorKind::Command(c) if c.code == UNAUTHORIZED)
 }
 
+/// Whether the server refused the `authorizedDatabases` option itself (an unknown field), as a
+/// compatible server that predates it does, rather than answering the command.
+fn refuses_the_option(e: &MongoError) -> bool {
+    /// `Location40415`: `BSON field 'listDatabases.authorizedDatabases' is an unknown field`.
+    const UNKNOWN_FIELD: i32 = 40415;
+    matches!(&*e.kind, ErrorKind::Command(c)
+        if c.code == UNKNOWN_FIELD || c.message.contains("authorizedDatabases"))
+}
+
 /// Databases the connection's user may see. `authorizedDatabases` asks the server for exactly
-/// those; a compatible server that does not know the option (Azure Cosmos DB for MongoDB) refuses
-/// the command, so the list is asked again without it. A user that may not run `listDatabases`
-/// at all gets the connection's own database.
+/// those; a server that does not know the option (Azure Cosmos DB for MongoDB) refuses the
+/// command, so the list is asked again without it. A user that may not run `listDatabases` at
+/// all gets the connection's own database.
 pub async fn databases(client: &Client, own: &str) -> Result<Vec<String>, AppError> {
     let listed = match client
         .list_database_names()
         .authorized_databases(true)
         .await
     {
-        Err(e) if matches!(&*e.kind, ErrorKind::Command(_)) && !unauthorized(&e) => {
-            client.list_database_names().await
-        }
+        Err(e) if refuses_the_option(&e) => client.list_database_names().await,
         listed => listed,
     };
     let mut names = match listed {
@@ -67,10 +75,7 @@ pub async fn tables(client: &Client, db: &str) -> Result<Vec<TableInfo>, AppErro
         if spec.name.starts_with("system.") {
             continue;
         }
-        let kind = match spec.collection_type {
-            CollectionType::View => TableKind::View,
-            _ => TableKind::Table,
-        };
+        let kind = reply::table_kind(reply::driver_kind(spec.collection_type));
         let row_estimate = if kind == TableKind::Table {
             db.collection::<Document>(&spec.name)
                 .estimated_document_count()
@@ -96,20 +101,42 @@ pub async fn tables(client: &Client, db: &str) -> Result<Vec<TableInfo>, AppErro
 /// An empty collection yields an empty list, not `not_found`; an unknown name does.
 pub async fn columns(client: &Client, db: &str, coll: &str) -> Result<Vec<ColumnInfo>, AppError> {
     let db = client.database(db);
-    let names = db
-        .list_collection_names()
-        .authorized_collections(true)
-        .filter(doc! { "name": coll })
-        .await?;
-    if names.is_empty() {
-        return Err(introspect::not_found_table(coll));
-    }
+    let entry = collection_entry(&db, coll, true)
+        .await?
+        .ok_or_else(|| not_found_table(coll))?;
     let mut summary = FieldSummary::default();
-    if let Some(validator) = validator(&db, coll).await? {
+    if let Some(validator) = entry_validator(&entry) {
         summary.add_validator(&validator);
     }
     add_sample(&db, coll, SAMPLE_DOCS, SAMPLE_BYTES, &mut summary).await?;
     Ok(summary.into_columns())
+}
+
+/// The raw `listCollections` entry of one collection. `authorized` hides the collections the
+/// user may not read, as the browse paths do.
+pub(crate) async fn collection_entry(
+    db: &Database,
+    coll: &str,
+    authorized: bool,
+) -> Result<Option<Document>, AppError> {
+    let mut command = doc! { "listCollections": 1, "filter": { "name": coll }, "cursor": {} };
+    if authorized {
+        command.insert("authorizedCollections", true);
+    }
+    let reply = db.run_command(command).await?;
+    let entries = reply::cursor_batch(&reply)
+        .ok_or_else(|| AppError::internal("The server reply has no cursor"))?;
+    Ok(entries
+        .into_iter()
+        .find(|entry| entry.get_str("name").is_ok_and(|name| name == coll)))
+}
+
+fn entry_validator(entry: &Document) -> Option<Document> {
+    entry
+        .get_document("options")
+        .ok()
+        .and_then(|options| options.get_document("validator").ok())
+        .cloned()
 }
 
 /// Collections and their field paths for autocomplete. Views contribute their name only;
@@ -158,31 +185,13 @@ pub async fn snapshot(client: &Client, db: &str) -> Result<SchemaSnapshot, AppEr
                 }),
         );
     }
-    Ok(introspect::group_snapshot(
+    Ok(group_snapshot(
         db.to_string(),
         snap_tables,
         rows,
     ))
 }
 
-/// The `options.validator` of `coll`, when the collection has one.
-async fn validator(db: &Database, coll: &str) -> Result<Option<Document>, AppError> {
-    let mut cursor = db
-        .list_collections()
-        .authorized_collections(true)
-        .filter(doc! { "name": coll })
-        .await?;
-    while let Some(spec) = cursor.try_next().await? {
-        if spec.name == coll {
-            return Ok(spec.options.validator);
-        }
-    }
-    Ok(None)
-}
-
-/// Streams `aggregate([{ $sample: { size } }])` into `summary`. Documents stay raw until the
-/// merge so `as_bytes` gives the size for free; the document that crosses `bytes` is still
-/// merged, then the loop stops. Nothing is collected into a Vec.
 async fn add_sample(
     db: &Database,
     coll: &str,
@@ -210,9 +219,6 @@ async fn add_sample(
     Ok(())
 }
 
-// ---- collection properties and the creation script
-
-/// The `listCollections` entry of one collection and its index specs.
 pub(crate) struct CollectionSpec {
     pub kind: MongoCollectionKind,
     /// The raw `options` of the entry: validator, validationLevel, validationAction, capped,
@@ -229,18 +235,10 @@ pub(crate) async fn spec(
     coll: &str,
 ) -> Result<CollectionSpec, AppError> {
     let database = client.database(db);
-    let reply = database
-        .run_command(doc! { "listCollections": 1, "filter": { "name": coll }, "cursor": {} })
-        .await?;
-    let entry = first_batch(&reply)?
-        .into_iter()
-        .find(|entry| entry.get_str("name").is_ok_and(|name| name == coll))
-        .ok_or_else(|| introspect::not_found_table(coll))?;
-    let kind = match entry.get_str("type").unwrap_or("collection") {
-        "view" => MongoCollectionKind::View,
-        "timeseries" => MongoCollectionKind::Timeseries,
-        _ => MongoCollectionKind::Collection,
-    };
+    let entry = collection_entry(&database, coll, false)
+        .await?
+        .ok_or_else(|| not_found_table(coll))?;
+    let kind = reply::named_kind(entry.get_str("type").ok());
     let options = entry
         .get_document("options")
         .ok()
@@ -252,7 +250,8 @@ pub(crate) async fn spec(
         let reply = database
             .run_command(doc! { "listIndexes": coll, "cursor": {} })
             .await?;
-        first_batch(&reply)?
+        reply::cursor_batch(&reply)
+            .ok_or_else(|| AppError::internal("The server reply has no cursor"))?
     };
     Ok(CollectionSpec {
         kind,
@@ -270,9 +269,18 @@ pub async fn properties(
 ) -> Result<TableProperties, AppError> {
     let spec = spec(client, db, coll).await?;
     let mut options = spec.options.clone();
-    let validator = options.remove("validator").and_then(into_document);
-    let validation_level = options.remove("validationLevel").and_then(into_string);
-    let validation_action = options.remove("validationAction").and_then(into_string);
+    let validator = match options.remove("validator") {
+        Some(Bson::Document(validator)) => Some(validator),
+        _ => None,
+    };
+    let validation_level = match options.remove("validationLevel") {
+        Some(Bson::String(level)) => Some(level),
+        _ => None,
+    };
+    let validation_action = match options.remove("validationAction") {
+        Some(Bson::String(action)) => Some(action),
+        _ => None,
+    };
     let indexes = spec
         .indexes
         .iter()
@@ -280,7 +288,7 @@ pub async fn properties(
         .collect::<Result<Vec<_>, AppError>>()?;
     let stats = match spec.kind {
         MongoCollectionKind::View => None,
-        _ => storage_stats(&client.database(db), coll).await,
+        _ => storage_stats(&client.database(db), coll).await?,
     };
     Ok(TableProperties {
         indexes,
@@ -289,34 +297,48 @@ pub async fn properties(
         references: Vec::new(),
         mongo: Some(MongoCollectionInfo {
             kind: spec.kind,
-            validator: validator.map(|v| ejson_pretty(Bson::Document(v))),
+            validator: validator
+                .map(|validator| ejson_pretty(Bson::Document(validator)))
+                .transpose()?,
             validation_level,
             validation_action,
-            options: ejson_pretty(Bson::Document(options)),
+            options: ejson_pretty(Bson::Document(options))?,
             stats,
         }),
     })
 }
 
-/// One `listIndexes` entry as the properties view shows it.
-fn index_info(coll: &str, spec: &Document) -> Result<IndexInfo, AppError> {
-    let key = spec.get_document("key").ok().cloned().unwrap_or_default();
-    let name = spec.get_str("name").unwrap_or_default().to_string();
+/// The `key` document of a `listIndexes` entry; an entry without one is a malformed reply.
+fn index_key(spec: &Document) -> Result<&Document, AppError> {
+    spec.get_document("key")
+        .map_err(|_| AppError::internal("The listIndexes reply has an index without a key"))
+}
+
+/// The `db.getCollection(name).createIndex(…)` text of one `listIndexes` entry. The properties
+/// panel and the DDL export write the same index the same way.
+pub(crate) fn create_index_text(coll: &str, spec: &Document) -> Result<String, AppError> {
+    let key_text = value::compact(&Bson::Document(index_key(spec)?.clone()))?;
     let options = index_options(spec);
-    // The definition is mongosh text, so a regex or a date option reads back as itself.
-    let key_text = shell::compact(&Bson::Document(key.clone()))?;
-    let definition = if options.is_empty() {
+    Ok(if options.is_empty() {
         format!(
             "db.getCollection({}).createIndex({key_text})",
-            shell::quoted(coll)
+            value::quoted(coll)
         )
     } else {
         format!(
             "db.getCollection({}).createIndex({key_text}, {})",
-            shell::quoted(coll),
-            shell::compact(&Bson::Document(options))?
+            value::quoted(coll),
+            value::compact(&Bson::Document(options))?
         )
-    };
+    })
+}
+
+/// One `listIndexes` entry as the properties view shows it.
+fn index_info(coll: &str, spec: &Document) -> Result<IndexInfo, AppError> {
+    let key = index_key(spec)?.clone();
+    let name = spec.get_str("name").unwrap_or_default().to_string();
+    // The definition is mongosh text, so a regex or a date option reads back as itself.
+    let definition = create_index_text(coll, spec)?;
     // Everything the fields above already say, and `v` (the server's index format version),
     // is not an option the user set.
     let mut rest = spec.clone();
@@ -340,47 +362,31 @@ fn index_info(coll: &str, spec: &Document) -> Result<IndexInfo, AppError> {
         method: index_method(&key),
         definition: Some(definition),
         mongo: Some(MongoIndexInfo {
-            keys: ejson(Bson::Document(key)),
+            keys: Bson::Document(key).into_relaxed_extjson().to_string(),
             sparse: spec.get_bool("sparse").unwrap_or(false),
             hidden: spec.get_bool("hidden").unwrap_or(false),
-            ttl_seconds: spec.get("expireAfterSeconds").and_then(number),
-            partial_filter: spec
-                .get_document("partialFilterExpression")
-                .ok()
-                .map(|filter| ejson(Bson::Document(filter.clone()))),
-            options: (!rest.is_empty()).then(|| ejson(Bson::Document(rest))),
+            ttl_seconds: spec
+                .get("expireAfterSeconds")
+                .and_then(|value| whole_number(value, i64::MIN, i64::MAX)),
+            partial_filter: spec.get_document("partialFilterExpression").ok().map(|filter| {
+                Bson::Document(filter.clone()).into_relaxed_extjson().to_string()
+            }),
+            options: (!rest.is_empty()).then(|| {
+                Bson::Document(rest).into_relaxed_extjson().to_string()
+            }),
         }),
     })
 }
 
-/// The index options that `createIndex` accepts, in the order the script writes them. Every
-/// option here changes the index, so a script that leaves one out builds a different index; the
-/// rest of a `listIndexes` entry is a field of its own (`v`, `ns`, `key`) or a field the shape
-/// of the entry already reports (`unique`, `sparse`, ...).
+/// The index options a `listIndexes` entry carries, in the order the script writes them: the
+/// keys `createIndex` accepts, so a stored index and a written one use one vocabulary. The rest
+/// of an entry is a field of its own (`v`, `ns`, `key`) or a field the shape of the entry
+/// already reports (`unique`, `sparse`, ...).
 pub(crate) fn index_options(spec: &Document) -> Document {
-    const OPTIONS: [&str; 17] = [
-        "name",
-        "unique",
-        "sparse",
-        "expireAfterSeconds",
-        "partialFilterExpression",
-        "collation",
-        "hidden",
-        "weights",
-        "default_language",
-        "wildcardProjection",
-        "language_override",
-        "textIndexVersion",
-        "2dsphereIndexVersion",
-        "bits",
-        "min",
-        "max",
-        "storageEngine",
-    ];
     let mut options = Document::new();
-    for key in OPTIONS {
-        if let Some(value) = spec.get(key) {
-            options.insert(key, value.clone());
+    for key in crate::core::mongo::write::CREATE_INDEX_OPTIONS {
+        if let Some(value) = spec.get(*key) {
+            options.insert(*key, value.clone());
         }
     }
     options
@@ -406,86 +412,72 @@ fn index_method(key: &Document) -> Option<String> {
     (!kinds.is_empty()).then(|| kinds.join(", "))
 }
 
-/// The `storageStats` of `coll`; `None` when the server refuses it, as a user without the
-/// `collStats` privilege gets, or for a shape sandb does not know.
-async fn storage_stats(db: &Database, coll: &str) -> Option<MongoCollectionStats> {
+/// The `storageStats` of `coll`. `Ok(None)` when the server refuses it (a user without the
+/// `collStats` privilege) or sends no stats; any other failure is the caller's error.
+async fn storage_stats(
+    db: &Database,
+    coll: &str,
+) -> Result<Option<MongoCollectionStats>, AppError> {
     // `$collStats` replaces the deprecated `collStats` command (6.2+).
-    let mut cursor = db
+    let mut cursor = match db
         .collection::<Document>(coll)
         .aggregate([doc! { "$collStats": { "storageStats": {} } }])
         .await
-        .ok()?;
-    let doc = cursor.try_next().await.ok().flatten()?;
-    let stats = doc.get_document("storageStats").ok()?;
-    let int = |key: &str| stats.get(key).and_then(number).unwrap_or(0);
-    let avg_obj_size = match stats.get("avgObjSize") {
-        Some(Bson::Double(avg)) => *avg,
-        Some(value) => number(value).map_or(0.0, |n| n as f64),
-        None => 0.0,
+    {
+        Ok(cursor) => cursor,
+        Err(e) if unauthorized(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
-    Some(MongoCollectionStats {
-        count: int("count"),
-        size: int("size"),
+    let doc = match cursor.try_next().await {
+        Ok(Some(doc)) => doc,
+        Ok(None) => return Ok(None),
+        Err(e) if unauthorized(&e) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(stats) = doc.get_document("storageStats").ok() else {
+        return Ok(None);
+    };
+    // A timeseries collection reports neither `count` nor the index sizes, so an absent field
+    // is 0; a field that is there with a type we cannot read is the error.
+    let int = |key: &str| -> Result<i64, AppError> {
+        match stats.get(key) {
+            None => Ok(0),
+            Some(value) => whole_number(value, i64::MIN, i64::MAX).ok_or_else(|| {
+                AppError::internal(format!("The storageStats reply has no whole {key}"))
+            }),
+        }
+    };
+    let avg_obj_size = match stats.get("avgObjSize") {
+        // An empty collection has no average object size.
+        None => 0.0,
+        Some(Bson::Double(avg)) => *avg,
+        Some(value) => whole_number(value, i64::MIN, i64::MAX)
+            .map(|n| n as f64)
+            .ok_or_else(|| AppError::internal("The storageStats reply has no avgObjSize"))?,
+    };
+    Ok(Some(MongoCollectionStats {
+        count: int("count")?,
+        size: int("size")?,
         avg_obj_size,
-        storage_size: int("storageSize"),
-        total_index_size: int("totalIndexSize"),
-        nindexes: int("nindexes"),
+        storage_size: int("storageSize")?,
+        total_index_size: int("totalIndexSize")?,
+        nindexes: int("nindexes")?,
+    }))
+}
+
+fn ejson_pretty(v: Bson) -> Result<String, AppError> {
+    serde_json::to_string_pretty(&v.into_relaxed_extjson()).map_err(|e| {
+        AppError::internal("Cannot render Extended JSON").with_detail(e.to_string())
     })
-}
-
-/// The documents of the first batch of a cursor reply.
-fn first_batch(reply: &Document) -> Result<Vec<Document>, AppError> {
-    let batch = reply
-        .get_document("cursor")
-        .and_then(|cursor| cursor.get_array("firstBatch"))
-        .map_err(|e| {
-            AppError::internal("The server reply has no cursor").with_detail(e.to_string())
-        })?;
-    Ok(batch
-        .iter()
-        .filter_map(|v| v.as_document().cloned())
-        .collect())
-}
-
-/// A whole number of any BSON numeric type.
-fn number(v: &Bson) -> Option<i64> {
-    match v {
-        Bson::Int32(i) => Some(i64::from(*i)),
-        Bson::Int64(i) => Some(*i),
-        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => Some(*d as i64),
-        _ => None,
-    }
-}
-
-fn into_document(v: Bson) -> Option<Document> {
-    match v {
-        Bson::Document(d) => Some(d),
-        _ => None,
-    }
-}
-
-fn into_string(v: Bson) -> Option<String> {
-    match v {
-        Bson::String(s) => Some(s),
-        _ => None,
-    }
-}
-
-/// A value as compact relaxed Extended JSON.
-fn ejson(v: Bson) -> String {
-    v.into_relaxed_extjson().to_string()
-}
-
-/// A value as pretty (2-space) relaxed Extended JSON.
-fn ejson_pretty(v: Bson) -> String {
-    serde_json::to_string_pretty(&v.into_relaxed_extjson()).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use mongodb::bson::{Bson, Document, doc};
 
-    use super::{index_method, index_options};
+    use super::{create_index_text, index_method, index_options};
+
+    use crate::core::error::ErrorCode;
 
     fn keys(pairs: &[(&str, Bson)]) -> Document {
         pairs
@@ -574,5 +566,26 @@ mod tests {
         );
         assert!(!options.contains_key("v") && !options.contains_key("ns"));
         assert!(!options.contains_key("key"));
+    }
+
+    #[test]
+    fn the_index_text_is_the_script_the_panel_and_the_export_write() {
+        let spec = doc! { "key": { "a": 1 } };
+        assert_eq!(
+            create_index_text("c", &spec).unwrap(),
+            "db.getCollection(\"c\").createIndex({\"a\": 1})"
+        );
+        let spec = doc! { "key": { "a": 1 }, "name": "a_1", "unique": true };
+        assert_eq!(
+            create_index_text("c", &spec).unwrap(),
+            "db.getCollection(\"c\").createIndex({\"a\": 1}, {\"name\": \"a_1\", \"unique\": true})"
+        );
+        // A `listIndexes` entry without its key is a malformed reply, not an empty index.
+        assert_eq!(
+            create_index_text("c", &doc! { "name": "no_key" })
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
     }
 }

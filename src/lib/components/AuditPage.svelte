@@ -1,7 +1,9 @@
 <script lang="ts">
   import { ArrowLeft, Search, Copy, Check, ChevronRight } from '@lucide/svelte';
-  import { ui, db, envDot } from '../state.svelte';
+  import { db, envDot } from '../connections.svelte';
+  import { ui } from '../state.svelte';
   import { audit, type AuditEntry } from '../audit.svelte';
+  import { Flash } from '../flash.svelte';
 
   type Tab = 'all' | 'read' | 'write' | 'blocked';
 
@@ -9,7 +11,7 @@
   let q = $state('');
   let connId = $state('all');
   let openId = $state<number | null>(null);
-  let copied = $state<number | null>(null);
+  const copied = new Flash<number>();
 
   const conns = $derived(Object.fromEntries(db.connections.map((c) => [c.id, c])));
   const isBlocked = (e: AuditEntry) => e.result.status === 'blocked' || e.result.status === 'denied';
@@ -47,9 +49,12 @@
   }
 
   async function copy(e: AuditEntry) {
-    await navigator.clipboard?.writeText(e.sql).catch(() => {});
-    copied = e.id;
-    setTimeout(() => copied === e.id && (copied = null), 1200);
+    try {
+      await navigator.clipboard.writeText(e.sql);
+      copied.show(e.id);
+    } catch (err) {
+      console.warn('Copy failed.', err);
+    }
   }
 </script>
 
@@ -135,7 +140,7 @@
                   <div class="relative rounded-lg border border-line bg-surface">
                     <pre class="overflow-auto px-3 py-2.5 pr-20 font-mono text-[12px] leading-[1.6] whitespace-pre-wrap">{e.sql}</pre>
                     <button class="btn btn-ghost absolute top-1.5 right-1.5 h-6 px-2 text-[12px]" onclick={(ev) => { ev.stopPropagation(); copy(e); }}>
-                      {#if copied === e.id}<Check size={12} class="text-emerald-600 dark:text-emerald-400" /> Copied{:else}<Copy size={12} /> Copy{/if}
+                      {#if copied.current === e.id}<Check size={12} class="text-emerald-600 dark:text-emerald-400" /> Copied{:else}<Copy size={12} /> Copy{/if}
                     </button>
                   </div>
                 </td>

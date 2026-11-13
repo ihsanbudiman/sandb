@@ -7,35 +7,38 @@ use std::time::{Duration, Instant};
 use mongodb::bson::{Bson, Document, doc};
 use tokio_util::sync::CancellationToken;
 
-use crate::core::connections::{self, Connection};
-use crate::core::db::query;
-use crate::core::db::readonly::{self, AiReadResult, ReadLimits};
-use crate::core::db::write::WriteResult;
+use crate::core::connections::{Connection, target_database};
 use crate::core::error::{AppError, ErrorCode};
+use crate::core::mongo::client::Access;
 use crate::core::mongo::command::{Command, Find, Method, Statement};
-use crate::core::mongo::conn::server_error;
-use crate::core::mongo::flatten::{Flattener, Page};
+use crate::core::mongo::comment::OpComment;
+use crate::core::mongo::conn::{MAX_TIME_MS_EXPIRED, server_code};
+use crate::core::mongo::flatten::Page;
 use crate::core::mongo::guard::{self, Kind};
-use crate::core::mongo::run::ReadStream;
+use crate::core::mongo::options::whole_number;
 use crate::core::mongo::{client, parse, run, write};
-use crate::core::state::AppState;
+use crate::core::result::{AiReadResult, GRACE, ReadLimits, WriteInfo, WriteResult, timeout_error};
 
-/// Rows one AI read returns.
-fn max_rows(limits: ReadLimits) -> usize {
-    limits.max_rows.max(1)
-}
-
-/// Parses `text` into exactly one statement. The error text carries the parse position.
 pub(crate) fn one_statement(text: &str) -> Result<Statement, AppError> {
     let stmts = parse::parse(text).map_err(AppError::from)?;
-    match stmts.as_slice() {
-        [] => Err(AppError::invalid("The query has no statement")),
-        [s] => Ok(s.clone()),
-        many => Err(AppError::invalid(format!(
-            "Exactly one statement is allowed, found {}",
-            many.len()
-        ))),
+    guard::exactly_one(&stmts)
+        .cloned()
+        .map_err(AppError::invalid)
+}
+
+/// The write the assistant proposes: exactly one statement, not `use`, a write rather than a
+/// read, classified for the preview the user sees. The write parses again when it runs.
+pub fn propose(text: &str, database: &str) -> Result<WriteInfo, AppError> {
+    let s = one_statement(text)?;
+    if matches!(s.command, Command::Use(_)) {
+        return Err(AppError::invalid(
+            "\"use\" is not a write: the statement runs on the source's database",
+        ));
     }
+    if guard::kind(&s.command) == Kind::Read {
+        return Err(AppError::invalid("This is a read. Use run_mongo_read."));
+    }
+    Ok(guard::classify_write(text, Some(database)))
 }
 
 /// The read guard of an AI read: exactly one statement, not `use`, and a provable read by the
@@ -59,39 +62,25 @@ pub(crate) fn read_statement(text: &str) -> Result<Statement, AppError> {
     Ok(s)
 }
 
-/// The server time limit of an AI read: the user's `maxTimeMS` when it is set and smaller,
-/// else `ms`. 0 means "no limit" to the server, so it becomes `ms` too.
+/// 0 means "no limit" to the server, so a zero `maxTimeMS` becomes `ms` too.
 fn capped_ms(user: Option<i64>, ms: i64) -> i64 {
     user.filter(|u| *u > 0).map_or(ms, |u| u.min(ms))
 }
 
-/// A whole non-negative number of a document value.
 fn whole(v: Option<&Bson>) -> Option<i64> {
-    match v {
-        Some(Bson::Int32(n)) if *n >= 0 => Some(i64::from(*n)),
-        Some(Bson::Int64(n)) if *n >= 0 => Some(*n),
-        Some(Bson::Double(f)) if f.fract() == 0.0 && *f >= 0.0 && *f < 9.0e15 => Some(*f as i64),
-        _ => None,
-    }
+    whole_number(v?, 0, i64::MAX)
 }
 
-/// Sets a method's `maxTimeMS` option to `capped_ms` of the user's value.
 fn ms_options(options: &mut Option<Document>, ms: i64) {
     let o = options.get_or_insert_with(Document::new);
     let user = whole(o.get("maxTimeMS"));
     o.insert("maxTimeMS", capped_ms(user, ms));
 }
 
-/// A `$limit` stage value as a row count, when it is a non-negative whole number.
 fn limit_value(stage: &Document) -> Option<u64> {
     whole(stage.get("$limit")).map(|n| n as u64)
 }
 
-/// The statement with the AI limits applied: `find` gets `limit = min(user limit, cap)`;
-/// `aggregate` gets a trailing `$limit` unless its last stage already limits to `cap` or
-/// less; `findOne` becomes a `find` with limit 1. Each gets `maxTimeMS` (`capped_ms`), as does
-/// `countDocuments`; `read` gives `distinct` and `estimatedDocumentCount` theirs, and an
-/// allow-listed read `runCommand` gets it in its command document.
 fn with_read_limits(cmd: Command, cap: usize, timeout: Duration) -> Command {
     let ms = i64::try_from(timeout.as_millis()).unwrap_or(i64::MAX);
     let cap = i64::try_from(cap).unwrap_or(i64::MAX);
@@ -177,98 +166,47 @@ fn with_read_limits(cmd: Command, cap: usize, timeout: Duration) -> Command {
     }
 }
 
-/// Opens the read. `distinct` and `estimatedDocumentCount` have no options in the parsed
-/// command, so their `maxTimeMS` is set here; every other read goes through `run::open_read`.
-async fn open(
-    client: &mongodb::Client,
-    database: &str,
-    cmd: &Command,
-    query_id: &str,
-    batch: Option<u32>,
-    timeout: Duration,
-) -> Result<ReadStream, AppError> {
-    let tag = Bson::String(query_id.to_string());
-    match cmd {
-        Command::Collection {
-            collection,
-            method: Method::Distinct { field, filter },
-        } => {
-            let values = client
-                .database(database)
-                .collection::<Document>(collection)
-                .distinct(field, filter.clone())
-                .comment(tag)
-                .max_time(timeout)
-                .await?;
-            Ok(ReadStream::docs(
-                values.into_iter().map(|v| doc! { "value": v }).collect(),
-            ))
-        }
-        Command::Collection {
-            collection,
-            method: Method::EstimatedDocumentCount,
-        } => {
-            let n = client
-                .database(database)
-                .collection::<Document>(collection)
-                .estimated_document_count()
-                .comment(tag)
-                .max_time(timeout)
-                .await?;
-            Ok(ReadStream::docs(vec![
-                doc! { "count": i64::try_from(n).unwrap_or(i64::MAX) },
-            ]))
-        }
-        _ => run::open_read(client, database, cmd, None, query_id, batch).await,
-    }
-}
-
-/// `run_ai_read` for a MongoDB connection: one mongosh read statement, run through the same
-/// stream the editor uses, capped at `max_rows` documents and `PAGE_BYTES` of BSON.
+/// `run_ai_read` for a MongoDB connection.
 pub async fn read(
-    state: &AppState,
+    access: &impl Access,
     conn: &Connection,
     database: Option<&str>,
     text: &str,
     limits: ReadLimits,
 ) -> Result<AiReadResult, AppError> {
     let s = read_statement(text)?;
-    let database = connections::target_database(conn, database);
+    let database = target_database(conn, database);
     if database.is_empty() {
         return Err(AppError::invalid("Choose a database for this source"));
     }
-    let client = client::client(state, &conn.id).await?;
+    let client = client::client(access, &conn.id).await?;
     let started = Instant::now();
-    let max = max_rows(limits);
+    let limits = limits.sanitized();
+    let max = limits.max_rows;
     // One document more than the page tells whether more exist.
     let cmd = with_read_limits(s.command, max + 1, limits.timeout);
     let query_id = uuid::Uuid::new_v4().to_string();
     let batch = u32::try_from(max + 1).ok();
     let work = async {
-        let mut stream = open(&client, &database, &cmd, &query_id, batch, limits.timeout).await?;
-        let mut f = Flattener::default();
-        let mut bytes = 0usize;
-        let mut truncated = false;
-        while let Some((doc, size)) = stream.next().await? {
-            if f.len() == max || (!f.is_empty() && bytes + size > run::PAGE_BYTES) {
-                truncated = true;
-                break;
-            }
-            bytes += size;
-            f.push(doc);
-        }
-        Ok::<_, AppError>((f.finish(), truncated))
+        let mut stream = run::open_read(
+            &client,
+            &database,
+            &cmd,
+            None,
+            OpComment::new(&query_id),
+            batch,
+            Some(limits.timeout),
+        )
+        .await?;
+        run::page(&mut stream, max).await
     };
     // The server's `maxTimeMS` is `limits.timeout`; this net fires a little later and kills the
     // op through its `comment`, like the editor's cancel.
-    let (page, truncated) = match tokio::time::timeout(limits.timeout + readonly::GRACE, work).await
-    {
+    let (page, end) = match tokio::time::timeout(limits.timeout + GRACE, work).await {
         Ok(r) => r.map_err(|e| time_limit(e, limits.timeout))?,
         Err(_) => {
-            let _ =
-                tokio::time::timeout(readonly::GRACE * 2, run::kill(state, &conn.id, &query_id))
-                    .await;
-            return Err(readonly::timeout_error(limits.timeout));
+            let _ = tokio::time::timeout(GRACE * 2, run::kill(access, &conn.id, &query_id)).await;
+            return Err(timeout_error(limits.timeout));
         }
     };
     let Page {
@@ -280,7 +218,7 @@ pub async fn read(
     Ok(AiReadResult {
         columns,
         rows,
-        truncated,
+        truncated: end != run::PageEnd::Stream,
         elapsed_ms: started.elapsed().as_millis() as u64,
         documents: Some(documents),
     })
@@ -289,20 +227,17 @@ pub async fn read(
 /// The server's `MaxTimeMSExpired` (code 50) is the AI read's time limit: the same `timeout`
 /// error as the client-side net.
 fn time_limit(e: AppError, limit: Duration) -> AppError {
-    if e.server_code.as_deref() == Some("MongoDB error 50") {
-        readonly::timeout_error(limit)
+    if server_code(&e) == Some(MAX_TIME_MS_EXPIRED) {
+        timeout_error(limit)
     } else {
         e
     }
 }
 
-/// `db::write::run_approved` for a MongoDB connection: parses the approved text again, refuses
-/// a cancelled-before-start run, and runs the one statement the way the editor does: the
-/// statements of `write::execute` there, an aggregate with `$out` / `$merge` through
-/// `run::open_read`, and a `runCommand` whose reply is checked for write errors
-/// (`command_affected`). One statement is atomic on one document only.
+/// `db::write::run_approved` for a MongoDB connection. One statement is atomic on one document
+/// only.
 pub async fn run_approved(
-    state: &AppState,
+    access: &impl Access,
     conn: &Connection,
     database: &str,
     text: &str,
@@ -318,28 +253,28 @@ pub async fn run_approved(
         return Err(AppError::invalid("Choose a database for this source"));
     }
     if stop.is_cancelled() {
-        return Err(query::cancelled_error());
+        return Err(AppError::cancelled());
     }
     let started = Instant::now();
-    let client = client::client(state, &conn.id).await?;
+    let client = client::client(access, &conn.id).await?;
     let query_id = uuid::Uuid::new_v4().to_string();
+    let comment = OpComment::new(&query_id);
     let affected = match &s.command {
-        cmd if run::is_write(cmd) => {
-            write::execute(&client, database, cmd, &query_id)
-                .await?
-                .affected
-        }
         Command::RunCommand { admin, command } => {
             let mut command = command.clone();
-            if !command.contains_key("comment") {
-                command.insert("comment", query_id.as_str());
-            }
+            comment.apply(&mut command);
             let target = if *admin { "admin" } else { database };
             let reply = client.database(target).run_command(command).await?;
             command_affected(&reply)?
         }
+        cmd if matches!(guard::kind(cmd), Kind::Write | Kind::Schema) => {
+            write::execute(&client, database, cmd, comment)
+                .await?
+                .affected
+        }
         cmd => {
-            let mut stream = run::open_read(&client, database, cmd, None, &query_id, None).await?;
+            let mut stream =
+                run::open_read(&client, database, cmd, None, comment, None, None).await?;
             while stream.next().await?.is_some() {}
             0
         }
@@ -354,30 +289,54 @@ pub async fn run_approved(
 /// `writeConcernError` become the same `Database` error as a refused write elsewhere. The
 /// changed count is `nModified` (update) or `n`, else 0.
 fn command_affected(reply: &Document) -> Result<u64, AppError> {
-    let refused = |e: &Document| {
-        let code = whole(e.get("code"))
-            .and_then(|c| i32::try_from(c).ok())
-            .unwrap_or(0);
-        server_error(code, e.get_str("errmsg").unwrap_or("Write error"))
-    };
-    if let Ok(errors) = reply.get_array("writeErrors")
-        && let Some(Bson::Document(e)) = errors.first()
-    {
-        return Err(refused(e));
-    }
-    if let Ok(e) = reply.get_document("writeConcernError") {
-        return Err(refused(e));
+    if let Some(error) = crate::core::mongo::conn::reply_write_error(reply) {
+        return Err(error);
     }
     let n = whole(reply.get("nModified")).or_else(|| whole(reply.get("n")));
     Ok(n.map_or(0, |n| n as u64))
 }
 
-// ---- tests ----
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::connections::Engine;
+    use crate::core::engine::Engine;
+    use crate::core::mongo::client::MongoClients;
+    use crate::core::query_registry::QueryRegistry;
+    use crate::core::secrets::{MemoryStore, SecretStore};
+
+    struct TestAccess {
+        conn: Connection,
+        clients: MongoClients,
+        secrets: MemoryStore,
+        queries: QueryRegistry,
+    }
+
+    impl Access for TestAccess {
+        fn connection(&self, _id: &str) -> Result<Connection, AppError> {
+            Ok(self.conn.clone())
+        }
+
+        fn mongo(&self) -> &MongoClients {
+            &self.clients
+        }
+
+        fn secrets(&self) -> &dyn SecretStore {
+            &self.secrets
+        }
+
+        fn queries(&self) -> &QueryRegistry {
+            &self.queries
+        }
+    }
+
+    fn access() -> TestAccess {
+        TestAccess {
+            conn: mongo_conn(),
+            clients: MongoClients::default(),
+            secrets: MemoryStore::new(),
+            queries: QueryRegistry::default(),
+        }
+    }
 
     fn command(text: &str) -> Command {
         one_statement(text).unwrap().command
@@ -538,7 +497,7 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(e.code, ErrorCode::Database);
-        assert_eq!(e.server_code.as_deref(), Some("MongoDB error 11000"));
+        assert_eq!(server_code(&e), Some(11000));
         assert_eq!(e.message, "E11000 duplicate key");
         let e = command_affected(&doc! {
             "n": 1,
@@ -546,7 +505,18 @@ mod tests {
             "ok": 1.0,
         })
         .unwrap_err();
-        assert_eq!(e.server_code.as_deref(), Some("MongoDB error 64"));
+        assert_eq!(server_code(&e), Some(64));
+        // An error without a code keeps the server's message and never becomes "MongoDB error 0".
+        let e = command_affected(&doc! {
+            "n": 0,
+            "writeErrors": [{ "index": 0, "errmsg": "no code here" }],
+            "ok": 1.0,
+        })
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Database);
+        assert_eq!(e.message, "no code here");
+        assert_eq!(server_code(&e), None);
+        assert_eq!(e.detail, None);
         assert_eq!(command_affected(&doc! { "n": 3, "ok": 1.0 }).unwrap(), 3);
         assert_eq!(
             command_affected(&doc! { "n": 3, "nModified": 2, "ok": 1.0 }).unwrap(),
@@ -614,19 +584,20 @@ mod tests {
     /// These checks run before any client is asked for, so no server is needed.
     #[tokio::test]
     async fn refusals_before_the_server() {
-        let dir = tempfile::tempdir().unwrap();
-        let st = AppState::new(
-            dir.path(),
-            Box::new(crate::core::secrets::MemoryStore::new()),
-        )
-        .unwrap();
+        let access = access();
         let conn = mongo_conn();
         let limits = ReadLimits::default();
-        let e = read(&st, &conn, Some("shop"), "db.orders.insertOne({})", limits)
-            .await
-            .unwrap_err();
+        let e = read(
+            &access,
+            &conn,
+            Some("shop"),
+            "db.orders.insertOne({})",
+            limits,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.code, ErrorCode::GuardRejected, "{e:?}");
-        let e = read(&st, &conn, None, "db.orders.find({})", limits)
+        let e = read(&access, &conn, None, "db.orders.find({})", limits)
             .await
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
@@ -635,13 +606,13 @@ mod tests {
         // A stop before the start runs nothing.
         let stop = CancellationToken::new();
         stop.cancel();
-        let e = run_approved(&st, &conn, "shop", "db.orders.deleteMany({})", &stop)
+        let e = run_approved(&access, &conn, "shop", "db.orders.deleteMany({})", &stop)
             .await
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
         let live = CancellationToken::new();
         for text in ["db.a.deleteMany({})\ndb.b.deleteMany({})", "use admin"] {
-            let e = run_approved(&st, &conn, "shop", text, &live)
+            let e = run_approved(&access, &conn, "shop", text, &live)
                 .await
                 .unwrap_err();
             assert_eq!(e.code, ErrorCode::InvalidInput, "{text}: {e:?}");

@@ -1,75 +1,74 @@
 <script lang="ts">
   import { Database, Search, Settings, ScrollText, Sun, Moon, Plus, Sparkles, PanelRight, PanelLeft, CircleArrowUp, PanelBottom } from '@lucide/svelte';
   import { FileCode, Play, Square, X, LoaderCircle, Check, Undo2, ListOrdered, FileUp, Scissors, Copy, ClipboardPaste, ChevronUp, ChevronDown, Table2, Eye, ScanEye, RotateCw, Save, CopyPlus, WandSparkles } from '@lucide/svelte';
-  import { tick, untrack } from 'svelte';
-  import { ui, db, active, envTag, canWrite, isSql, structureChanged, type Conn } from './lib/state.svelte';
+  import { tick } from 'svelte';
+  import { db, envTag, duplicateDraft, sameSource, setAiWrite, dbOf, defaultDb, type Conn } from './lib/connections.svelte';
+  import { ui } from './lib/state.svelte';
   import { look, backdropOn, toggleTheme } from './lib/appearance.svelte';
-  import { connOf, dbOf, openChatOnTab, type Source as ChatSource } from './lib/chat.svelte';
-  import { api, ApiError, type ResultSort, type ForeignKeyInfo, type SnapshotTable, type WriteInfo, type DocumentFormat, type EjsonMode } from './lib/api';
-  import { schemas, runMock, statementKind, nsOf, type QueryResult, type Row, type Schema } from './lib/mock';
-  import { appendStatement, statementRanges } from './lib/sql/text';
-  import { appendMongoStatement, mongoStatementRanges } from './lib/mongo/text';
-  import { toResult, toResults, snapshotSchema, snapshotKey, moreRows } from './lib/results';
+  import { catalog, completionColumns, forget as forgetCatalog, loadSnapshot, loadedTables, properties, snapshot, structureChanged } from './lib/catalog.svelte';
+  import { openChatOnTab } from './lib/chat.svelte';
+  import type { Source as ChatSource } from './lib/connections.svelte';
+  import { api, ApiError } from './lib/api';
+  import { appendStatement } from './lib/sql/text';
+  import { appendMongoStatement } from './lib/mongo/text';
+  import { snapshotSchema } from './lib/results';
+  import { confirmDiscard } from './lib/edits';
+  import { tabs, activeTab, active, newTab, selectTab, closeTab, setTabConn, openTableTab, openSqlTab, clearResults, activateResult, closeResult, pendingOf, tabDatabase, isPlaceholderTitle, type Tab } from './lib/tabs.svelte';
+  import { saved, findSaved, isDirty, suggestName, createSaved, updateSaved, deleteSaved, renameSaved, type SavedQuery } from './lib/saved.svelte';
+  import { displayName, selectSql, insertSql, type TableAction, type TableFilter, type TableRef } from './lib/tableActions';
+  import { tableKey, tableIdOf, tableLabel } from './lib/tableId';
+  import { runs, clock, run, cancel, cancelRun, loadTableData, loadMore, sortResult, refreshResult, countRows, exportTable, exportCollection, askDanger } from './lib/run.svelte';
+  import { manualCommit, refreshStatus, leaveSession, settlePending, txButtons, endActive } from './lib/tx.svelte';
+  import { ask } from './lib/ask.svelte';
+  import { overlays, overlayOpen } from './lib/overlays.svelte';
+  import { notify } from './lib/notice.svelte';
+  import { KEYS, isKey } from './lib/keys';
+  import { classify, statements } from './lib/writeCheck';
   import ConnectionTree from './lib/components/ConnectionTree.svelte';
   import ConnectionDialog from './lib/components/ConnectionDialog.svelte';
   import SqlEditor from './lib/components/SqlEditor.svelte';
+  import type { EditorCommands } from './lib/components/SqlEditor.svelte';
   import ResultsGrid from './lib/components/ResultsGrid.svelte';
   import ChatPanel from './lib/components/ChatPanel.svelte';
   import SafeguardDialog from './lib/components/SafeguardDialog.svelte';
-  import MongoWriteDialog from './lib/components/MongoWriteDialog.svelte';
   import SettingsPage from './lib/components/SettingsPage.svelte';
   import AuditPage from './lib/components/AuditPage.svelte';
   import CommandPalette, { type PaletteTable } from './lib/components/CommandPalette.svelte';
   import DeleteConnectionDialog from './lib/components/DeleteConnectionDialog.svelte';
   import TargetBar from './lib/components/TargetBar.svelte';
-  import TableDangerDialog from './lib/components/TableDangerDialog.svelte';
   import TableProperties from './lib/components/TableProperties.svelte';
-  import ExportDocumentsDialog from './lib/components/ExportDocumentsDialog.svelte';
   import TableFilterBar from './lib/components/TableFilterBar.svelte';
   import SavedQueries from './lib/components/SavedQueries.svelte';
   import SaveQueryDialog from './lib/components/SaveQueryDialog.svelte';
-  import { saved, findSaved, isDirty, suggestName, createSaved, updateSaved, deleteSaved, renameSaved, type SavedQuery, type SaveAsk } from './lib/saved.svelte';
-  import { qualified, displayName, selectSql, insertSql, dangerSql, tableDataSql, mongoCollection, type TableAction, type TableRef, type TableFilter, type Danger } from './lib/tableActions';
-  import { audit, logQuery } from './lib/audit.svelte';
-  import { confirmDiscard, edits, pendingCount, resetEdits } from './lib/edits.svelte';
-  import { tabs, activeTab, newTab, selectTab, closeTab, setTabConn, defaultDb, openTableTab, setResults, replaceResult, replaceActiveResult, activateResult, closeResult, clearResults, pendingOf, type Tab } from './lib/tabs.svelte';
-  import { manualCommit, refreshStatus, endTx, leaveSession, settlePending, txPrompt } from './lib/tx.svelte';
-  import PendingTxDialog from './lib/components/PendingTxDialog.svelte';
+  import NoticeToast from './lib/components/NoticeToast.svelte';
   import WhatsNewDialog from './lib/components/WhatsNewDialog.svelte';
+  import AskHost from './lib/components/AskHost.svelte';
   import { updates, checkForUpdates, showWhatsNew } from './lib/updates.svelte';
 
-  const isMock = api.kind === 'mock';
   // The overlay title bar puts the macOS window buttons over the top-left corner.
-  const inset = api.kind === 'tauri' && /Mac/.test(navigator.userAgent);
-  // Mock mode opens on a sample query, like the prototype.
-  if (!tabs.list.length) newTab(isMock ? 'SELECT *\nFROM public.orders\nWHERE status = \'paid\'\nLIMIT 50;' : '');
+  const inset = api.capabilities.windowEffects && /Mac/.test(navigator.userAgent);
+  if (!tabs.list.length) newTab('');
   // Never undefined: closing the last tab opens a fresh one.
   const tab = $derived(activeTab()!);
   checkForUpdates(true);
   showWhatsNew();
 
-  let guardTarget = $state<Conn | null>(null);
-  // The Mongo write confirm: the run waits on the dialog's answer.
-  let writeAsk = $state<{ info: WriteInfo; conn: Conn; resolve: (ok: boolean) => void } | null>(null);
-  let connDialog = $state(false);
-  let connEdit = $state<Conn | null>(null);
-  let connDelete = $state<Conn | null>(null);
-  let paletteOpen = $state(false);
-  let editor = $state<ReturnType<typeof SqlEditor>>();
+  let editor = $state<{ commands(): EditorCommands }>();
+  let scriptInput = $state<HTMLInputElement>();
 
   // Capture phase so ⌘K wins even while CodeMirror has focus.
   $effect(() => {
     const onkey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      if (isKey(e, KEYS.palette.combo)) {
         e.preventDefault();
         e.stopPropagation();
-        if (connDialog || connDelete || danger || guardTarget || writeAsk || txPrompt.ask || saveAsk) return;
-        paletteOpen = !paletteOpen;
-      } else if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 's') {
+        if (overlayOpen()) return;
+        overlays.palette = !overlays.palette;
+      } else if (!e.altKey && isKey(e, KEYS.save.combo)) {
         // ⌘S saves, ⇧⌘S saves as a new query. preventDefault also stops the WebView's "Save page".
         e.preventDefault();
         e.stopPropagation();
-        if (connDialog || connDelete || danger || guardTarget || writeAsk || txPrompt.ask || saveAsk || paletteOpen) return;
+        if (overlayOpen()) return;
         saveQuery(e.shiftKey);
       }
     };
@@ -80,7 +79,7 @@
   async function focusEditor() {
     ui.page = 'query';
     await tick();
-    editor?.focus();
+    editor?.commands().focus();
   }
 
   // The WebView's own menu (Reload, Play All Animations) has no use in the app. Text fields and
@@ -157,7 +156,7 @@
   }
 
   async function switchConn(c: Conn) {
-    if (c.id === conn.id || !confirmDiscard()) return;
+    if (c.id === conn.id || !confirmDiscard(tab.edits)) return;
     const t = tab;
     if (!(await settlePending([t], 'Switching the connection'))) return;
     leaveSession(t);
@@ -167,7 +166,7 @@
 
   // The session belongs to the old database, like a connection switch.
   async function switchDb(name: string) {
-    if (conn.engine === 'sqlite' || name === database || !confirmDiscard()) return;
+    if (conn.engine === 'sqlite' || name === database || !confirmDiscard(tab.edits)) return;
     const t = tab;
     if (!(await settlePending([t], 'Switching the database'))) return;
     leaveSession(t);
@@ -191,58 +190,22 @@
     if (created || filters) loadTableData(nt);
   }
 
-  // Foreign keys of each opened table, keyed like `Tab.opened.key`; the Data view links their cells to the referenced row.
-  let tableFks = $state<Record<string, ForeignKeyInfo[]>>({});
-  const tableId = (c: Conn, t: TableRef) => `${c.id}/${t.database}/${t.schema ?? ''}/${t.name}`;
-
-  /** `force`: load again after a structure change. A failed load leaves the table without links. */
-  function loadForeignKeys(c: Conn, t: TableRef, force = false) {
-    const key = tableId(c, t);
-    if (key in tableFks && !force) return;
-    tableFks[key] ??= [];
-    api.tableProperties(c.id, t.database, t.schema, t.name).then((p) => (tableFks[key] = p.foreignKeys)).catch(() => {});
-  }
-
   /** Opens the referenced table, filtered to the row that `row` points at. */
-  function followForeignKey(c: Conn, from: TableRef, fk: ForeignKeyInfo, row: Row) {
+  function followForeignKey(c: Conn, from: TableRef, fk: { columns: string[]; refSchema?: string | null; refTable: string; refColumns: string[] }, row: Record<string, unknown>) {
     const values = fk.columns.map((col) => row[col]);
     if (values.some((v) => v === null || typeof v === 'object')) return;
     const ref: TableRef = { database: from.database, schema: fk.refSchema ?? null, name: fk.refTable, kind: 'table' };
     openTableView(c, ref, fk.refColumns.map((column, i) => ({ id: crypto.randomUUID(), column, operator: '=', value: String(values[i]) })));
   }
 
-  /** Runs the table tab's filtered read (SELECT, or find() on MongoDB); also the Refresh button of its Data view. */
-  function loadTableData(t: Tab) {
-    const ref = t.table!;
-    const c = db.connections.find((x) => x.id === t.connId)!;
-    // No LIMIT: the run limit pages the rows, so "Load more" can fetch further. A filter value that
-    // the read cannot hold as typed stops here, so nothing malformed reaches the server.
-    let sql: string;
-    try {
-      sql = tableDataSql(c.engine, ref, t.filters, t.result?.columns ?? [], t.result?.types ?? []);
-    } catch (e) {
-      notify(false, e instanceof Error ? e.message : String(e));
-      return;
-    }
-    t.query = sql;
-    t.opened = { key: tableId(c, ref), sql };
-    // MongoDB has no foreign keys to link.
-    if (isSql(c)) loadForeignKeys(c, ref);
-    run(undefined, { sql, sort: t.sort });
-  }
-
   // The tabs stay in the title bar on every page; picking one goes back to the query view.
   function pickTab(id: string) {
-    // A running save may not see its tab switch: its reset would wipe the next tab's edits.
-    if (edits.saving) return;
-    // Pending grid edits belong to their tab, so switching never discards them.
     if (id !== tab.id) selectTab(id);
     ui.page = 'query';
   }
 
   let tabStrip = $state<HTMLDivElement>();
   async function addTab() {
-    if (edits.saving) return;
     // A new tab keeps the edits of the tab it leaves: it never asks to discard them.
     newTab();
     ui.page = 'query';
@@ -252,16 +215,14 @@
 
   // Pending edits belong to the active tab's result; other tabs can close without asking.
   async function dropTab(t: Tab) {
-    if (edits.saving) return;
+    if (t.edits.saving) return;
     if (isDirty(t) && !confirm(`“${t.title}” has unsaved changes. Close the tab without saving them?`)) return;
-    if (t.pending && !confirm(`“${t.title}” has unsaved grid changes. Close the tab without saving them?`)) return;
-    if (t.id === tab.id && !confirmDiscard()) return;
+    if (t.id !== tab.id && pendingOf(t) && !confirm(`“${t.title}” has unsaved grid changes. Close the tab without saving them?`)) return;
+    if (t.id === tab.id && !confirmDiscard(t.edits)) return;
     if (!(await settlePending([t], 'Closing this tab')) || !tabs.list.some((x) => x.id === t.id)) return;
-    const r = running[t.id];
-    if (r) api.cancelQuery(r.id).catch(() => {});
+    cancelRun(t);
     closeTab(t.id);
-    // Every tab may hold a session; the backend ignores tabs without one.
-    api.closeTabSession(t.id).catch(() => {});
+    leaveSession(t);
   }
 
   let renaming = $state<string | null>(null);
@@ -277,227 +238,48 @@
 
   const conn = $derived(active());
   const hasConn = $derived(db.connections.length > 0);
-  // `||`: a tab opened before the connections loaded has no database yet.
-  const database = $derived(conn.engine === 'sqlite' ? 'main' : tab.database || conn.database);
-  let snapshot = $state<{ key: string; schema: Schema; tables: SnapshotTable[] } | null>(null);
-  // The mock serves SQL connections from the prototype's local tables; a mock MongoDB connection
-  // goes through the API like a real one, because the mock backend answers its calls.
-  const protoMock = $derived(isMock && isSql(conn));
-  const schema = $derived(protoMock ? schemas[conn.schema] : snapshot?.key === `${conn.id}/${database}` ? snapshot.schema : {});
+  const database = $derived(tabDatabase(tab, conn));
+  // Autocomplete and palette tables of the active database; the catalog loads them once per database.
+  const snap = $derived(snapshot(conn.id, database));
+  const schema = $derived(snapshotSchema(snap?.status === 'ok' ? snap.items : null));
   const tables = $derived(Object.keys(schema));
   // Tree highlight follows the shown result; joins, unions, CTEs and aggregates have no single table.
   const selected = $derived.by(() => {
-    const { result: r, opened, resultConn } = tab;
-    if (!protoMock) return opened && r && !r.error && r.sql === opened.sql ? opened.key : null;
-    if (!r?.table || !r.sql || r.error) return null;
-    if (/\b(join|union|group\s+by|distinct)\b|^\s*with\b|\bfrom\s+[\w.]+(\s+\w+)?\s*,|\b(count|sum|avg|min|max)\s*\(/i.test(r.sql.replace(/--.*$/gm, ''))) return null;
-    return `${resultConn.id}/${nsOf(resultConn.engine, r.table)}/${r.table}`;
+    const { result: r, opened } = tab;
+    return opened && r && !r.error && r.sql === opened.sql ? tableKey(opened.id) : null;
   });
-  // statementKind reads SQL keywords; a Mongo tab only needs to know whether there is any text to run.
-  const kind = $derived(conn.engine === 'mongo' ? (tab.query.trim() ? 'read' : 'empty') : statementKind(tab.query));
+  // SQL: the statements decide the Run/Save cues. A Mongo tab only needs to know whether there is any text to run.
+  const split = $derived(statements(conn.engine, tab.query));
+  const kind = $derived(conn.engine === 'mongo' ? (tab.query.trim() ? 'read' : 'empty') : split.empty ? 'empty' : split.write ? 'write' : 'read');
+  const busy = $derived(runs[tab.id]);
+  const now = $derived(clock.now);
+  // Foreign keys of the table a tab shows; the grid links their cells to the referenced row.
+  const tableFks = $derived(tab.opened ? (properties(tab.opened.id.connId, tab.opened.id.database, tab.opened.id.schema, tab.opened.id.name)?.items?.foreignKeys ?? []) : []);
 
-  // Autocomplete and palette tables of real connections; failures only leave autocomplete empty.
   $effect(() => {
-    if (protoMock || !conn.id) return;
-    const key = `${conn.id}/${database}`;
-    const engine = conn.engine;
-    if (untrack(() => snapshot?.key) === key) return;
-    api.schemaSnapshot(conn.id, database).then(
-      (s) => { if (`${active().id}/${database}` === key) snapshot = { key, schema: snapshotSchema(s, engine), tables: s.tables }; },
-      () => {},
-    );
+    // A structure change or a connection pointing elsewhere drops the snapshot; load it again.
+    catalog.rev;
+    if (!conn.id) return;
+    void loadSnapshot(conn.id, database);
   });
 
-  /**
-   * Autocomplete columns of a table the snapshot holds without columns (cut by the column cap), or of a
-   * PG table outside `public` written without its schema (only when the name is unique).
-   */
-  async function columnsOf(path: string[]): Promise<string[]> {
-    const c = conn;
-    const d = database;
-    if (protoMock || snapshot?.key !== `${c.id}/${d}` || path.length > 2) return [];
-    const [ns, name] = path.length === 2 ? path : [undefined, path[0]];
-    const hits = snapshot.tables.filter((t) => t.name === name && (ns === undefined || t.schema === ns));
-    const t = hits.find((t) => !t.schema || t.schema === 'public') ?? (hits.length === 1 ? hits[0] : undefined);
-    if (!t) return [];
-    if (t.columns.length) return t.columns.map((x) => x.name);
-    return (await api.listColumns(c.id, d, t.schema ?? null, t.name)).map((x) => x.name);
-  }
+  /** Autocomplete columns beyond the snapshot; the catalog answers from its own caches. */
+  const columnsOf = (path: string[]) => completionColumns(conn.id, database, path);
 
-  const DEFAULT_LIMIT = 200;
-  /** The row count of a trailing `LIMIT n` (also `LIMIT n OFFSET m` and MySQL/SQLite `LIMIT m, n`), or null. */
-  function sqlLimit(sql: string): number | null {
-    const m = /\blimit\s+(\d+)(?:\s*,\s*(\d+)|\s+offset\s+\d+)?\s*;?$/i.exec(sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim());
-    return m ? Number(m[2] ?? m[1]) : null;
-  }
-  /** The row count of the last `.limit(<int>)` of the mongosh text, or null. */
-  function mongoLimit(sql: string): number | null {
-    const all = [...sql.matchAll(/\.limit\s*\(\s*(\d+)\s*\)/g)];
-    return all.length ? Number(all.at(-1)![1]) : null;
-  }
-  // Keyed by tab id; the Run/Cancel button and timer show the active tab's run only.
-  // `script`: a file run; `done`/`total` come from the backend while it runs.
-  const running = $state<Record<string, { id: string; started: number; script?: { name: string; done: number; total: number } }>>({});
-  const busy = $derived(running[tab.id]);
-  let now = $state(Date.now());
-  $effect(() => {
-    if (!busy) return;
-    const t = setInterval(() => (now = Date.now()), 250);
-    return () => clearInterval(t);
-  });
-
-  // Statement kinds that change what the tree lists or a collection's contents.
-  const MONGO_STRUCTURE = new Set(['createCollection', 'drop', 'renameCollection', 'createIndex', 'createIndexes', 'dropIndex', 'dropIndexes', 'dropDatabase', 'runCommand']);
-  const SQL_STRUCTURE = /^(CREATE|DROP|ALTER|RENAME|TRUNCATE)\b/;
-
-  /** Whether a run changed the schema: the tree and open Properties views then reload. */
-  function changesStructure(engine: Conn['engine'], sql: string | undefined, info: WriteInfo | null): boolean {
-    if (engine === 'mongo') {
-      // An aggregate that writes a collection changes what the tree lists.
-      if (sql && /\$out\b|\$merge\b/.test(sql)) return true;
-      return !!info?.statements.some((s) => s.read === false && MONGO_STRUCTURE.has(s.kind));
-    }
-    return !!info?.statements.some((s) => SQL_STRUCTURE.test(s.kind));
-  }
-
-  /** Collections a run wrote, with the database each statement ran in (`use` included). */
-  function mongoWriteTargets(stmts: { sql: string; isRead: boolean; database?: string }[], fallback: string) {
-    const out: { database: string; collection: string }[] = [];
-    for (const s of stmts) {
-      if (s.isRead) continue;
-      const raw = /getCollection\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')\s*\)/.exec(s.sql)?.[1] ?? /^db\.([A-Za-z_$][\w$]*)\s*\./.exec(s.sql)?.[1];
-      if (!raw) continue;
-      const quote = raw[0];
-      const collection = quote === '"' || quote === "'" ? raw.slice(1, -1).replace(/\\(["'\\])/g, '$1') : raw;
-      out.push({ database: s.database ?? fallback, collection });
-    }
-    return out;
-  }
-
-  /** Reloads the connection's loaded tree nodes and tells open Properties views to reload their data. */
-  function treeChanged(c: Conn) {
-    tree?.refreshStructure(c);
-    structureChanged();
-  }
-
-  /**
-   * Runs the selection, or the statement at the cursor (as DBeaver's Ctrl+Enter); without an editor,
-   * the whole query. `again` re-runs the shown result with a higher limit.
-   * `pick` runs the given SQL instead; with `script` (a file name) the toolbar shows statement progress.
-   * With `append` the results open as new result tabs after the current ones.
-   */
-  async function run(again?: { sql: string; limit: number; sort?: ResultSort }, pick?: { sql?: string; script?: string; sort?: ResultSort; append?: boolean }) {
-    // The result lands on this tab even if the user switches tabs while it runs.
-    const t = tab;
-    if (running[t.id] || (!again && !confirmDiscard())) return;
-    // A re-run keeps its target: switching or closing result tabs during the await must not
-    // move its rows into another Result tab.
-    const targetResult = again ? t.result : null;
-    const sql = again?.sql ?? pick?.sql ?? (editor ? editor.selection().trim() || editor.statementAt() : t.query);
-    const sort = again?.sort ?? pick?.sort;
-    if (!again) t.sort = pick?.sort;
-    const c = conn;
-    // statementKind reads SQL keywords; Mongo only needs to know whether there is any text.
-    const mongo = c.engine === 'mongo';
-    if (mongo ? !sql.trim() : statementKind(sql) === 'empty') return;
-    // A re-run (load more, sort, refresh after save) goes to the database the result came from: a Mongo `use` may have changed it.
-    const dbName = (again && targetResult?.database) || database;
-    // A LIMIT in the SQL wins over the default page size; the backend caps it at 100,000.
-    const limit = again?.limit ?? Math.max((mongo ? mongoLimit(sql) : sqlLimit(sql)) ?? 0, DEFAULT_LIMIT);
-    // Every run is classified, so the audit log can tell a write from a read and a schema change
-    // refreshes the tree. Production Mongo writes ask first, like the table danger dialogs;
-    // unparsable text runs anyway, so the backend's parse error shows in the result.
-    let writeInfo: WriteInfo | null = null;
-    if (!again) {
-      const info = await api.classifyWrite(c.engine, sql, database).catch(() => null);
-      writeInfo = info;
-      if (mongo && info && c.env === 'production' && canWrite(c) && info.statements.some((s) => s.read === false) && !info.warnings.some((w) => w.code === 'unparsable')) {
-        const ok = await new Promise<boolean>((resolve) => (writeAsk = { info, conn: c, resolve }));
-        if (!ok) return;
-      }
-    }
-    const id = crypto.randomUUID();
-    const started = Date.now();
-    running[t.id] = { id, started, script: pick?.script ? { name: pick.script, done: 0, total: 0 } : undefined };
-    now = started;
-    // A run should show its result, so it opens a hidden grid.
-    ui.resultsOpen = true;
-    // Polls until the run ends; a poll that fails only leaves the count where it was.
-    const poll = pick?.script
-      ? setInterval(() => {
-          api.queryProgress(id).then((p) => {
-            const s = running[t.id]?.id === id ? running[t.id].script : undefined;
-            if (p && s) [s.done, s.total] = [p.done, p.total];
-          }, () => {});
-        }, 300)
-      : undefined;
-    let r: QueryResult;
-    let all: QueryResult[] | undefined;
-    let active = 0;
-    let runStatements: { sql: string; isRead: boolean; database?: string }[] = [];
-    try {
-      const queryRun = await api.runQuery({ connId: c.id, database: dbName, sql, queryId: id, limit, tabId: t.id, sort });
-      runStatements = queryRun.statements;
-      if (again) {
-        r = toResult(queryRun, isMock, limit, dbName);
-      } else {
-        const converted = toResults(queryRun, isMock, limit, dbName);
-        all = converted.results;
-        active = converted.active;
-        r = all[active] ?? { columns: [], rows: [], ms: queryRun.elapsedMs, note: 'Statement ran.' };
-      }
-    } catch (e) {
-      const err = ApiError.from(e);
-      r = { columns: [], rows: [], ms: Date.now() - started, error: err.code === 'cancelled' ? (err.detail ? `Query cancelled. ${err.detail}` : 'Query cancelled') : err.message, live: !isMock };
-    } finally {
-      clearInterval(poll);
-      delete running[t.id];
-      refreshStatus(t);
-    }
-    if (again) {
-      if (targetResult) replaceResult(t, targetResult, r);
-      else replaceActiveResult(t, r);
-    } else {
-      const fresh = all?.length ? all : [r];
-      if (pick?.append) setResults(t, [...t.results, ...fresh], t.results.length + (all?.length ? active : 0));
-      else setResults(t, fresh, all?.length ? active : 0);
-      t.resultConn = c;
-    }
-    if (again) {
-      t.resultConn = c;
-      return;
-    }
-    // A Mongo write was classified before the dialog; SQL uses statementKind.
-    const wrote = mongo ? !!writeInfo?.statements.some((s) => s.read === false) : statementKind(sql) === 'write';
-    logQuery({
-      kind: wrote ? 'WRITE' : 'READ',
-      source: 'You',
-      sql: sql.trim(),
-      result: r.error ? { status: 'error', message: r.error } : { status: 'ok', rows: r.rows.length },
-      ms: r.ms,
-    });
-    if (!r.error) {
-      if (changesStructure(c.engine, sql, writeInfo)) treeChanged(c);
-      // A Mongo write into a name the tree does not list can create it: insert, upsert, bulkWrite,
-      // or a `use newdb` before the statement. Known collections stay free of a reload.
-      else if (mongo && mongoWriteTargets(runStatements, dbName).some((x) => !tree?.hasCollection(c, x.database, x.collection))) treeChanged(c);
-    }
-  }
-
-  function cancel() {
-    if (busy) api.cancelQuery(busy.id).catch(() => {});
+  /** The SQL a plain Run executes: the selection, or the statement at the cursor, or the whole query. */
+  function currentSql(): string {
+    return editor ? editor.commands().selection().trim() || editor.commands().statementAt() : tab.query;
   }
 
   // Editor context menu. It replaces the native menu, so it carries Cut / Copy / Paste too.
   let editorMenu = $state<{ x: number; y: number; sel: boolean } | null>(null);
-  let scriptInput = $state<HTMLInputElement>();
 
   function openEditorMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    editor?.pointAt(e.clientX, e.clientY);
+    editor?.commands().pointAt(e.clientX, e.clientY);
     // Menu is w-64 (256px) and about 340px tall; keep it inside the window.
-    editorMenu = { x: Math.max(4, Math.min(e.clientX, innerWidth - 260)), y: Math.max(4, Math.min(e.clientY, innerHeight - 344)), sel: !!editor?.selection() };
+    editorMenu = { x: Math.max(4, Math.min(e.clientX, innerWidth - 260)), y: Math.max(4, Math.min(e.clientY, innerHeight - 344)), sel: !!editor?.commands().selection() };
   }
 
   // The action runs first: the menu's `{@const}` reads `editorMenu`, which is null once closed.
@@ -507,15 +289,15 @@
   }
 
   function copySelection(cut: boolean) {
-    const s = editor?.selection();
+    const s = editor?.commands().selection();
     if (!s) return;
     navigator.clipboard?.writeText(s).catch(() => {});
-    if (cut) editor?.insert('');
+    if (cut) editor?.commands().insert('');
   }
 
   function formatQuery() {
     try {
-      editor?.format();
+      editor?.commands().format();
     } catch (e) {
       notify(false, `Cannot format: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -525,28 +307,12 @@
   async function runScript(e: Event & { currentTarget: HTMLInputElement }) {
     const f = e.currentTarget.files?.[0];
     e.currentTarget.value = ''; // so picking the same file again fires change
-    if (f) run(undefined, { sql: await f.text(), script: f.name });
-  }
-
-  // Error of the last Commit/Rollback button press, shown on its tab only.
-  let txError = $state<{ tab: string; text: string } | null>(null);
-  let txBusy = $state(false);
-  async function endActive(commit: boolean) {
-    const t = tab;
-    txBusy = true;
-    txError = null;
-    try {
-      await endTx(t, commit);
-    } catch (e) {
-      txError = { tab: t.id, text: ApiError.from(e).message };
-    } finally {
-      txBusy = false;
-    }
+    if (f) run({ sql: await f.text(), script: f.name });
   }
 
   // Create and duplicate point the active tab at the new connection.
   async function canSwitch() {
-    if (!confirmDiscard()) return false;
+    if (!confirmDiscard(tab.edits)) return false;
     const t = tab;
     if (!(await settlePending([t], 'Switching the connection'))) return false;
     leaveSession(t);
@@ -567,14 +333,14 @@
   // Tauri: closing the window or menu Quit with a pending transaction asks here first; the backend rolls back
   // whatever is left. A quit during another tab prompt waits for it (Cancel there cancels the quit too).
   $effect(() => {
-    if (api.kind !== 'tauri') return;
+    if (!api.capabilities.quitPrompt) return;
     let off: (() => void) | undefined;
     let gone = false;
     import('@tauri-apps/api/event')
       .then(({ listen }) =>
         listen('sandb://quit-requested', async () => {
-          if (edits.saving) return;
-          if ((pendingCount() || tabs.list.some((t) => t.pending)) && !confirm('There are unsaved grid changes. Quit without saving them?')) return;
+          if (tabs.list.some((t) => t.edits.saving)) return;
+          if ((tabs.list.some((t) => pendingOf(t)) || tabs.list.some((t) => t.status?.pending)) && !confirm('There are unsaved grid changes. Quit without saving them?')) return;
           if (await settlePending(tabs.list, 'Quitting sandb', true)) api.quitApp().catch(() => {});
         }),
       )
@@ -587,14 +353,13 @@
 
   // Tauri: the menu's Close Tab (⌘W) closes the active tab. Ignored while a dialog or prompt is open.
   $effect(() => {
-    if (api.kind !== 'tauri') return;
+    if (!api.capabilities.nativeMenu) return;
     let off: (() => void) | undefined;
     let gone = false;
     import('@tauri-apps/api/event')
       .then(({ listen }) =>
         listen('sandb://close-tab', () => {
-          if (edits.saving) return;
-          if (connDialog || connDelete || danger || guardTarget || writeAsk || txPrompt.ask || paletteOpen) return;
+          if (overlayOpen()) return;
           dropTab(tab);
         }),
       )
@@ -608,12 +373,12 @@
   // Bridge and mock: best effort only. The browser asks before leaving; on leave, sessions are dropped (rolled back).
   // Every tab, as `status` may be stale; the bridge request uses keepalive so the unload does not cancel it.
   $effect(() => {
-    if (api.kind === 'tauri') return;
+    if (!api.capabilities.pageUnload) return;
     const onbefore = (e: BeforeUnloadEvent) => {
-      if (tabs.list.some((t) => t.status?.pending) || tabs.list.some((t) => t.pending) || pendingCount()) e.preventDefault();
+      if (tabs.list.some((t) => t.status?.pending) || tabs.list.some((t) => pendingOf(t))) e.preventDefault();
     };
     const onhide = () => {
-      for (const t of tabs.list) api.closeTabSession(t.id).catch(() => {});
+      for (const t of tabs.list) api.closeTabSession({ tabId: t.id }).catch(() => {});
     };
     window.addEventListener('beforeunload', onbefore);
     window.addEventListener('pagehide', onhide);
@@ -626,102 +391,79 @@
   // Tauri decides a window close in Rust: tell it when grid edits (live or in an inactive tab) are unsaved.
   let unsavedSent: boolean | null = null;
   $effect(() => {
-    const unsaved = pendingCount() > 0 || tabs.list.some((t) => t.pending);
+    const unsaved = tabs.list.some((t) => pendingOf(t));
     if (unsaved === unsavedSent) return;
     unsavedSent = unsaved;
-    api.setUnsavedEdits?.(unsaved).catch(() => {});
+    api.setUnsavedEdits(unsaved).catch(() => {});
   });
-
-  function loadMore() {
-    const r = tab.result;
-    if (r?.sql && r.limit && moreRows(r)) run({ sql: r.sql, limit: r.limit * 2, sort: tab.table ? tab.sort : r.sort });
-  }
-
-  function resultLabel(t: Tab, r: QueryResult, i: number) {
-    if (r.title) return r.title;
-    return t.results.length > 1 ? `Result ${i + 1}` : (r.table ?? 'Results');
-  }
-
-  function resultTip(r: QueryResult, i: number) {
-    return r.title ?? r.table ?? r.sql?.replace(/\s+/g, ' ').slice(0, 120) ?? `Result ${i + 1}`;
-  }
 
   /** Switching result tabs drops edit mode, like switching editor tabs. */
   function openResult(t: Tab, i: number) {
     if (t.resultIndex === i) return;
-    if (!confirmDiscard()) return;
+    if (!confirmDiscard(t.edits)) return;
     activateResult(t, i);
-    resetEdits(true);
   }
 
   /** The X of one result tab; closing the last one hides the results pane. */
   function dropResult(t: Tab, i: number) {
     const active = i === t.resultIndex;
-    if (active && !confirmDiscard()) return;
+    if (active && !confirmDiscard(t.edits)) return;
     closeResult(t, i);
-    if (active) resetEdits(true);
     if (!t.results.length) ui.resultsOpen = false;
   }
 
-  function sortResult(t: Tab, sort: ResultSort) {
-    const r = t.result;
-    if (!r?.sql || !r.sortable || r.summary || running[t.id] || !confirmDiscard()) return;
-    // The sort belongs to the shown result, not to the editor tab.
-    if (t.table) t.sort = sort;
-    else r.sort = sort;
-    run({ sql: r.sql, limit: r.limit ?? DEFAULT_LIMIT, sort });
+  function resultLabel(t: Tab, r: { title?: string }, i: number) {
+    if (r.title) return r.title;
+    return t.results.length > 1 ? `Result ${i + 1}` : 'Results';
   }
 
-  function refreshResult(t: Tab) {
-    const r = t.result;
-    if (r?.sql) run({ sql: r.sql, limit: r.limit ?? DEFAULT_LIMIT, sort: t.table ? t.sort : r.sort });
+  function resultTip(r: { title?: string; sql?: string }, i: number) {
+    return r.title ?? r.sql?.replace(/\s+/g, ' ').slice(0, 120) ?? `Result ${i + 1}`;
   }
+
   function newConnection() {
     connEdit = null;
-    connDialog = true;
+    overlays.connection = true;
   }
 
   function editConnection(c: Conn) {
     connEdit = c;
-    connDialog = true;
+    overlays.connection = true;
   }
 
   // The copy is saved (and switched to) only when the user clicks Save in the dialog.
   function duplicateConnection(c: Conn) {
-    const name = `${c.name} (copy)`;
-    connEdit = { ...c, id: name.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now().toString(36), name, aiWrite: false, copyOf: c.id };
-    connDialog = true;
+    connEdit = duplicateDraft(c);
+    overlays.connection = true;
   }
+  let connEdit = $state<Conn | null>(null);
 
   // The dialog asks about transactions; a changed target makes every result on the connection stale.
   function connEdited(c: Conn, dbChanged: boolean) {
     // The save closed the tab sessions on this connection.
     for (const t of tabs.list) if (t.connId === c.id) refreshStatus(t);
     if (!dbChanged) return;
-    const sql = c.id === conn.id ? tab.result?.sql : undefined;
-    const dropped = tabs.list.filter((t) => t.connId === c.id && t.pending).length;
+    const dropped = tabs.list.filter((t) => t.connId === c.id && pendingOf(t)).length;
     for (const t of tabs.list) {
       if (t.connId !== c.id) continue;
       t.database = defaultDb(c);
-      // The rows came from the old target; parked edits and results go with it.
+      // The rows came from the old target; edits and results go with it.
       clearResults(t);
       t.opened = null;
     }
     if (dropped) notify(false, `Unsaved grid edits in ${dropped} tab${dropped === 1 ? '' : 's'} were dropped: the connection target changed.`);
-    if (c.id !== conn.id) return;
-    if (!protoMock) return openFirstTable();
-    if (sql) replaceActiveResult(tab, runMock(sql, schema, conn));
+    if (c.id === conn.id) openFirstTable();
   }
 
-  // Throws on a backend error; DeleteConnectionDialog shows it and keeps the connection.
-  async function deleteConnection(c: Conn) {
+  /** Throws on a backend error; the delete dialog shows it and keeps the connection. `false`: nothing was deleted. */
+  async function deleteConnection(c: Conn): Promise<boolean> {
     const wasActive = c.id === conn.id;
-    if (wasActive && !confirmDiscard()) return;
+    if (wasActive && !confirmDiscard(tab.edits)) return false;
     // One decision for every tab on the connection; Cancel leaves the delete dialog open.
-    if (!(await settlePending(tabs.list.filter((t) => t.connId === c.id), 'Deleting the connection'))) return;
-    await api.deleteConnection(c.id);
+    if (!(await settlePending(tabs.list.filter((t) => t.connId === c.id), 'Deleting the connection'))) return false;
+    await api.deleteConnection({ id: c.id });
     db.connections.splice(db.connections.findIndex((x) => x.id === c.id), 1);
-    connDelete = null;
+    forgetCatalog(c);
     // Other tabs on it move too; their results would otherwise stay editable against a deleted connection.
     // With none left, they keep the stale id until the next saved connection claims the active tab.
     const next = db.connections[0];
@@ -734,6 +476,15 @@
       t.status = null;
     }
     if (wasActive && next) openFirstTable();
+    return true;
+  }
+
+  async function enableWrites(c: Conn) {
+    if (await ask<boolean>(SafeguardDialog, { conn: c })) await setAiWrite(c, true);
+  }
+
+  async function askDeleteConnection(c: Conn) {
+    await ask<boolean>(DeleteConnectionDialog, { conn: c, run: () => deleteConnection(c) });
   }
 
   // Shown at once; on a save error the list goes back to the old order.
@@ -742,7 +493,7 @@
     const at = (order: string[], c: Conn) => order.indexOf(c.id) >>> 0; // Unknown ids (-1) go last.
     db.connections.sort((a, b) => at(ids, a) - at(ids, b));
     try {
-      await api.reorderConnections(ids);
+      await api.reorderConnections({ ids });
     } catch (e) {
       db.connections.sort((a, b) => at(prev, a) - at(prev, b));
       notify(false, `Could not save the connection order: ${ApiError.from(e).message}`);
@@ -750,101 +501,52 @@
   }
 
   function openFirstTable() {
-    if (protoMock) return openTable(tables[0]);
-    // Real databases: nothing runs until the user opens a table or runs a query.
+    // Nothing runs until the user opens a table or runs a query.
     tab.opened = null;
     clearResults(tab);
   }
 
-  /** Mock mode: runs the table in the active tab. `t`: a table name as the palette lists it. */
-  function openTable(t: string) {
-    if (!confirmDiscard()) return;
-    tab.query = `SELECT *\nFROM ${conn.engine === 'pg' ? nsOf(conn.engine, t) + '.' : ''}${t}\nLIMIT 200;`;
-    // The editor text updates after this tick, so the statement goes in as SQL.
-    run(undefined, { sql: tab.query });
-  }
-
-  /** A palette table: real connections open it in its own table tab, like the tree does. */
-  function openPaletteTable(t: string) {
-    ui.page = 'query';
-    if (protoMock) return openTable(t);
-    const found = snapshot?.key === `${conn.id}/${database}` ? snapshot.tables.find((x) => snapshotKey(x, conn.engine) === t) : undefined;
-    if (found) openTableView(conn, { database, schema: found.schema ?? null, name: found.name, kind: found.kind });
-  }
-
-  // ---- table menu of the connection tree ----
-  let tree = $state<ReturnType<typeof ConnectionTree>>();
-
-  // AI writes run inside the chat; the audit log tells us when one succeeded, so a schema change
-  // there refreshes the tree too (the seeded demo entries are skipped).
-  let auditSeen = untrack(() => audit.entries.at(-1)?.id ?? 0);
-  $effect(() => {
-    const last = audit.entries.at(-1);
-    if (!last || last.id <= auditSeen) return;
-    const fresh = audit.entries.filter((e) => e.id > auditSeen);
-    auditSeen = last.id;
-    for (const e of fresh) {
-      if (e.source !== 'AI' || e.kind !== 'WRITE' || e.result.status !== 'ok') continue;
-      const c = db.connections.find((x) => x.id === e.connId);
-      if (!c) continue;
-      void api.classifyWrite(c.engine, e.sql)
-        .then((info) => {
-          if (changesStructure(c.engine, e.sql, info)) return treeChanged(c);
-          if (c.engine !== 'mongo') return;
-          const targets = mongoWriteTargets([{ sql: e.sql, isRead: false, database: c.database }], c.database);
-          if (targets.some((x) => !tree?.hasCollection(c, x.database, x.collection))) treeChanged(c);
-        })
-        .catch(() => {});
-    }
-  });
-
   // Palette tables: the whole active database (its snapshot), plus every table list the tree has loaded in other databases.
   const paletteTables = $derived.by<PaletteTable[]>(() => {
     const here = `${conn.name} / ${database}`;
-    const out: PaletteTable[] = tables.map((t) => ({ key: `${conn.id}/${database}/${t}`, label: t, hint: here, open: () => openPaletteTable(t) }));
-    if (protoMock) return out;
-    for (const { c, t } of tree?.loadedTables() ?? []) {
+    const out: PaletteTable[] = [];
+    const seen = new Set<string>();
+    for (const t of snap?.status === 'ok' ? (snap.items?.tables ?? []) : []) {
+      const label = tableLabel(t);
+      if (seen.has(label)) continue;
+      seen.add(label);
+      out.push({ key: `${conn.id}/${database}/${label}`, label, hint: here, open: () => openTableView(conn, { database, schema: t.schema ?? null, name: t.name, kind: t.kind }) });
+    }
+    for (const { c, t } of loadedTables()) {
       if (c.id === conn.id && t.database === database) continue;
       const open = () => { ui.page = 'query'; openTableView(c, t); };
-      // Same naming as the snapshot tables: `public` stays implicit.
-      const label = t.schema && t.schema !== 'public' ? displayName(t) : t.name;
-      out.push({ key: `${c.id}/${t.database}/${t.schema ?? ''}/${t.name}`, label, hint: `${c.name} / ${t.database}`, open });
+      out.push({ key: tableKey(tableIdOf(c.id, t)), label: tableLabel(t), hint: `${c.name} / ${t.database}`, open });
     }
     return out;
   });
 
-  let danger = $state<Danger | null>(null);
-  // The tree's "Export collection..." dialog: the collection it exports, while the dialog is open.
-  let docExport = $state<{ c: Conn; t: TableRef } | null>(null);
-  // Outcome of an action that has no other place to show it (count, export, a save, an error). `action`: e.g. Undo.
-  let notice = $state<{ ok: boolean; text: string; action?: { label: string; run: () => void } } | null>(null);
-  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
-  function notify(ok: boolean, text: string, action?: { label: string; run: () => void }) {
-    notice = { ok, text, action };
-    clearTimeout(noticeTimer);
-    noticeTimer = setTimeout(() => (notice = null), ok ? (action ? 8000 : 5000) : 10000);
-  }
-
   // ---- saved queries ----
-  let saveAsk = $state<SaveAsk | null>(null);
   const savedQ = $derived(findSaved(tab.savedId));
   const tabClean = $derived(!!savedQ && !isDirty(tab));
 
   /** ⌘S: a linked tab writes to its query at once; any other tab asks for a name. `copy` (⇧⌘S) always asks and saves a new query. */
-  function saveQuery(copy = false) {
+  async function saveQuery(copy = false) {
     const t = tab;
     if (ui.page !== 'query' || t.table || !hasConn) return;
     const q = findSaved(t.savedId);
     if (q && !copy) return updateSaved(t);
     if (!t.query.trim()) return;
-    const name = q ? `${q.name} copy` : /^Query \d+$/.test(t.title) ? suggestName(t.query) : t.title;
-    saveAsk = { tab: t, name, copy: !!q };
-  }
-
-  function confirmSave(a: SaveAsk, name: string) {
-    saveAsk = null;
-    createSaved(a.tab, name);
-    notify(true, `Saved “${name}”`, ui.sidebarOpen && ui.sidebarView === 'queries' ? undefined : { label: 'Show', run: () => { ui.sidebarOpen = true; ui.sidebarView = 'queries'; } });
+    const name = q ? `${q.name} copy` : isPlaceholderTitle(t.title) ? suggestName(t.query) : t.title;
+    const chosen = await ask<string | null>(SaveQueryDialog, {
+      name,
+      copy: !!q,
+      conn: db.connections.find((c) => c.id === t.connId),
+      database: t.database,
+      lines: t.query.split('\n').length,
+    });
+    if (!chosen) return;
+    createSaved(t, chosen);
+    notify(true, `Saved “${chosen}”`, ui.sidebarOpen && ui.sidebarView === 'queries' ? undefined : { label: 'Show', run: () => { ui.sidebarOpen = true; ui.sidebarView = 'queries'; } });
     focusEditor();
   }
 
@@ -856,12 +558,11 @@
     const c = own ?? conn;
     const dbName = own && q.database ? q.database : defaultDb(c);
     const cur = tab;
-    const blank = !cur.table && !cur.savedId && !cur.query.trim() && !cur.result && !running[cur.id] && cur.connId === c.id && cur.database === dbName;
+    const blank = !cur.table && !cur.savedId && !cur.query.trim() && !cur.result && !runs[cur.id] && cur.connId === c.id && cur.database === dbName;
     const t = blank ? cur : newTab();
     if (!blank) {
       setTabConn(t, c);
       t.database = dbName;
-      t.resultConn = c;
     }
     t.query = q.sql;
     t.title = q.name;
@@ -869,8 +570,8 @@
     ui.page = 'query';
     await tick();
     tabStrip?.querySelector('[aria-current=page]')?.scrollIntoView({ inline: 'nearest' });
-    if (andRun) run(undefined, { sql: t.query });
-    else editor?.focus();
+    if (andRun) void run({ sql: t.query }, t);
+    else editor?.commands().focus();
   }
 
   function deleteQuery(q: SavedQuery) {
@@ -879,139 +580,79 @@
 
   /** Generated SQL opens in a new tab on the table's connection and database; nothing runs. */
   function openInNewTab(c: Conn, t: TableRef, sql: string) {
-    const nt = newTab(sql);
-    setTabConn(nt, c);
-    if (c.engine !== 'sqlite') nt.database = t.database;
+    openSqlTab(c, t.database, sql);
     ui.page = 'query';
   }
 
   /** Chat SQL opens on the database its step ran on; older steps without one use the active tab's database. */
   function chatTab(sql: string, src?: ChatSource) {
-    const nt = newTab(sql);
-    const c = src && connOf(src);
-    if (src && c) {
-      setTabConn(nt, c);
-      nt.resultConn = c;
-      if (c.engine !== 'sqlite') nt.database = dbOf(src, c);
-    }
-    return nt;
+    const c = src && src.connId ? db.connections.find((x) => x.id === src.connId) : undefined;
+    return c ? openSqlTab(c, src!.database ?? null, sql) : newTab(sql);
   }
 
   /** A Run from a chat code block: a new tab there, or the active editor tab the user picked when it is on the same database. */
   async function chatRun(sql: string, src?: ChatSource, target: 'active' | 'new' = 'new') {
     // Writes are inserted for review, never executed straight from an assistant reply.
-    const engine = (src ? connOf(src)?.engine : conn.engine) ?? 'pg';
-    let hasWrite: boolean;
-    if (engine === 'mongo') {
-      // mongosh text: the guard API classifies it; when it cannot answer — or the text does not
-      // parse — fail closed to insert-only so nothing runs blind.
-      const info = await api.classifyWrite('mongo', sql).catch(() => null);
-      hasWrite = !info || info.warnings.some((w) => w.code === 'unparsable') || info.statements.some((s) => s.read === false);
-    } else {
-      hasWrite = statementRanges(sql, engine).some(([from, to]) => statementKind(sql.slice(from, to)) === 'write');
-    }
-    if (hasWrite) {
+    const c = src ? db.connections.find((x) => x.id === src.connId) : undefined;
+    const engine = c?.engine ?? conn.engine;
+    const cls = await classify(engine, sql, src ? dbOf(src, c) : database);
+    if (cls.write) {
       ui.page = 'query';
       chatInsert(sql, src);
       return;
     }
     const t = tab;
-    const same = !src || !connOf(src) || (t.connId === src.connId && t.database === dbOf(src));
+    const same = !src || !c || sameSource({ connId: t.connId, database: t.database }, { connId: c.id, database: src.database });
     if (target === 'new' || !same) {
       ui.page = 'query';
-      chatTab(sql, src);
-      run(undefined, { sql });
+      void run({ sql }, chatTab(sql, src), cls);
       return;
     }
-    const empty = engine === 'mongo' ? !mongoStatementRanges(sql).length : statementKind(sql) === 'empty';
-    if (t.table || running[t.id] || empty || !confirmDiscard()) return;
+    if (t.table || runs[t.id] || cls.empty || !confirmDiscard(t.edits)) return;
     ui.page = 'query';
     // Keep the query already in the tab; the new one goes below it as its own statement.
-    t.query = engine === 'mongo' ? appendMongoStatement(t.query, sql) : appendStatement(t.query, sql, conn.engine);
-    run(undefined, { sql });
+    t.query = engine === 'mongo' ? appendMongoStatement(t.query, sql) : appendStatement(t.query, sql, engine);
+    void run({ sql }, t, cls);
   }
 
   /** Appended to the active editor when it is on the step's database, else into a new tab there. */
   function chatInsert(sql: string, src?: ChatSource) {
-    const same = !src || !connOf(src) || (tab.connId === src.connId && tab.database === dbOf(src));
+    const c = src ? db.connections.find((x) => x.id === src.connId) : undefined;
+    const same = !src || !c || sameSource({ connId: tab.connId, database: tab.database }, { connId: c.id, database: src.database });
     if (!tab.table && same) tab.query = conn.engine === 'mongo' ? appendMongoStatement(tab.query, sql) : appendStatement(tab.query, sql, conn.engine);
     else chatTab(sql, src);
   }
 
   async function tableAction(a: TableAction, c: Conn, t: TableRef) {
-    const e = c.engine;
     try {
       switch (a) {
         case 'view':
           return openTableView(c, t);
         case 'ddl':
-          return openInNewTab(c, t, await api.tableDdl(c.id, t.database, t.schema, t.name));
+          return openInNewTab(c, t, await api.tableDdl({ connId: c.id, database: t.database, schema: t.schema, table: t.name }));
         case 'select':
         case 'insert': {
-          const cols = await api.listColumns(c.id, t.database, t.schema, t.name);
-          return openInNewTab(c, t, a === 'select' ? selectSql(e, t, cols) : insertSql(e, t, cols));
+          const cols = await api.listColumns({ connId: c.id, database: t.database, schema: t.schema, table: t.name });
+          return openInNewTab(c, t, a === 'select' ? selectSql(c.engine, t, cols) : insertSql(c.engine, t, cols));
         }
-        case 'count': {
-          const sql = `SELECT count(*) FROM ${qualified(e, t)}`;
-          const started = Date.now();
-          // No tabId: a read through the pool, outside any tab transaction.
-          const r = await api.runQuery({ connId: c.id, database: t.database, sql, queryId: crypto.randomUUID(), limit: 1 });
-          logQuery({ kind: 'READ', source: 'You', sql, result: { status: 'ok', rows: 1 }, ms: Date.now() - started, conn: c });
-          const n = Number(r.statements[0]?.rows[0]?.[0]);
-          return notify(true, `${displayName(t)}: ${Number.isFinite(n) ? n.toLocaleString() : '?'} rows`);
-        }
+        case 'count':
+          return countRows(c, t);
         case 'exportDdl':
-        case 'exportSql': {
-          const out = await api.exportTableSql(c.id, t.database, t.schema, t.name, a === 'exportSql');
-          const what = e === 'mongo' ? 'script' : 'DDL';
-          if (!out.cancelled) notify(true, a === 'exportSql' && t.kind === 'table' ? `Exported the ${what} and ${out.rows} rows to ${out.path}` : `Exported the ${what} to ${out.path}`);
-          return;
-        }
-        case 'exportCsv': {
-          const out = await api.exportCsv(c.id, t.database, `SELECT * FROM ${qualified(e, t)}`);
-          if (!out.cancelled) notify(true, `Exported ${out.rows} rows to ${out.path}`);
-          return;
-        }
+        case 'exportSql':
+        case 'exportCsv':
+          return exportTable(c, t, a);
         case 'exportDocuments':
-          docExport = { c, t };
+          void exportCollection(c, t);
           return;
         case 'truncate':
         case 'drop':
-          danger = { action: a, c, t };
+          void askDanger({ action: a, c, t });
       }
     } catch (err) {
       notify(false, ApiError.from(err).message);
     }
   }
-
-  // The tree's collection export: the dialog asks for the format, and the read is every document of the collection.
-  // Throws on a backend error; the dialog shows it and stays open.
-  async function exportCollection(format: DocumentFormat, ejson: EjsonMode) {
-    const d = docExport;
-    if (!d) return;
-    const sql = `${mongoCollection(d.t.name)}.find({})`;
-    const out = format === 'csv' ? await api.exportCsv(d.c.id, d.t.database, sql) : await api.exportDocuments(d.c.id, d.t.database, sql, format, ejson);
-    if (out.cancelled) return;
-    docExport = null;
-    notify(true, `Exported ${out.rows} ${format === 'csv' ? 'rows' : 'documents'} to ${out.path}`);
-  }
-
-  // Runs through the pool without a tabId, so it commits at once, also on Production (the dialog asks first).
-  // Throws on a backend error; the dialog shows it and stays open.
-  async function runDanger(d: Danger) {
-    const sql = dangerSql(d.c.engine, d.t, d.action);
-    const started = Date.now();
-    try {
-      const r = await api.runQuery({ connId: d.c.id, database: d.t.database, sql, queryId: crypto.randomUUID(), limit: 1 });
-      logQuery({ kind: 'WRITE', source: 'You', sql, result: { status: 'ok', rows: r.statements[0]?.affected ?? 0 }, ms: Date.now() - started, conn: d.c });
-    } catch (err) {
-      logQuery({ kind: 'WRITE', source: 'You', sql, result: { status: 'error', message: ApiError.from(err).message }, ms: Date.now() - started, conn: d.c });
-      throw err;
-    }
-    danger = null;
-    tree?.refreshTables(d.c, d.t);
-    notify(true, `${d.action === 'drop' ? 'Dropped' : 'Truncated'} ${displayName(d.t)}`);
-  }</script>
+</script>
 
 <!-- Behind everything: the picked image, or nothing (see-through window). The ::after layer tints it with the canvas color. -->
 {#if backdropOn()}
@@ -1046,7 +687,7 @@
             {:else}
               <button class="flex h-full items-center gap-2 pl-2.5" aria-current={t.id === tab.id ? 'page' : undefined} onclick={() => pickTab(t.id)} ondblclick={() => (renaming = t.id)} title="{prodT ? 'Production · ' : ''}Double-click to rename">
                 {#if t.table}<Table2 size={13} class={on ? 'text-accent' : 'text-faint'} />{:else}<FileCode size={13} class={on ? 'text-accent' : 'text-faint'} />{/if} <span class="max-w-40 truncate">{t.title}</span>{#if prodT}<span class="sr-only">, production</span>{/if}
-                {#if running[t.id] && !on}<LoaderCircle size={12} class="animate-spin text-faint" />{/if}
+                {#if runs[t.id] && !on}<LoaderCircle size={12} class="animate-spin text-faint" />{/if}
                 {#if t.status?.pending}<span class="size-1.5 rounded-full bg-amber-500" title="Transaction open"></span>{/if}
               </button>
             {/if}
@@ -1071,9 +712,9 @@
        Hidden, not unmounted, so the tree keeps its expanded nodes. -->
   <aside class="flex shrink-0 flex-col overflow-hidden" style:width="{ui.sidebarWidth}px" hidden={!ui.sidebarOpen}>
     <div class="pt-1 pb-2">
-      <button class="flex h-7 w-full items-center gap-2 rounded-md bg-hover px-2.5 text-muted hover:bg-active hover:text-ink" onclick={() => (paletteOpen = true)}>
+      <button class="flex h-7 w-full items-center gap-2 rounded-md bg-hover px-2.5 text-muted hover:bg-active hover:text-ink" onclick={() => (overlays.palette = true)}>
         <Search size={13} /> <span class="flex-1 text-left">Quick search</span>
-        <kbd class="text-[11px]">⌘K</kbd>
+        <kbd class="text-[11px]">{KEYS.palette.hint}</kbd>
       </button>
     </div>
 
@@ -1084,7 +725,7 @@
 
     <!-- Both stay mounted: the tree keeps its expanded nodes, the list its filter. -->
     <nav class="-mx-1 flex-1 overflow-auto px-1 pb-2" hidden={ui.sidebarView !== 'connections'}>
-      <ConnectionTree bind:this={tree} {selected} onopen={openTableView} onnew={newConnection} onedit={editConnection} onduplicate={duplicateConnection} ondelete={(c) => (connDelete = c)} ontable={tableAction} onreorder={reorderConnections} />
+      <ConnectionTree {selected} onopen={openTableView} onnew={newConnection} onedit={editConnection} onduplicate={duplicateConnection} ondelete={askDeleteConnection} ontable={tableAction} onreorder={reorderConnections} />
     </nav>
     <nav class="-mx-1 flex-1 overflow-auto px-1 pb-2" hidden={ui.sidebarView !== 'queries'} aria-label="Saved queries">
       <SavedQueries activeId={ui.page === 'query' ? (savedQ?.id ?? null) : null} onopen={(q) => openSaved(q)} onrun={(q) => openSaved(q, true)} ondelete={deleteQuery} />
@@ -1111,7 +752,7 @@
     <!-- Production work gets a red top edge on every view of the tab: table data, properties and the editor. -->
     {#if ui.page === 'query' && hasConn && conn.env === 'production'}<div class="pointer-events-none absolute inset-x-0 top-0 z-10 h-0.5 bg-red-600 dark:bg-red-500" aria-hidden="true"></div>{/if}
     {#if ui.page === 'settings'}
-      <SettingsPage onEnableWrites={(c) => (guardTarget = c)} />
+      <SettingsPage onEnableWrites={enableWrites} />
     {:else if ui.page === 'audit'}
       <AuditPage />
     {:else if !hasConn}
@@ -1146,17 +787,17 @@
       {/if}
     </div>
     {#if tab.view === 'data'}
-      {@const tableKey = conn.engine === 'pg' && t.schema && t.schema !== 'public' ? `${t.schema}.${t.name}` : t.name}
-      {@const columns = tab.result?.columns.length ? tab.result.columns : (schema[tableKey] ?? [])}
+      {@const key = tableLabel(t)}
+      {@const columns = tab.result?.columns.length ? tab.result.columns : (schema[key] ?? [])}
       <div class="flex min-h-0 flex-1 flex-col border-t border-line">
         <TableFilterBar {columns} types={tab.result?.types ?? []} bind:filters={tab.filters} loading={!!busy} onapply={() => loadTableData(tab)} />
         <div class="relative min-h-0 flex-1">
-          <ResultsGrid result={tab.result} conn={tab.resultConn} {schema} loading={!!busy} sort={tab.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={loadMore} onsaved={() => { treeChanged(tab.resultConn); refreshResult(tab); }} foreignKeys={tableFks[tab.opened?.key ?? '']} onfollow={(fk, row) => followForeignKey(conn, t, fk, row)} />
+          <ResultsGrid tab={tab} loading={!!busy} sort={tab.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} foreignKeys={tableFks} onfollow={(fk, row) => followForeignKey(conn, t, fk, row)} />
         </div>
       </div>
     {:else}
       <div class="flex min-h-0 flex-1 border-t border-line">
-        {#key tab.id}<TableProperties {conn} table={t} onchanged={() => { loadForeignKeys(conn, t, true); tree?.refreshTables(conn, t); }} onopen={(r) => openTableView(conn, r)} />{/key}
+        {#key tab.id}<TableProperties {conn} table={t} onopen={(r) => openTableView(conn, r)} />{/key}
       </div>
     {/if}
     {:else}
@@ -1170,12 +811,12 @@
         {@const st = tab.status}
         <span class="mx-1 h-4 w-px shrink-0 bg-line"></span>
         <!-- An aborted transaction counts as pending; Rollback is the way out of it. Disabled buttons do not show tooltips reliably, so the wrappers carry the title. -->
-        <span class="shrink-0" title="Commit the tab's open transaction"><button class="btn btn-ghost px-2 @[16rem]:px-2.5" onclick={() => endActive(true)} disabled={!st?.pending || st.aborted || !!busy || txBusy} title="Commit the tab's open transaction" aria-label="Commit"><Check size={14} /> <span class="hidden @[16rem]:inline">Commit</span></button></span>
-        <span class="shrink-0" title="Roll back the tab's open transaction"><button class="btn btn-ghost px-2 @[16rem]:px-2.5" onclick={() => endActive(false)} disabled={!(st?.pending || st?.aborted) || !!busy || txBusy} title="Roll back the tab's open transaction" aria-label="Rollback"><Undo2 size={14} /> <span class="hidden @[16rem]:inline">Rollback</span></button></span>
+        <span class="shrink-0" title="Commit the tab's open transaction"><button class="btn btn-ghost px-2 @[16rem]:px-2.5" onclick={() => endActive(true)} disabled={!st?.pending || st.aborted || !!busy || txButtons.busy} title="Commit the tab's open transaction" aria-label="Commit"><Check size={14} /> <span class="hidden @[16rem]:inline">Commit</span></button></span>
+        <span class="shrink-0" title="Roll back the tab's open transaction"><button class="btn btn-ghost px-2 @[16rem]:px-2.5" onclick={() => endActive(false)} disabled={!(st?.pending || st?.aborted) || !!busy || txButtons.busy} title="Roll back the tab's open transaction" aria-label="Rollback"><Undo2 size={14} /> <span class="hidden @[16rem]:inline">Rollback</span></button></span>
         {#if st?.pending}
           <span class="flex min-w-0 items-center gap-1.5 text-[12px] font-medium text-amber-700 dark:text-amber-400" role="status" title="Transaction open"><span class="size-1.5 shrink-0 rounded-full bg-amber-500"></span> <span class="truncate">Transaction open</span></span>
         {/if}
-        {#if txError?.tab === tab.id}<span class="min-w-0 truncate text-[12px] text-red-700 dark:text-red-400" role="alert">{txError.text}</span>{/if}
+        {#if txButtons.error?.tab === tab.id}<span class="min-w-0 truncate text-[12px] text-red-700 dark:text-red-400" role="alert">{txButtons.error.text}</span>{/if}
       {/if}
       </div>
       <!-- statementKind reads SQL keywords, so a Mongo tab has no Read/Write cue. -->
@@ -1187,7 +828,7 @@
         {/if}
       {/if}
       <!-- A saved, unchanged tab shows "Saved"; ⌘S then has nothing to write. -->
-      <button class="btn btn-ghost shrink-0 px-2 xl:px-2.5" onclick={() => saveQuery()} disabled={!savedQ && kind === 'empty'} title={savedQ ? (tabClean ? `“${savedQ.name}” is saved · ⇧⌘S saves a copy` : `Save changes to “${savedQ.name}” (⌘S)`) : 'Save query (⌘S)'} aria-label={tabClean ? 'Saved' : 'Save query'}>
+      <button class="btn btn-ghost shrink-0 px-2 xl:px-2.5" onclick={() => saveQuery()} disabled={!savedQ && kind === 'empty'} title={savedQ ? (tabClean ? `“${savedQ.name}” is saved · ⇧⌘S saves a copy` : `Save changes to “${savedQ.name}” (${KEYS.save.hint})`) : `Save query (${KEYS.save.hint})`} aria-label={tabClean ? 'Saved' : 'Save query'}>
         {#if tabClean}<Check size={14} class="text-emerald-600 dark:text-emerald-400" />{:else}<Save size={14} />{/if}
         <span class="hidden xl:inline">{tabClean ? 'Saved' : 'Save'}</span>
       </button>
@@ -1208,7 +849,7 @@
         <span class="font-mono text-[11.5px] text-muted tabular-nums">{((now - busy.started) / 1000).toFixed(1)} s</span>
         <button class="btn btn-secondary" onclick={cancel} title="Cancel the running query"><Square size={11} class="fill-current" /> Cancel</button>
       {:else}
-        <button class="btn btn-primary pr-2" onclick={() => run()} disabled={kind === 'empty'} title="Run the selection, or the statement at the cursor"><Play size={11} class="fill-current" /> Run <kbd class="ml-0.5 hidden font-sans text-[11px] font-normal lg:inline" aria-hidden="true">⌘↵</kbd></button>
+        <button class="btn btn-primary pr-2" onclick={() => run({ sql: currentSql() })} disabled={kind === 'empty'} title="Run the selection, or the statement at the cursor"><Play size={11} class="fill-current" /> Run <kbd class="ml-0.5 hidden font-sans text-[11px] font-normal lg:inline" aria-hidden="true">{KEYS.run.hint}</kbd></button>
       {/if}
     </div>
 
@@ -1216,7 +857,7 @@
     <div class="min-h-28 overflow-hidden {ui.resultsOpen ? 'shrink-0' : 'flex-1'}" style:height={ui.resultsOpen ? `${ui.editorSplit * 100}%` : undefined} oncontextmenu={openEditorMenu}>
       <!-- Keyed so undo never crosses into another tab's text. -->
       {#key tab.id}
-        <SqlEditor bind:this={editor} bind:value={tab.query} onrun={() => run()} onrunnew={() => run(undefined, { append: true })} onrunall={() => run(undefined, { sql: tab.query })} onformat={formatQuery} {schema} {columnsOf} dialect={conn.engine} />
+        <SqlEditor bind:this={editor} bind:value={tab.query} onrun={() => run({ sql: currentSql() })} onrunnew={() => run({ sql: currentSql(), append: true })} onrunall={() => run({ sql: tab.query })} onformat={formatQuery} {schema} {columnsOf} dialect={conn.engine} />
       {/key}
     </div>
     <input bind:this={scriptInput} type="file" accept=".sql,text/plain" class="hidden" onchange={runScript} />
@@ -1257,7 +898,7 @@
         {/if}
         <div class="relative min-h-0 flex-1">
           {#key `${tab.id}:${tab.resultIndex}:${tab.result?.sql ?? ''}:${tab.result?.title ?? ''}`}
-            <ResultsGrid result={tab.result} conn={tab.resultConn} {schema} loading={!!busy} sort={tab.result?.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={loadMore} onsaved={() => { treeChanged(tab.resultConn); refreshResult(tab); }} />
+            <ResultsGrid tab={tab} loading={!!busy} sort={tab.result?.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} />
           {/key}
         </div>
       </div>
@@ -1276,7 +917,7 @@
     <!-- Below 880 px the panel floats over the main card, so it has no gap to drag. -->
     <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
     <div class="-mx-2 hidden w-2 shrink-0 cursor-col-resize rounded-full outline-none hover:bg-accent/25 focus-visible:bg-accent/40 min-[880px]:block" role="separator" aria-orientation="vertical" aria-label="Resize assistant" aria-valuenow={ui.chatWidth} aria-valuemin={280} aria-valuemax={640} tabindex="0" onpointerdown={resizeChat} onkeydown={keyChat}></div>
-    <ChatPanel {tables} activeBusy={!!busy} onEnableWrites={(c) => (guardTarget = c)} onInsertSql={chatInsert} onRunSql={chatRun} />
+    <ChatPanel {tables} activeBusy={!!busy} onEnableWrites={enableWrites} onInsertSql={chatInsert} onRunSql={chatRun} />
   {/if}
   </div>
 </div>
@@ -1284,47 +925,28 @@
 {#if editorMenu}
   {@const m = editorMenu}
   <div class="popover fixed z-40 w-64 p-1" style="left:{m.x}px;top:{m.y}px" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-    <button class="nav-item" role="menuitem" disabled={!!busy} onclick={() => menuAct(() => run(undefined, { sql: m.sel ? editor!.selection() : editor!.statementAt() }))}><Play size={13} /> <span class="flex-1">{m.sel ? 'Run selection' : 'Run statement at cursor'}</span><kbd class="kbd">⌘↵</kbd></button>
-    <button class="nav-item" role="menuitem" disabled={!!busy || kind === 'empty'} onclick={() => menuAct(() => run(undefined, { sql: tab.query }))}><ListOrdered size={13} /> <span class="flex-1">Run all statements</span><kbd class="kbd">⌥X</kbd></button>
+    <button class="nav-item" role="menuitem" disabled={!!busy} onclick={() => menuAct(() => run({ sql: m.sel ? editor!.commands().selection() : editor!.commands().statementAt() }))}><Play size={13} /> <span class="flex-1">{m.sel ? 'Run selection' : 'Run statement at cursor'}</span><kbd class="kbd">{KEYS.run.hint}</kbd></button>
+    <button class="nav-item" role="menuitem" disabled={!!busy || kind === 'empty'} onclick={() => menuAct(() => run({ sql: tab.query }))}><ListOrdered size={13} /> <span class="flex-1">Run all statements</span><kbd class="kbd">{KEYS.runAll.hint}</kbd></button>
     <button class="nav-item" role="menuitem" disabled={!!busy} onclick={() => menuAct(() => scriptInput?.click())}><FileUp size={13} /> Run SQL script from file…</button>
-    <button class="nav-item" role="menuitem" disabled={kind === 'empty'} onclick={() => menuAct(formatQuery)}><WandSparkles size={13} /> <span class="flex-1">{m.sel ? 'Format selection' : 'Format query'}</span><kbd class="kbd">⇧⌘F</kbd></button>
+    <button class="nav-item" role="menuitem" disabled={kind === 'empty'} onclick={() => menuAct(formatQuery)}><WandSparkles size={13} /> <span class="flex-1">{m.sel ? 'Format selection' : 'Format query'}</span><kbd class="kbd">{KEYS.format.hint}</kbd></button>
     <div class="mx-2 my-1 h-px bg-line"></div>
-    <button class="nav-item" role="menuitem" disabled={!savedQ && kind === 'empty'} onclick={() => menuAct(() => saveQuery())}><Save size={13} /> <span class="flex-1">{savedQ ? 'Save changes' : 'Save query…'}</span><kbd class="kbd">⌘S</kbd></button>
-    <button class="nav-item" role="menuitem" disabled={kind === 'empty'} onclick={() => menuAct(() => saveQuery(true))}><CopyPlus size={13} /> <span class="flex-1">Save as new query…</span><kbd class="kbd">⇧⌘S</kbd></button>
+    <button class="nav-item" role="menuitem" disabled={!savedQ && kind === 'empty'} onclick={() => menuAct(() => saveQuery())}><Save size={13} /> <span class="flex-1">{savedQ ? 'Save changes' : 'Save query…'}</span><kbd class="kbd">{KEYS.save.hint}</kbd></button>
+    <button class="nav-item" role="menuitem" disabled={kind === 'empty'} onclick={() => menuAct(() => saveQuery(true))}><CopyPlus size={13} /> <span class="flex-1">Save as new query…</span><kbd class="kbd">{KEYS.saveAs.hint}</kbd></button>
     <div class="mx-2 my-1 h-px bg-line"></div>
     <button class="nav-item" role="menuitem" disabled={!m.sel} onclick={() => menuAct(() => copySelection(true))}><Scissors size={13} /> Cut</button>
     <button class="nav-item" role="menuitem" disabled={!m.sel} onclick={() => menuAct(() => copySelection(false))}><Copy size={13} /> Copy</button>
-    <button class="nav-item" role="menuitem" onclick={() => menuAct(() => navigator.clipboard?.readText().then((s) => editor?.insert(s), () => {}))}><ClipboardPaste size={13} /> Paste</button>
-    <button class="nav-item" role="menuitem" onclick={() => menuAct(() => editor?.selectAll())}><span class="size-[13px]"></span> Select all</button>
+    <button class="nav-item" role="menuitem" onclick={() => menuAct(() => navigator.clipboard?.readText().then((s) => editor?.commands().insert(s), () => {}))}><ClipboardPaste size={13} /> Paste</button>
+    <button class="nav-item" role="menuitem" onclick={() => menuAct(() => editor?.commands().selectAll())}><span class="size-[13px]"></span> Select all</button>
   </div>
 {/if}
-<SafeguardDialog bind:target={guardTarget} />
-<MongoWriteDialog bind:ask={writeAsk} />
-<ConnectionDialog bind:open={connDialog} conn={connEdit} canswitch={canSwitch} canupdate={canUpdate} onsaved={openFirstTable} onedited={connEdited} />
-<DeleteConnectionDialog bind:target={connDelete} ondelete={deleteConnection} />
-<TableDangerDialog bind:target={danger} onconfirm={runDanger} />
-{#if docExport}
-  <ExportDocumentsDialog onexport={exportCollection} onclose={() => (docExport = null)} />
-{/if}
-<SaveQueryDialog bind:ask={saveAsk} onsave={confirmSave} />
+<ConnectionDialog bind:open={overlays.connection} conn={connEdit} canswitch={canSwitch} canupdate={canUpdate} onsaved={openFirstTable} onedited={connEdited} />
 <WhatsNewDialog />
-{#if notice}
-  {@const n = notice}
-  <div class="popover fixed bottom-3 left-3 z-50 flex max-w-md items-start gap-2 px-3 py-2 text-[12.5px] {n.ok ? 'text-ink' : 'text-red-700 dark:text-red-300'}" role={n.ok ? 'status' : 'alert'}>
-    <span class="min-w-0 flex-1 break-words">{n.text}</span>
-    {#if n.action}
-      {@const a = n.action}
-      <!-- Run first: `a` reads `notice`, which is null once cleared. -->
-      <button class="-my-0.5 h-6 shrink-0 rounded px-1.5 text-[12.5px] font-medium text-accent hover:bg-hover" onclick={() => { a.run(); notice = null; }}>{a.label}</button>
-    {/if}
-    <button class="grid size-5 shrink-0 place-items-center rounded text-faint hover:bg-hover hover:text-ink" aria-label="Dismiss" onclick={() => (notice = null)}><X size={12} /></button>
-  </div>
-{/if}
+<NoticeToast />
 <CommandPalette
-  bind:open={paletteOpen}
+  bind:open={overlays.palette}
   tables={paletteTables}
   onfocuseditor={focusEditor}
-  onrun={() => { if (kind === 'empty') return; ui.page = 'query'; run(); }}
+  onrun={() => { if (kind === 'empty') return; ui.page = 'query'; run({ sql: currentSql() }); }}
   ontogglechat={() => (ui.chatOpen = !ui.chatOpen)}
   ontogglesidebar={() => (ui.sidebarOpen = !ui.sidebarOpen)}
   onpage={(p) => (ui.page = p)}
@@ -1334,5 +956,5 @@
   onsave={() => saveQuery()}
   onopensaved={(q) => openSaved(q)}
 />
-<!-- Last, so it stacks above the connection and delete dialogs that wait on it. -->
-<PendingTxDialog />
+<!-- Last, so an answer stacks above the connection dialog and any dialog that waits on it. -->
+<AskHost />

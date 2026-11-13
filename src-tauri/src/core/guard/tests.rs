@@ -1,13 +1,14 @@
 //! Table-driven tests for the AI read guard and the write classifier. Every bypass case says
 //! why the SQL is dangerous: a regression here lets AI-written SQL change or leak data.
 
-use super::*;
-use crate::core::connections::Engine::{self, Mysql, Pg, Sqlite};
+use super::classify::*;
+use crate::core::engine::SqlEngine::{self, Mysql, Pg, Sqlite};
+use crate::core::result::{WarningCode, WriteInfo};
 
-const ALL: [Engine; 3] = [Pg, Mysql, Sqlite];
+const ALL: [SqlEngine; 3] = [Pg, Mysql, Sqlite];
 
 /// (engine, sql, fragment the reason must contain (lowercase), why it is dangerous).
-type Bypass = (Engine, &'static str, &'static str, &'static str);
+type Bypass = (SqlEngine, &'static str, &'static str, &'static str);
 
 const BYPASSES: &[Bypass] = &[
     // --- stacked statements: the second statement would run with the first one's approval.
@@ -304,7 +305,6 @@ const BYPASSES: &[Bypass] = &[
         "parse",
         "row locks; unparsable, so refused",
     ),
-    // --- user variables.
     (Mysql, "SELECT @a := 1", "variable", "changes session state"),
     (
         Mysql,
@@ -312,7 +312,6 @@ const BYPASSES: &[Bypass] = &[
         "variable",
         "assignment hidden in WHERE",
     ),
-    // --- statements that are not reads.
     (
         Pg,
         "COPY t TO PROGRAM 'x'",
@@ -506,7 +505,6 @@ const BYPASSES: &[Bypass] = &[
         "DDL",
     ),
     (Pg, "GRANT SELECT ON t TO x", "grant is not a read", "DCL"),
-    // --- SQLite PRAGMA writes and non-allow-listed pragmas.
     (
         Sqlite,
         "PRAGMA writable_schema=1",
@@ -555,7 +553,6 @@ const BYPASSES: &[Bypass] = &[
         "pragma is not a read",
         "PRAGMA is SQLite only",
     ),
-    // --- functions with side effects (every name on the deny list).
     (
         Pg,
         "SELECT pg_terminate_backend(123)",
@@ -1106,7 +1103,6 @@ const BYPASSES: &[Bypass] = &[
         "large values",
         "precision specifier builds a huge string",
     ),
-    // --- parser tricks.
     (Pg, "", "empty", "nothing to check"),
     (Pg, "   \n\t ", "empty", "nothing to check"),
     (Pg, "-- only a comment", "no statement", "nothing to run"),
@@ -1138,7 +1134,7 @@ const BYPASSES: &[Bypass] = &[
     ),
 ];
 
-const READS: &[(Engine, &str, &str)] = &[
+const READS: &[(SqlEngine, &str, &str)] = &[
     (
         Pg,
         "SELECT c.name, count(o.id) AS n, sum(o.total) FROM customers c LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.name HAVING count(*) > 1 ORDER BY 2 DESC LIMIT 10",
@@ -1357,7 +1353,28 @@ fn bypasses_are_rejected_with_a_specific_reason() {
                 "WRONG REASON [{engine:?}] {sql:?}: {:?} (expected {fragment:?}; {why})",
                 r.reason
             )),
-            Err(_) => {}
+            Err(r) => {
+                // The shape of the refusal says which rule fired: a per-statement refusal names
+                // its statement, a refusal of the whole text has none, and only a parse failure
+                // carries the parser's detail.
+                let whole_text = matches!(
+                    *fragment,
+                    "exactly one" | "executable comment" | "hint" | "parse" | "empty" | "no statement"
+                );
+                let unparsable = *fragment == "parse";
+                if r.kind.is_some() == whole_text {
+                    failures.push(format!(
+                        "WRONG SHAPE [{engine:?}] {sql:?}: kind {:?} ({why})",
+                        r.kind
+                    ));
+                }
+                if r.detail.is_some() != unparsable {
+                    failures.push(format!(
+                        "WRONG SHAPE [{engine:?}] {sql:?}: detail {:?} ({why})",
+                        r.detail
+                    ));
+                }
+            }
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -1426,8 +1443,6 @@ fn rejection_becomes_guard_rejected_error() {
     assert!(e.message.contains("DELETE is not a read"), "{}", e.message);
 }
 
-// ---- write classification ----
-
 fn codes(info: &WriteInfo) -> Vec<WarningCode> {
     info.warnings.iter().map(|w| w.code).collect()
 }
@@ -1435,24 +1450,35 @@ fn codes(info: &WriteInfo) -> Vec<WarningCode> {
 #[test]
 fn write_warnings() {
     use WarningCode::*;
-    let cases: &[(Engine, &str, &[WarningCode])] = &[
+    let cases: &[(SqlEngine, &str, &[WarningCode])] = &[
         (Pg, "UPDATE orders SET status = 'x' WHERE id = 1", &[]),
         (Pg, "UPDATE orders SET status = 'x'", &[UpdateWithoutWhere]),
         (Mysql, "DELETE FROM orders", &[DeleteWithoutWhere]),
         (Sqlite, "DELETE FROM orders WHERE id = 1", &[]),
         (Pg, "INSERT INTO orders (id) VALUES (1)", &[]),
+        (Mysql, "INSERT INTO orders (id) VALUES (1)", &[]),
         (Pg, "DROP TABLE orders", &[Drop]),
         (Pg, "DROP VIEW v", &[Drop]),
         (Pg, "DROP SCHEMA s CASCADE", &[Drop]),
-        (Mysql, "DROP DATABASE shop", &[Drop]),
+        (Mysql, "DROP DATABASE shop", &[ImplicitCommit, Drop]),
         (Pg, "DROP INDEX i", &[Drop]),
         (Pg, "TRUNCATE orders", &[Truncate]),
-        (Mysql, "TRUNCATE TABLE orders", &[Truncate]),
+        (Mysql, "TRUNCATE TABLE orders", &[ImplicitCommit, Truncate]),
         (Pg, "ALTER TABLE orders DROP COLUMN note", &[AlterDrop]),
         (Pg, "ALTER TABLE orders DROP CONSTRAINT c", &[AlterDrop]),
-        (Mysql, "ALTER TABLE orders DROP INDEX i", &[AlterDrop]),
+        (Mysql, "ALTER TABLE orders DROP INDEX i", &[ImplicitCommit, AlterDrop]),
         (Pg, "ALTER TABLE orders ADD COLUMN note text", &[]),
         (Pg, "CREATE TABLE x (id int)", &[]),
+        (Sqlite, "CREATE TABLE x (id int)", &[]),
+        (Mysql, "CREATE TABLE x (id int)", &[ImplicitCommit]),
+        (Mysql, "SET autocommit = 1", &[ImplicitCommit]),
+        // The probe rule is conservative; the approval warning is the parsed fact, so session
+        // state that commits nothing stays silent.
+        (Mysql, "SET FOREIGN_KEY_CHECKS = 0", &[]),
+        (Mysql, "SET @x = 1", &[]),
+        (Mysql, "SET @@global.autocommit = 1", &[]),
+        (Mysql, "USE shop", &[]),
+        (Mysql, "BEGIN", &[]),
         (
             Pg,
             "UPDATE a SET x = 1; DELETE FROM b",
@@ -1466,7 +1492,7 @@ fn write_warnings() {
         ),
     ];
     for (e, sql, want) in cases {
-        let info = classify_write(sql, *e, None);
+        let info = classify_write(sql, *e);
         assert_eq!(codes(&info), *want, "[{e:?}] {sql}: {info:?}");
     }
 }
@@ -1476,7 +1502,6 @@ fn write_statements_have_kind_and_table() {
     let info = classify_write(
         "INSERT INTO shop.orders (id) VALUES (1); UPDATE customers SET a = 1 WHERE id = 2; DROP TABLE IF EXISTS old_a, old_b",
         Pg,
-        None,
     );
     let got: Vec<(&str, Option<&str>)> = info
         .statements
@@ -1500,17 +1525,30 @@ fn write_statements_have_kind_and_table() {
     assert!(drop.message.contains("old_a, old_b"), "{}", drop.message);
 }
 
+/// `structure` is the backend's answer, so the frontend does not re-derive it from the kind.
+#[test]
+fn structural_statements_are_flagged() {
+    let info = classify_write(
+        "CREATE TABLE x (id int); INSERT INTO x (id) VALUES (1); RENAME TABLE x TO y; DROP TABLE y",
+        Mysql,
+    );
+    let flags: Vec<Option<bool>> = info.statements.iter().map(|s| s.structure).collect();
+    assert_eq!(flags, [Some(true), Some(false), Some(true), Some(true)]);
+    assert_eq!(info.statements[2].kind, "RENAME");
+}
+
 #[test]
 fn write_info_json_shape() {
-    let v = serde_json::to_value(classify_write("DELETE FROM t", Sqlite, None)).unwrap();
+    let v = serde_json::to_value(classify_write("DELETE FROM t", Sqlite)).unwrap();
     assert_eq!(
-        v,
-        serde_json::json!({
-            "statements": [{"kind": "DELETE", "table": "t"}],
-            "warnings": [{"code": "delete_without_where", "message": "DELETE without WHERE removes every row of t", "statement": 0}]
-        })
+        v["statements"],
+        serde_json::json!([{"kind": "DELETE", "table": "t", "structure": false}])
     );
-    let v = serde_json::to_value(classify_write("x", Pg, None)).unwrap();
+    let warning = &v["warnings"][0];
+    assert_eq!(warning["code"], "delete_without_where");
+    assert_eq!(warning["statement"], 0);
+
+    let v = serde_json::to_value(classify_write("x", Pg)).unwrap();
     assert_eq!(v["statements"], serde_json::json!([]));
     assert_eq!(v["warnings"][0]["code"], "unparsable");
     assert!(v["warnings"][0].get("statement").is_none());

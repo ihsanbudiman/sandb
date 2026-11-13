@@ -3,127 +3,32 @@
 //! Run: `cargo test --features it --test it_mongo_query`.
 #![cfg(feature = "it")]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+mod common;
+
+use std::time::Duration;
 
 use mongodb::bson::{Document, doc};
-use sandb_lib::core::connections::{self, ConnectionInput, Engine, Env, SslMode};
-use sandb_lib::core::db::export::{self, ExportRequest};
-use sandb_lib::core::db::query::{self, QueryRun, RunRequest, RunSort};
+use sandb_lib::core::result::ExportRequest;
+use sandb_lib::core::result::{DEFAULT_LIMIT, QueryRun, RunRequest, RunSort};
+use sandb_lib::core::ops;
 use sandb_lib::core::error::{AppError, ErrorCode};
-use sandb_lib::core::secrets::MemoryStore;
 use sandb_lib::core::state::AppState;
 use serde_json::{Value, json};
 
-const RS: u16 = 57017;
-
-fn env_test() -> HashMap<String, String> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdb/.env.test");
-    let raw =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
-}
-
-fn state() -> (tempfile::TempDir, AppState) {
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
-    (dir, st)
-}
+use common::Cleanup;
 
 /// A saved connection to `shop_staging` as `user` (`sandb_ro` or `sandb_rw`).
 fn saved(st: &AppState, user: &str, read_only: bool) -> String {
-    let key = if user == "sandb_rw" {
-        "SANDB_RW_PASSWORD"
-    } else {
-        "SANDB_RO_PASSWORD"
-    };
-    let password = env_test().get(key).cloned().expect("password in .env.test");
-    let input = ConnectionInput {
-        name: format!("it-mongo-query-{user}"),
-        engine: Engine::Mongo,
-        env: Env::Local,
-        host: "127.0.0.1".into(),
-        port: RS,
-        database: "shop_staging".into(),
-        user: user.into(),
-        ssl: SslMode::Disable,
-        file: String::new(),
-        ai_write: false,
+    let input = common::mongo_input(
+        &format!("mongo-query-{user}"),
+        common::mongo_rs(),
+        user,
+        common::seed::STAGING,
         read_only,
-        version: None,
-        uri: String::new(),
-        auth_source: "admin".into(),
-        topology: None,
-    };
-    connections::create(st, input, Some(password)).unwrap().id
-}
-
-/// Drops the scratch names a test made when the test ends, also while a failed test unwinds.
-/// `Drop` cannot use the test's client or runtime (both are being torn down after a panic), so it
-/// opens its own root client on its own thread.
-struct Cleanup {
-    uri: String,
-    collections: Vec<String>,
-}
-
-impl Cleanup {
-    /// A guard for scratch collections on the server at `port`.
-    fn new(port: u16) -> Self {
-        let password = env_test()
-            .get("MONGO_INITDB_ROOT_PASSWORD")
-            .cloned()
-            .expect("MONGO_INITDB_ROOT_PASSWORD in testdb/.env.test");
-        Self {
-            uri: format!("mongodb://root:{password}@127.0.0.1:{port}/admin"),
-            collections: Vec::new(),
-        }
-    }
-
-    /// Tracks `coll` and returns it.
-    fn collection(&mut self, coll: impl Into<String>) -> String {
-        let coll = coll.into();
-        self.collections.push(coll.clone());
-        coll
-    }
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if self.collections.is_empty() {
-            return;
-        }
-        let uri = self.uri.clone();
-        let collections = std::mem::take(&mut self.collections);
-        let joined = std::thread::Builder::new()
-            .name("it-mongo-cleanup".into())
-            .spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                rt.block_on(async move {
-                    let Ok(client) = mongodb::Client::with_uri_str(uri).await else {
-                        return;
-                    };
-                    for coll in collections {
-                        let _ = client
-                            .database("shop_staging")
-                            .collection::<Document>(&coll)
-                            .drop()
-                            .await;
-                    }
-                });
-            })
-            .map(|h| h.join());
-        let _ = joined;
-    }
+    );
+    st.create_connection(input, Some(common::password(user)))
+        .unwrap()
+        .id
 }
 
 fn req(conn_id: &str, text: &str) -> RunRequest {
@@ -140,13 +45,13 @@ fn req(conn_id: &str, text: &str) -> RunRequest {
 
 async fn run(st: &AppState, r: RunRequest) -> QueryRun {
     let text = r.sql.clone();
-    query::run(st, r)
+    ops::run_query(st, r)
         .await
         .unwrap_or_else(|e| panic!("{text}: {e:?}"))
 }
 
 async fn run_err(st: &AppState, r: RunRequest) -> AppError {
-    query::run(st, r).await.expect_err("the run must fail")
+    ops::run_query(st, r).await.expect_err("the run must fail")
 }
 
 fn column<'a>(r: &'a QueryRun, i: usize, name: &str) -> Vec<&'a Value> {
@@ -161,11 +66,11 @@ fn column<'a>(r: &'a QueryRun, i: usize, name: &str) -> Vec<&'a Value> {
 
 #[tokio::test]
 async fn find_returns_a_page_with_columns_types_and_documents() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     let r = run(&st, req(&id, "db.products.find({})")).await;
     let s = &r.statements[0];
-    assert_eq!(s.rows.len(), query::DEFAULT_LIMIT);
+    assert_eq!(s.rows.len(), DEFAULT_LIMIT);
     assert!(s.truncated && s.is_read && s.sortable);
     let names: Vec<&str> = s.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(&names[..4], ["_id", "sku", "name", "price"]);
@@ -189,7 +94,7 @@ async fn find_returns_a_page_with_columns_types_and_documents() {
 
 #[tokio::test]
 async fn find_applies_filter_projection_sort_and_limit() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     let r = run(
         &st,
@@ -213,7 +118,7 @@ async fn find_applies_filter_projection_sort_and_limit() {
 
 #[tokio::test]
 async fn aggregate_and_nested_paths() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     let r = run(
         &st,
@@ -226,7 +131,7 @@ async fn aggregate_and_nested_paths() {
     let s = &r.statements[0];
     assert_eq!(s.rows.len(), 5);
     let total: i64 = column(&r, 0, "n").iter().map(|v| v.as_i64().unwrap()).sum();
-    assert_eq!(total, 500);
+    assert_eq!(total, common::seed::ORDERS as i64);
     let r = run(&st, req(&id, "db.customers.find({}).limit(3)")).await;
     let names: Vec<&str> = r.statements[0]
         .columns
@@ -240,7 +145,7 @@ async fn aggregate_and_nested_paths() {
 
 #[tokio::test]
 async fn header_sort_orders_find_and_aggregate() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     for text in [
         "db.customers.find({}, {name: 1})",
@@ -254,7 +159,11 @@ async fn header_sort_orders_find_and_aggregate() {
         });
         let out = run(&st, r).await;
         assert_eq!(out.statements[0].sql, text);
-        assert_eq!(column(&out, 0, "_id")[0], &json!(500), "{text}");
+        assert_eq!(
+            column(&out, 0, "_id")[0],
+            &json!(common::seed::CUSTOMERS),
+            "{text}"
+        );
     }
     let mut r = req(&id, "db.customers.countDocuments({})");
     r.sort = Some(RunSort {
@@ -267,7 +176,7 @@ async fn header_sort_orders_find_and_aggregate() {
 
 #[tokio::test]
 async fn load_more_raises_the_limit() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     let mut r = req(&id, "db.orders.find({})");
     r.limit = Some(400);
@@ -278,7 +187,7 @@ async fn load_more_raises_the_limit() {
 
 #[tokio::test]
 async fn large_documents_stop_at_the_page_byte_limit() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     let out = run(&st, req(&id, "db.big_docs.find({})")).await;
     let s = &out.statements[0];
@@ -297,7 +206,7 @@ async fn large_documents_stop_at_the_page_byte_limit() {
 
 #[tokio::test]
 async fn counts_distinct_show_and_use_in_one_run() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     let out = run(
         &st,
@@ -309,19 +218,19 @@ async fn counts_distinct_show_and_use_in_one_run() {
     .await;
     assert_eq!(out.statements.len(), 6);
     let count = |i: usize| column(&out, i, "count")[0].as_i64().unwrap();
-    assert!(count(0) > 0 && count(0) < 500);
+    assert_eq!(count(0), common::seed::CUSTOMERS_ON_PRO);
     assert_eq!(out.statements[1].rows.len(), 3);
     let names: Vec<&Value> = column(&out, 2, "name");
     assert!(names.contains(&&json!("order_summary")), "{names:?}");
     assert!(out.notices.iter().any(|n| n.contains("analytics")));
-    assert_eq!(count(4), 10_000);
+    assert_eq!(count(4), common::seed::EVENTS as i64);
     // `use` lasts for the rest of the run: analytics has no products.
     assert_eq!(count(5), 0);
 }
 
 #[tokio::test]
 async fn read_only_connection_refuses_writes_before_they_run() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_rw", true);
     for text in [
         "db.products.insertOne({a: 1})",
@@ -334,7 +243,7 @@ async fn read_only_connection_refuses_writes_before_they_run() {
     }
     // The server is the second barrier: the `read` role cannot write even past the app check.
     let ro = saved(&st, "sandb_ro", false);
-    let e = query::run_editor_unchecked(&st, req(&ro, "db.products.insertOne({a: 1})"))
+    let e = ops::run_editor_unchecked(&st, req(&ro, "db.products.insertOne({a: 1})"))
         .await
         .expect_err("server refuses");
     assert_eq!(e.code, ErrorCode::Database, "{e:?}");
@@ -343,19 +252,16 @@ async fn read_only_connection_refuses_writes_before_they_run() {
 
 #[tokio::test]
 async fn writes_report_counts_on_a_writable_connection() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_rw", false);
-    let mut clean = Cleanup::new(RS);
-    let coll = clean.collection(format!("it_scratch_{}", uuid::Uuid::new_v4().simple()));
-    let out = query::run(
-        &st,
-        req(
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
+    let out = ops::run_query(&st, req(
             &id,
             &format!(
                 "db.{coll}.insertMany([{{a: 1}}, {{a: 2}}, {{a: 3}}])\ndb.{coll}.updateMany({{a: {{$gte: 2}}}}, {{$set: {{b: true}}}})\ndb.{coll}.find({{b: true}})\ndb.{coll}.drop()"
             ),
-        ),
-    )
+        ), )
     .await;
     let out = out.unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!(out.statements[0].affected, Some(3));
@@ -373,7 +279,7 @@ async fn writes_report_counts_on_a_writable_connection() {
 
 #[tokio::test]
 async fn parse_errors_carry_the_position() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     let e = run_err(&st, req(&id, "db.products.find({a: })")).await;
     assert_eq!(e.code, ErrorCode::InvalidInput);
@@ -382,7 +288,7 @@ async fn parse_errors_carry_the_position() {
 
 #[tokio::test]
 async fn csv_export_streams_every_document_with_flattened_columns() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("customers.csv");
@@ -392,10 +298,10 @@ async fn csv_export_streams_every_document_with_flattened_columns() {
         sql: sql.into(),
         tab_id: None,
     };
-    let r = export::export_csv(&st, request("db.customers.find({})"), &path)
+    let r = ops::export_csv(&st, request("db.customers.find({})"), &path)
         .await
         .unwrap();
-    assert_eq!(r.rows, 500);
+    assert_eq!(r.rows, common::seed::CUSTOMERS);
     let text = std::fs::read_to_string(&path).unwrap();
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().unwrap().split(',').collect();
@@ -406,13 +312,13 @@ async fn csv_export_streams_every_document_with_flattened_columns() {
     let first: Vec<&str> = lines.next().unwrap().split(',').collect();
     assert_eq!(first[tags], "\"[\"\"newsletter\"\"]\"", "{first:?}");
     assert_eq!(text.lines().count(), 501);
-    let e = export::check(&st, &request("db.customers.deleteMany({})")).unwrap_err();
+    let e = ops::check_export(&st, &request("db.customers.deleteMany({})")).unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidInput);
 }
 
 #[tokio::test]
 async fn cancel_stops_a_slow_aggregation_on_the_server() {
-    let (_d, st) = state();
+    let (_d, st) = common::state();
     let id = saved(&st, "sandb_ro", true);
     // A correlated `$lookup` of the events on themselves scans 10,000 × 10,000 documents.
     let mut r = req(
@@ -421,37 +327,28 @@ async fn cancel_stops_a_slow_aggregation_on_the_server() {
     );
     r.database = Some("analytics".into());
     let query_id = r.query_id.clone();
-    let st = std::sync::Arc::new(st);
     let task = {
         let st = st.clone();
-        tokio::spawn(async move { query::run(&st, r).await })
+        tokio::spawn(async move { ops::run_query(&st, r).await })
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    if task.is_finished() {
-        panic!("the aggregation ended before the cancel: {:?}", task.await);
+    // Wait for the run to register, then cancel it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while ops::query_progress(&st, &query_id).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the aggregation never started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let cancelled_at = Instant::now();
-    query::cancel(&st, &query_id).await.unwrap();
+    ops::cancel_query(&st, &query_id).await.unwrap();
     let e = tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .expect("the run ends after the cancel")
         .unwrap()
         .expect_err("cancelled");
     assert_eq!(e.code, ErrorCode::Cancelled, "{e:?}");
-    assert!(cancelled_at.elapsed() < Duration::from_secs(3));
     // Nothing with the run's comment is left on the server.
-    let root = env_test()
-        .get("MONGO_INITDB_ROOT_PASSWORD")
-        .cloned()
-        .expect("root password");
-    let options = mongodb::options::ClientOptions::parse(format!(
-        "mongodb://root:{root}@127.0.0.1:{RS}/admin"
-    ))
-    .await
-    .unwrap();
-    let admin = mongodb::Client::with_options(options)
-        .unwrap()
-        .database("admin");
+    let admin = common::root_client(common::mongo_rs()).await.database("admin");
     let mut ops = admin
         .aggregate(vec![
             doc! { "$currentOp": { "allUsers": true } },

@@ -1,32 +1,18 @@
 <script lang="ts">
   import { ListFilter, Plus, X } from '@lucide/svelte';
-  import type { TableFilter, TableFilterOperator } from '../tableActions';
+  import { FILTER_OPERATORS, filterOperator, isTextType, type TableFilter } from '../tableActions';
 
   let {
     columns,
-    types = [],
+    types,
     filters = $bindable([]),
     loading = false,
     onapply,
-  }: { columns: string[]; types?: string[]; filters?: TableFilter[]; loading?: boolean; onapply: () => void } = $props();
-
-  const operators: { value: TableFilterOperator; label: string; text?: boolean }[] = [
-    { value: '=', label: 'equals' },
-    { value: '<>', label: 'does not equal' },
-    { value: '>', label: 'greater than' },
-    { value: '>=', label: 'at least' },
-    { value: '<', label: 'less than' },
-    { value: '<=', label: 'at most' },
-    { value: 'contains', label: 'contains', text: true },
-    { value: 'startsWith', label: 'starts with', text: true },
-    { value: 'endsWith', label: 'ends with', text: true },
-    { value: 'isNull', label: 'is NULL' },
-    { value: 'isNotNull', label: 'is not NULL' },
-  ];
+  }: { columns: string[]; types: string[]; filters?: TableFilter[]; loading?: boolean; onapply: () => void } = $props();
 
   const control = 'h-7 rounded-md border border-line bg-field px-2 text-[12px] text-ink outline-none focus:border-accent/70 focus:ring-2 focus:ring-accent/15';
   // Mongo columns type their fields `string` (or a union containing it); SQL uses char/text/...
-  const isText = (column: string) => /char|text|uuid|json|xml|citext|string/i.test(types[columns.indexOf(column)] ?? 'text');
+  const isText = (column: string) => isTextType(types[columns.indexOf(column)] ?? '');
 
   function addFilter() {
     if (!columns.length) return;
@@ -35,7 +21,7 @@
 
   function setColumn(filter: TableFilter, column: string) {
     filter.column = column;
-    if (operators.find((o) => o.value === filter.operator)?.text && !isText(column)) filter.operator = '=';
+    if (filterOperator(filter.operator).text && !isText(column)) filter.operator = '=';
   }
 
   function clearFilters() {
@@ -59,6 +45,7 @@
   {#if filters.length}
     <div class="space-y-1.5 px-3 pb-2.5">
       {#each filters as filter, i (filter.id)}
+        {@const op = filterOperator(filter.operator)}
         <div class="grid grid-cols-[minmax(110px,0.8fr)_minmax(120px,0.65fr)_minmax(140px,1.4fr)_28px] items-center gap-2">
           <div class="flex min-w-0 items-center gap-2">
             <span class="w-8 shrink-0 text-right text-[10.5px] font-medium uppercase tracking-wide text-faint">{i ? 'AND' : 'WHERE'}</span>
@@ -67,11 +54,11 @@
             </select>
           </div>
           <select class="{control} w-full" aria-label="Filter operator" bind:value={filter.operator}>
-            {#each operators as operator}
+            {#each FILTER_OPERATORS as operator}
               {#if !operator.text || isText(filter.column)}<option value={operator.value}>{operator.label}</option>{/if}
             {/each}
           </select>
-          {#if filter.operator === 'isNull' || filter.operator === 'isNotNull'}
+          {#if op.noValue}
             <span class="px-2 text-[12px] italic text-faint">No value needed</span>
           {:else}
             <input class="{control} w-full font-mono" aria-label="Filter value" bind:value={filter.value} placeholder="Value" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" />

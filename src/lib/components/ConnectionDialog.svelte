@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { X, LoaderCircle, KeyRound } from '@lucide/svelte';
+  import { LoaderCircle, KeyRound } from '@lucide/svelte';
   import { untrack } from 'svelte';
-  import { db, active, engines, envDot, toConn, type Conn, type Engine, type Env } from '../state.svelte';
+  import { db, defaultDb, engines, envDot, sameTarget, type Conn, type Engine, type Env } from '../connections.svelte';
+  import { active } from '../tabs.svelte';
   import { activeTab, setTabConn } from '../tabs.svelte';
-  import { api, ApiError, type Connection, type ConnectionInput, type SslMode, type Topology } from '../api';
-  import { isMongoUri, parseMongoUri } from '../mongoUri';
+  import { api, errorText, type Connection, type ConnectionInput, type MongoUriParts, type SslMode, type Topology } from '../api';
+  import { ask } from '../ask.svelte';
+  import Modal from './Modal.svelte';
   import SafeguardDialog from './SafeguardDialog.svelte';
 
   // `conn` set: edit it, or, if its id is not in db.connections yet, save it as a new copy (duplicate).
@@ -13,15 +15,15 @@
     conn = null,
     onsaved,
     onedited,
-    canswitch = () => true,
-    canupdate = () => true,
+    canswitch,
+    canupdate,
   }: {
     open?: boolean;
     conn?: Conn | null;
     onsaved: () => void;
     onedited?: (c: Conn, dbChanged: boolean) => void;
-    canswitch?: () => boolean | Promise<boolean>;
-    canupdate?: (c: Conn, dbChanged: boolean) => boolean | Promise<boolean>;
+    canswitch: () => boolean | Promise<boolean>;
+    canupdate: (c: Conn, dbChanged: boolean) => boolean | Promise<boolean>;
   } = $props();
 
   let engine = $state<Engine>('pg');
@@ -50,12 +52,30 @@
   let saveError = $state('');
   // Bumped on every reset, so a test that finishes after close/reopen is ignored.
   let run = 0;
-  let guard = $state<Conn | null>(null);
-  let guardCopy: Conn | null = null;
+  // The backend's split of the typed string, without its password: the saved one is compared with it.
+  let uriParts = $state<MongoUriParts | null>(null);
 
   const existing = $derived(conn ? db.connections.find((x) => x.id === conn.id) : undefined);
   const mongo = $derived(engine === 'mongo');
   const useUri = $derived(mongo && mode === 'uri');
+
+  const mongoUri = (s: string) => /^mongodb(\+srv)?:\/\//i.test(s.trim());
+
+  $effect(() => {
+    const text = useUri ? uri.trim() : '';
+    if (!text) {
+      uriParts = null;
+      return;
+    }
+    let gone = false;
+    void (async () => {
+      const p = await api.parseMongoUri({ uri: text }).catch(() => null);
+      if (!gone) uriParts = p;
+    })();
+    return () => {
+      gone = true;
+    };
+  });
 
   $effect(() => {
     // Reading `conn` re-fills when ⌘K "New connection" replaces an open edit.
@@ -65,13 +85,12 @@
     }
   });
 
-  // SafeguardDialog sets aiWrite on the copy when the user confirms; the real connection changes only on Save.
-  $effect(() => {
-    if (!guard && guardCopy) {
-      if (guardCopy.aiWrite) aiWrite = true;
-      guardCopy = null;
-    }
-  });
+  // SafeguardDialog answers true; the connection changes only when the user saves.
+  async function toggleAi() {
+    if (aiWrite) return (aiWrite = false);
+    if (readOnly) return;
+    if (await ask<boolean>(SafeguardDialog, { conn: { engine, name: name.trim() || 'new connection', env, readOnly } })) aiWrite = true;
+  }
 
   function fill(c: Conn | null) {
     if (!c) {
@@ -95,8 +114,8 @@
     host = c.host || 'localhost';
     port = c.port || engines[c.engine].port;
     user = c.user;
-    // The stored password is never sent to the UI. The mock shows fake dots like the prototype did.
-    password = api.kind === 'mock' && c.engine !== 'sqlite' ? 'saved-secret' : '';
+    // The stored password is never sent to the UI.
+    password = '';
     ssl = c.ssl;
     file = c.file || '~/data/app.db';
     env = c.env;
@@ -119,15 +138,6 @@
     saveError = '';
   }
 
-  function toggleAi() {
-    if (aiWrite) return (aiWrite = false);
-    if (readOnly) return;
-    // A new connection has no Conn yet; the stub only feeds SafeguardDialog.
-    const base: Conn = conn ?? toConn({ ...input(), id: '', name: 'new connection', version: '', aiWrite: false, topology: null });
-    guard = { ...base, name: name.trim() || base.name, env, readOnly, aiWrite: false };
-    guardCopy = guard;
-  }
-
   // A read-only connection refuses AI writes too, so turning it on also turns AI write access off.
   function toggleReadOnly() {
     readOnly = !readOnly;
@@ -137,7 +147,7 @@
   const engineList: Engine[] = ['pg', 'mysql', 'sqlite', 'mongo'];
   const envs: Env[] = ['local', 'staging', 'production'];
   // MongoDB needs no database: a server lists its own.
-  const canSave = $derived(name.trim().length > 0 && (engine === 'sqlite' ? file.trim() : useUri ? isMongoUri(uri) : host.trim() && (mongo || database.trim())));
+  const canSave = $derived(name.trim().length > 0 && (engine === 'sqlite' ? file.trim() : useUri ? mongoUri(uri) : host.trim() && (mongo || database.trim())));
 
   function setEngine(e: Engine) {
     // MongoDB has no Prefer TLS mode; it starts with Disable.
@@ -175,21 +185,21 @@
   // connection string tests without it: its password, if the server needs one, goes into the string.
   const secretId = () => (conn && !passwordDirty && engine !== 'sqlite' && !(useUri && targetChanged()) ? (existing ? conn.id : (conn.copyOf ?? null)) : null);
 
+  /** Where the fields currently point, in the shape `sameTarget` compares (engine defaults included). */
+  function typedTarget() {
+    const base = { engine, host: host.trim(), port: Number(port) || engines[engine].port, user: user.trim(), file: engine === 'sqlite' ? file.trim() : '', uri: '' };
+    // A typed string decides the target, and its password is not part of the saved one.
+    return useUri && uriParts ? { engine, host: uriParts.host, port: uriParts.port, user: uriParts.user, file: '', uri: uriParts.redacted } : base;
+  }
+
   // The backend refuses to send a stored password to another target; say so before the round trip.
   function targetChanged(): boolean {
     const src = conn && db.connections.find((x) => x.id === (existing ? conn.id : conn.copyOf));
-    if (!src) return false;
-    if (src.engine !== engine) return true;
-    // The saved string has no password, so the typed one is compared without it.
-    if (src.uri !== (useUri ? (parseMongoUri(uri)?.redacted ?? uri.trim()) : '')) return true;
-    return !useUri && (src.host !== host.trim() || src.port !== (Number(port) || engines[engine].port) || src.user !== user.trim());
+    return !!src && !sameTarget(src, typedTarget());
   }
-  const needsPassword = $derived(api.kind !== 'mock' && engine !== 'sqlite' && !useUri && !!conn && !passwordDirty && targetChanged());
-
-  function errText(e: unknown) {
-    const err = ApiError.from(e);
-    return err.detail ? `${err.message}: ${err.detail}` : err.message;
-  }
+  const needsPassword = $derived(api.capabilities.secretStorage !== 'none' && engine !== 'sqlite' && !useUri && !!conn && !passwordDirty && targetChanged());
+  // The two failures the dialog can show at once, one on each line.
+  const failed = $derived([test === 'error' && testMsg ? `Test: ${testMsg}` : '', saveError ? `Save failed: ${saveError}` : ''].filter(Boolean).join('\n') || null);
 
   async function runTest() {
     if (needsPassword) {
@@ -202,14 +212,14 @@
     const at = sig;
     const mine = run;
     try {
-      const r = await api.testConnection(input(), passwordArg(), secretId());
+      const r = await api.testConnection({ input: input(), password: passwordArg(), id: secretId() });
       if (mine !== run || at !== sig || test !== 'testing') return;
       tested = { sig: at, version: r.serverVersion, topology: r.topology ?? null };
       testMsg = `Connected · ${r.serverVersion}${r.topology ? ` · ${r.topology.replace('_', ' ')}` : ''} · ${r.latencyMs} ms`;
       test = 'ok';
     } catch (e) {
       if (mine !== run || at !== sig || test !== 'testing') return;
-      testMsg = errText(e);
+      testMsg = errorText(e);
       test = 'error';
     }
   }
@@ -225,28 +235,30 @@
     return { ...input(), version: fresh ? fresh.version : null, topology: fresh ? fresh.topology : null };
   }
 
+  /** The saved connection joins the list and the active tab; both create paths end here. */
+  function adopt(saved: Conn) {
+    db.connections.push(saved);
+    const t = activeTab();
+    if (t) setTabConn(t, saved);
+    close();
+    onsaved();
+  }
+
   async function save() {
     if (saving) return;
     if (conn) return saveConn(conn);
     if (!(await canswitch())) return;
     saving = true;
     saveError = '';
+    let created: Conn;
     try {
-      const c = toConn(await api.createConnection(payload(), passwordArg()));
-      db.connections.push(c);
-      const t = activeTab();
-      if (t) setTabConn(t, c);
+      created = await api.createConnection({ input: payload(), password: passwordArg() });
     } catch (e) {
-      saveError = errText(e);
+      saveError = errorText(e);
       saving = false;
       return;
     }
-    name = '';
-    database = '';
-    aiWrite = false;
-    readOnly = false;
-    close();
-    onsaved();
+    adopt(created);
   }
 
   async function saveConn(c: Conn) {
@@ -255,34 +267,31 @@
       if (!(await canswitch())) return;
       saving = true;
       saveError = '';
+      let saved: Conn;
       try {
         const src = c.copyOf;
-        const saved = toConn(src ? await api.duplicateConnection(src, payload(), passwordArg()) : await api.createConnection(payload(), passwordArg()));
-        db.connections.push(saved);
-        const t = activeTab();
-        if (t) setTabConn(t, saved);
+        saved = src ? await api.duplicateConnection({ id: src, input: payload(), password: passwordArg() }) : await api.createConnection({ input: payload(), password: passwordArg() });
       } catch (e) {
-        saveError = errText(e);
+        saveError = errorText(e);
         saving = false;
         return;
       }
-      close();
-      onsaved();
+      adopt(saved);
       return;
     }
     const next = payload();
-    const nextDb = engine === 'sqlite' ? 'main' : next.database;
-    // Only a change of target touches the open result; name, env and AI access do not.
-    const dbChanged = cur.database !== nextDb || cur.host !== (engine === 'sqlite' ? '' : next.host) || cur.port !== (engine === 'sqlite' ? 0 : next.port) || cur.file !== (engine === 'sqlite' ? next.file : '');
+    const nextDb = defaultDb(next);
+    // Only a change of target or database touches the open result; name, env and AI access do not.
+    const dbChanged = cur.database !== nextDb || !sameTarget(cur, typedTarget());
     if (dbChanged && cur.id === active().id && !(await canswitch())) return;
     if (!(await canupdate(cur, dbChanged))) return;
     saving = true;
     saveError = '';
     try {
-      const saved = await api.updateConnection(cur.id, next, passwordArg());
-      Object.assign(cur, toConn(saved));
+      const saved = await api.updateConnection({ id: cur.id, input: next, password: passwordArg() });
+      Object.assign(cur, saved);
     } catch (e) {
-      saveError = errText(e);
+      saveError = errorText(e);
       saving = false;
       return;
     }
@@ -291,21 +300,22 @@
   }
 </script>
 
-<svelte:window onkeydown={(e) => open && !guard && e.key === 'Escape' && close()} />
-
 {#snippet field(text: string)}
   <span class="label mb-1.5 block">{text}</span>
 {/snippet}
 
 {#if open}
-  <div class="dialog-backdrop">
-    <div class="dialog flex max-h-[calc(100dvh-2rem)] w-full max-w-lg flex-col">
-      <header class="dialog-head">
-        <h2 class="flex-1">{!conn ? 'New connection' : existing ? 'Edit connection' : 'Duplicate connection'}</h2>
-        <button class="btn btn-ghost -my-1 -mr-1.5 size-7 p-0" onclick={close} aria-label="Close"><X size={15} /></button>
-      </header>
-
-      <div class="dialog-body flex-1 space-y-4 overflow-auto pb-5">
+  <Modal
+    title={!conn ? 'New connection' : existing ? 'Edit connection' : 'Duplicate connection'}
+    width="max-w-lg"
+    class="flex max-h-[calc(100dvh-2rem)] flex-col"
+    bodyClass="flex-1 space-y-4 overflow-auto pb-5"
+    footClass="border-t border-line py-3"
+    closable
+    busy={saving}
+    error={failed}
+    onclose={close}
+  >
         <p class="-mt-2 text-[12.5px] text-muted">{conn ? `${engines[engine].label} · the engine of a saved connection cannot change.` : 'Connect to a PostgreSQL, MySQL, SQLite or MongoDB database.'}</p>
 
         <div class="grid grid-cols-4 gap-2">
@@ -368,7 +378,7 @@
           {/if}
           {#if useUri}
             <label class="block">{@render field('Connection string')}<input class="input font-mono" bind:value={uri} placeholder="mongodb+srv://user:password@cluster0.example.net/app" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-            {#if uri.trim() && !isMongoUri(uri)}<p class="text-[12px] text-amber-700 dark:text-amber-400">The string must start with mongodb:// or mongodb+srv://.</p>{/if}
+            {#if uri.trim() && !mongoUri(uri)}<p class="text-[12px] text-amber-700 dark:text-amber-400">The string must start with mongodb:// or mongodb+srv://.</p>{/if}
             <p class="flex items-center gap-1.5 text-[12px] text-faint"><KeyRound size={12} class="shrink-0" /> A password in the string is saved encrypted in sandb's data folder; the connections file keeps the string without it.</p>
           {:else}
             <div class="grid grid-cols-[1fr_96px] gap-2">
@@ -378,7 +388,7 @@
             <label class="block">{@render field('Database')}<input class="input font-mono" bind:value={database} placeholder={mongo ? 'optional' : 'app'} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
             <div class="grid grid-cols-2 gap-2">
               <label class="block">{@render field('User')}<input class="input font-mono" bind:value={user} placeholder={mongo ? 'optional' : undefined} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-              <label class="block">{@render field('Password')}<input class="input font-mono" type="password" bind:value={password} oninput={() => (passwordDirty = true)} placeholder={conn && !passwordDirty && api.kind !== 'mock' ? 'Saved · type to replace' : '••••••••'} /></label>
+              <label class="block">{@render field('Password')}<input class="input font-mono" type="password" bind:value={password} oninput={() => (passwordDirty = true)} placeholder={conn && !passwordDirty && api.capabilities.secretStorage !== 'none' ? 'Saved · type to replace' : '••••••••'} /></label>
             </div>
             {#if mongo}
               <div class="grid grid-cols-2 gap-2">
@@ -422,16 +432,8 @@
             <span class="absolute top-0.5 left-0.5 size-4 rounded-full bg-white shadow transition {aiWrite ? 'translate-x-4' : ''}"></span>
           </button>
         </div>
-      </div>
 
-      {#if (test === 'error' && testMsg) || saveError}
-        <div class="mx-5 mb-3 space-y-1 rounded-lg bg-red-500/8 px-3 py-2 text-[12.5px] text-red-700 dark:text-red-300" role="alert">
-          {#if test === 'error' && testMsg}<p class="break-words"><span class="sr-only">Error: </span><b class="font-semibold">Test:</b> {testMsg}</p>{/if}
-          {#if saveError}<p class="break-words"><span class="sr-only">Error: </span><b class="font-semibold">Save failed:</b> {saveError}</p>{/if}
-        </div>
-      {/if}
-
-      <footer class="dialog-foot border-t border-line py-3">
+    {#snippet footer()}
         <button class="btn btn-secondary" onclick={runTest} disabled={test === 'testing' || saving || !canSave}>Test connection</button>
         <span class="min-w-0 flex-1 truncate text-[12px]">
           {#if test === 'testing'}
@@ -446,9 +448,6 @@
         <button class="btn btn-primary" onclick={save} disabled={!canSave || saving}>
           {#if saving}<LoaderCircle size={13} class="animate-spin" />{/if} Save
         </button>
-      </footer>
-    </div>
-  </div>
+    {/snippet}
+  </Modal>
 {/if}
-
-<SafeguardDialog bind:target={guard} />

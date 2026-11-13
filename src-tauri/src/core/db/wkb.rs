@@ -8,7 +8,6 @@
 
 use std::fmt::Write as _;
 
-/// Deepest collection nesting accepted; deeper input is not treated as geometry.
 const MAX_DEPTH: u32 = 32;
 
 const Z_FLAG: u32 = 0x8000_0000;
@@ -16,7 +15,7 @@ const M_FLAG: u32 = 0x4000_0000;
 const SRID_FLAG: u32 = 0x2000_0000;
 
 /// `POINT(1 2)` for PostGIS hex EWKB, `None` when `hex` is not valid EWKB.
-/// With a cap, the text is cut after `cap` bytes and ends with `…`, as `value::text_capped` does.
+/// With a cap, the text is cut after `cap` bytes and ends with `…`.
 pub fn hex_ewkb_to_wkt(hex: &str, cap: Option<usize>) -> Option<String> {
     let h = hex.as_bytes();
     // Byte order (1) + type (4) is the smallest header.
@@ -83,7 +82,6 @@ impl Out {
     }
 }
 
-/// Reads bytes straight from the hex text; nothing is decoded into a buffer first.
 struct Reader<'a> {
     hex: &'a [u8],
     /// Byte offset (half the hex offset).
@@ -126,7 +124,6 @@ impl Reader<'_> {
         })
     }
 
-    /// Skips `n` coordinates of `dims` doubles without reading them.
     fn skip(&mut self, n: u32, dims: usize) -> Result<(), Stop> {
         let size = (n as usize).checked_mul(dims * 8).ok_or(Stop::Invalid)?;
         if self.len() - self.pos < size {

@@ -1,8 +1,11 @@
 <script lang="ts">
-  import { tick } from 'svelte';
   import { FileCode, Search, Ellipsis, Play, Pencil, Copy, CopyPlus, Trash, BookmarkPlus, X } from '@lucide/svelte';
-  import { db, active, engines, type Conn } from '../state.svelte';
+  import { focusOn, selectOnMount } from '../actions';
+  import { ago } from '../chatParts';
+  import { db, engines, type Conn } from '../connections.svelte';
+  import { active } from '../tabs.svelte';
   import { tabs } from '../tabs.svelte';
+  import { KEYS } from '../keys';
   import { saved, isDirty, renameSaved, duplicateSaved, type SavedQuery } from '../saved.svelte';
 
   let {
@@ -45,14 +48,6 @@
 
   const preview = (sql: string) => sql.replace(/--.*$/gm, '').replace(/\s+/g, ' ').trim();
 
-  function ago(ms: number) {
-    const s = Math.round((Date.now() - ms) / 1000);
-    if (s < 60) return 'just now';
-    if (s < 3600) return `${Math.round(s / 60)} min ago`;
-    if (s < 86400) return `${Math.round(s / 3600)} h ago`;
-    return new Date(ms).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: s > 300 * 86400 ? 'numeric' : undefined });
-  }
-
   // ---- menu ----
   const place = (x: number, y: number, s: SavedQuery) => ({ x: Math.max(4, Math.min(x, innerWidth - 212)), y: Math.max(4, Math.min(y, innerHeight - 220)), q: s });
 
@@ -76,25 +71,30 @@
     if (s) fn(s);
   }
 
-  async function startRename(s: SavedQuery) {
+  // Which row takes focus back after its rename ends; the counter makes every request a new token.
+  let focusRequest = $state<{ id: string; n: number } | null>(null);
+  let focusSeq = 0;
+
+  function startRename(s: SavedQuery) {
     renaming = s.id;
-    await tick();
-    listEl?.querySelector<HTMLInputElement>('input[data-rename]')?.select();
   }
 
   function finishRename(s: SavedQuery, name: string) {
     if (renaming !== s.id) return;
     renaming = null;
     renameSaved(s.id, name);
-    tick().then(() => rowOf(s.id)?.focus());
+    focusRequest = { id: s.id, n: ++focusSeq };
+  }
+
+  function cancelRename(s: SavedQuery) {
+    renaming = null;
+    focusRequest = { id: s.id, n: ++focusSeq };
   }
 
   async function duplicate(s: SavedQuery) {
     const copy = duplicateSaved(s.id);
     if (copy) startRename(copy);
   }
-
-  const rowOf = (id: string) => listEl?.querySelector<HTMLButtonElement>(`[data-saved="${id}"]`);
 
   // Arrow keys walk the rows; F2 renames; Delete removes; Enter (a button click) opens; ⌘↵ runs.
   function rowKey(e: KeyboardEvent, s: SavedQuery) {
@@ -181,16 +181,16 @@
           <div class="flex h-[42px] items-center gap-2 rounded-md bg-active px-2">
             <FileCode size={13} class="shrink-0 text-accent" />
             <input
-              data-rename
               class="h-6 min-w-0 flex-1 rounded border border-accent/70 bg-field px-1.5 text-[12.5px] text-ink outline-none"
               value={s.name}
+              use:selectOnMount
               aria-label="Query name"
               autocapitalize="off"
               autocorrect="off"
               spellcheck="false"
               autocomplete="off"
               onblur={(e) => finishRename(s, e.currentTarget.value)}
-              onkeydown={(e) => { e.stopPropagation(); if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') { renaming = null; rowOf(s.id)?.focus(); } }}
+              onkeydown={(e) => { e.stopPropagation(); if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') cancelRename(s); }}
             />
           </div>
         {:else}
@@ -199,6 +199,7 @@
             class="flex w-full items-start gap-2 rounded-md py-1.5 pr-7 pl-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-accent/40 {on || menuOn ? 'bg-active' : 'hover:bg-hover'}"
             title="{s.sql.length > 600 ? s.sql.slice(0, 600) + '…' : s.sql}"
             aria-current={on ? 'true' : undefined}
+            use:focusOn={focusRequest?.id === s.id ? focusRequest.n : 0}
             onclick={() => onopen(s)}
             ondblclick={() => startRename(s)}
             oncontextmenu={(e) => openMenu(e, s)}
@@ -212,7 +213,7 @@
               </span>
               <span class="flex items-center gap-1.5 text-[11px] text-faint">
                 <span class="min-w-0 flex-1 truncate font-mono">{preview(s.sql) || 'Empty'}</span>
-                <span class="shrink-0">{ago(s.updated)}</span>
+                <span class="shrink-0">{ago(s.updated, { year: true })}</span>
               </span>
             </span>
           </button>
@@ -234,7 +235,7 @@
   <div class="mx-1 mt-2 rounded-lg border border-dashed border-line px-3 py-5 text-center">
     <div class="mx-auto mb-2 grid size-8 place-items-center rounded-lg bg-accent/12 text-accent"><BookmarkPlus size={15} /></div>
     <p class="text-[12.5px] font-medium text-ink">No saved queries</p>
-    <p class="mt-1 text-[12px] leading-relaxed text-faint">Press <kbd class="kbd">⌘S</kbd> in the editor to save the query. It stays here for the next session.</p>
+    <p class="mt-1 text-[12px] leading-relaxed text-faint">Press <kbd class="kbd">{KEYS.save.hint}</kbd> in the editor to save the query. It stays here for the next session.</p>
   </div>
 {:else if !shown}
   <p class="px-2 py-3 text-center text-[12px] text-faint">No query matches “{q}”</p>
@@ -245,7 +246,7 @@
   <div class="popover fixed z-40 w-52 p-1" style="left:{m.x}px;top:{m.y}px" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
     <div class="truncate px-2 pt-1 pb-1 text-[11.5px] text-faint">{m.q.name}</div>
     <button class="nav-item" role="menuitem" onclick={() => act(onopen)}><FileCode size={13} /> Open</button>
-    <button class="nav-item" role="menuitem" onclick={() => act(onrun)}><Play size={13} /> <span class="flex-1">Open and run</span><kbd class="kbd">⌘↵</kbd></button>
+    <button class="nav-item" role="menuitem" onclick={() => act(onrun)}><Play size={13} /> <span class="flex-1">Open and run</span><kbd class="kbd">{KEYS.run.hint}</kbd></button>
     <div class="mx-2 my-1 h-px bg-line"></div>
     <button class="nav-item" role="menuitem" onclick={() => act(startRename)}><Pencil size={13} /> <span class="flex-1">Rename</span><kbd class="kbd">F2</kbd></button>
     <button class="nav-item" role="menuitem" onclick={() => act(duplicate)}><CopyPlus size={13} /> Duplicate</button>

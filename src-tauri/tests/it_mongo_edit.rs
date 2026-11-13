@@ -4,168 +4,38 @@
 //! Run: `cargo test --features it --test it_mongo_edit`.
 #![cfg(feature = "it")]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+mod common;
 
 use mongodb::bson::oid::ObjectId;
 use mongodb::bson::{Bson, DateTime, Decimal128, Document, doc};
 use mongodb::options::{Collation, CollationStrength};
-use sandb_lib::core::connections::{self, ConnectionInput, Engine, Env, SslMode};
-use sandb_lib::core::db::edit::{
-    self, ApplyEditsRequest, ApplyEditsResult, CellValueRequest, EditOperation, EditableRequest,
-    EditableResult,
+use sandb_lib::core::connections::ConnectionInput;
+use sandb_lib::core::result::{
+    ApplyEditsRequest, ApplyEditsResult, CellValueRequest, EditOperation,
+    EditableRequest, EditableResult,
 };
-use sandb_lib::core::db::query::{self, RunRequest};
+use sandb_lib::core::result::RunRequest;
+use sandb_lib::core::ops;
 use sandb_lib::core::error::{AppError, ErrorCode};
 use sandb_lib::core::mongo;
-use sandb_lib::core::mongo::edit::edit_text;
-use sandb_lib::core::mongo::shell::literal;
-use sandb_lib::core::secrets::MemoryStore;
+use sandb_lib::core::mongo::value::literal;
 use sandb_lib::core::state::AppState;
 use serde_json::{Value, json};
 
-const RS: u16 = 57017;
-const STANDALONE: u16 = 57018;
-const DB: &str = "shop_staging";
+use common::{Cleanup, Ctx};
+
 const CONFLICT: &str =
     "The document changed or no longer exists since it was loaded. Nothing was overwritten.";
 
-fn env_test() -> HashMap<String, String> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdb/.env.test");
-    let raw =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
-}
-
-fn rw_password() -> String {
-    env_test()
-        .get("SANDB_RW_PASSWORD")
-        .cloned()
-        .expect("SANDB_RW_PASSWORD in testdb/.env.test")
-}
-
-fn ro_password() -> String {
-    env_test()
-        .get("SANDB_RO_PASSWORD")
-        .cloned()
-        .expect("SANDB_RO_PASSWORD in testdb/.env.test")
-}
-
-fn state() -> (tempfile::TempDir, AppState) {
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
-    (dir, st)
-}
-
 /// Read-write user on `shop_staging`.
 fn rw(port: u16) -> ConnectionInput {
-    ConnectionInput {
-        name: format!("it-mongo-edit-{port}"),
-        engine: Engine::Mongo,
-        env: Env::Local,
-        host: "127.0.0.1".into(),
-        port,
-        database: DB.into(),
-        user: "sandb_rw".into(),
-        ssl: SslMode::Disable,
-        file: String::new(),
-        ai_write: false,
-        read_only: false,
-        version: None,
-        uri: String::new(),
-        auth_source: "admin".into(),
-        topology: None,
-    }
-}
-
-/// A fresh scratch collection name, `it_scratch_` + 32 hex characters like a simple uuid.
-fn scratch() -> String {
-    static N: AtomicU32 = AtomicU32::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!(
-        "it_scratch_{:016x}{:016x}",
-        nanos,
-        N.fetch_add(1, Ordering::Relaxed) as u128
-    )
-}
-
-/// Drops the scratch collection a fixture made when the test ends, also while a failed test
-/// unwinds. `Drop` cannot use the fixture's client or runtime (both are being torn down after a
-/// panic), so it opens its own root client on its own thread.
-struct Cleanup {
-    uri: String,
-    /// `(database, collection)` pairs; a test may seed its scratch name in a second database.
-    collections: Vec<(String, String)>,
-}
-
-impl Cleanup {
-    /// A guard for scratch collections on the server at `port`.
-    fn new(port: u16) -> Self {
-        let password = env_test()
-            .get("MONGO_INITDB_ROOT_PASSWORD")
-            .cloned()
-            .expect("MONGO_INITDB_ROOT_PASSWORD in testdb/.env.test");
-        Self {
-            uri: format!("mongodb://root:{password}@127.0.0.1:{port}/admin"),
-            collections: Vec::new(),
-        }
-    }
-
-    /// Tracks `coll` in `database` and returns it.
-    fn collection(&mut self, database: &str, coll: impl Into<String>) -> String {
-        let coll = coll.into();
-        self.collections.push((database.into(), coll.clone()));
-        coll
-    }
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if self.collections.is_empty() {
-            return;
-        }
-        let uri = self.uri.clone();
-        let collections = std::mem::take(&mut self.collections);
-        let joined = std::thread::Builder::new()
-            .name("it-mongo-cleanup".into())
-            .spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                rt.block_on(async move {
-                    let Ok(client) = mongodb::Client::with_uri_str(uri).await else {
-                        return;
-                    };
-                    for (database, coll) in collections {
-                        let _ = client
-                            .database(&database)
-                            .collection::<Document>(&coll)
-                            .drop()
-                            .await;
-                    }
-                });
-            })
-            .map(|h| h.join());
-        let _ = joined;
-    }
+    common::mongo_input("mongo-edit", port, &common::rw_user(), common::seed::STAGING, false)
 }
 
 /// A read-write connection on `port`, its client and a scratch collection seeded with `docs`.
 struct Fixture {
     _dir: tempfile::TempDir,
-    st: AppState,
+    st: std::sync::Arc<AppState>,
     conn_id: String,
     client: mongodb::Client,
     coll: String,
@@ -175,21 +45,26 @@ struct Fixture {
 impl Fixture {
     async fn new(port: u16, docs: Vec<Document>) -> Self {
         let f = Self::open(port).await;
-        f.seed(DB, docs).await;
+        f.seed(common::seed::STAGING, docs).await;
         f
     }
 
     /// The connection and a scratch name; the collection does not exist yet.
     async fn open(port: u16) -> Self {
-        let (dir, st) = state();
+        let ctx: Ctx = common::ctx(
+            "mongo-edit",
+            rw(port),
+            Some(common::rw_password()),
+        );
         let mut clean = Cleanup::new(port);
-        let coll = clean.collection(DB, scratch());
-        let c = connections::create(&st, rw(port), Some(rw_password())).unwrap();
-        let client = mongo::client::client(&st, &c.id).await.unwrap();
+        let coll = clean.collection(common::scratch());
+        let client = mongo::client::client(ctx.st.as_ref(), &ctx.conn.id)
+            .await
+            .unwrap();
         Fixture {
-            _dir: dir,
-            st,
-            conn_id: c.id,
+            _dir: ctx._dir,
+            st: ctx.st,
+            conn_id: ctx.conn.id,
             client,
             coll,
             _clean: clean,
@@ -207,7 +82,7 @@ impl Fixture {
 
     /// Tracks the fixture's scratch name in `database` too, for a test that seeds it there.
     fn track_in(&mut self, database: &str) {
-        self._clean.collection(database, &self.coll);
+        self._clean.collection_in(database, &self.coll);
     }
 
     fn sql(&self) -> String {
@@ -215,51 +90,42 @@ impl Fixture {
     }
 
     async fn editable(&self, sql: &str) -> EditableResult {
-        edit::editable_result(
-            &self.st,
-            EditableRequest {
+        ops::editable_result(&self.st, EditableRequest {
                 conn_id: self.conn_id.clone(),
-                database: DB.into(),
+                database: common::seed::STAGING.into(),
                 sql: sql.into(),
-            },
-        )
+            }, )
         .await
         .unwrap()
     }
 
     async fn save(&self, operations: Vec<EditOperation>) -> Result<ApplyEditsResult, AppError> {
-        edit::apply_edits(
-            &self.st,
-            ApplyEditsRequest {
+        ops::apply_edits(&self.st, ApplyEditsRequest {
                 conn_id: self.conn_id.clone(),
-                database: DB.into(),
+                database: common::seed::STAGING.into(),
                 sql: self.sql(),
                 tab_id: None,
                 query_id: None,
                 operations,
-            },
-        )
+            }, )
         .await
     }
 
     async fn cell(&self, id: Value, column: &str) -> Result<Option<String>, AppError> {
-        edit::cell_value(
-            &self.st,
-            CellValueRequest {
+        ops::cell_value(&self.st, CellValueRequest {
                 conn_id: self.conn_id.clone(),
-                database: DB.into(),
+                database: common::seed::STAGING.into(),
                 sql: self.sql(),
                 tab_id: None,
                 pk: [("_id".to_string(), id)].into(),
                 column: column.into(),
-            },
-        )
+            }, )
         .await
     }
 
     async fn find(&self, id: i32) -> Option<Document> {
         self.client
-            .database(DB)
+            .database(common::seed::STAGING)
             .collection::<Document>(&self.coll)
             .find_one(doc! { "_id": id })
             .await
@@ -268,7 +134,7 @@ impl Fixture {
 
     async fn count(&self) -> u64 {
         self.client
-            .database(DB)
+            .database(common::seed::STAGING)
             .collection::<Document>(&self.coll)
             .count_documents(doc! {})
             .await
@@ -279,7 +145,7 @@ impl Fixture {
     /// cannot leak a collection.
     async fn drop(&self) {
         self.client
-            .database(DB)
+            .database(common::seed::STAGING)
             .collection::<Document>(&self.coll)
             .drop()
             .await
@@ -290,21 +156,6 @@ impl Fixture {
 /// A typed wire value.
 fn typed(ty: &str, value: &str) -> Value {
     json!({ "type": ty, "value": value })
-}
-
-/// The typed wire value of a stored scalar, as the grid builds it from the cell.
-fn typed_of(v: &Bson) -> Value {
-    let ty = match v {
-        Bson::Int32(_) => "int32",
-        Bson::Int64(_) => "int64",
-        Bson::Double(_) => "double",
-        Bson::Decimal128(_) => "decimal128",
-        Bson::DateTime(_) => "date",
-        Bson::ObjectId(_) => "objectId",
-        Bson::String(_) => "string",
-        other => panic!("not a scalar: {other:?}"),
-    };
-    typed(ty, &edit_text(v).unwrap())
 }
 
 fn int_id(id: i32) -> Value {
@@ -355,7 +206,7 @@ fn batch_with_conflict_second() -> Vec<EditOperation> {
 
 #[tokio::test]
 async fn replica_set_saves_the_batch_in_one_transaction() {
-    let f = Fixture::new(RS, two_docs()).await;
+    let f = Fixture::new(common::mongo_rs(), two_docs()).await;
     let editable = f.editable(&f.sql()).await;
     let r = f
         .save(vec![
@@ -386,7 +237,7 @@ async fn replica_set_saves_the_batch_in_one_transaction() {
 
 #[tokio::test]
 async fn replica_set_rolls_back_the_batch_when_one_change_fails() {
-    let f = Fixture::new(RS, two_docs()).await;
+    let f = Fixture::new(common::mongo_rs(), two_docs()).await;
     let r = f.save(batch_with_conflict_second()).await;
     let (d1, d2) = (f.find(1).await, f.find(2).await);
     f.drop().await;
@@ -401,7 +252,7 @@ async fn replica_set_rolls_back_the_batch_when_one_change_fails() {
 
 #[tokio::test]
 async fn standalone_keeps_the_changes_before_the_failure() {
-    let f = Fixture::new(STANDALONE, two_docs()).await;
+    let f = Fixture::new(common::mongo_standalone(), two_docs()).await;
     let editable = f.editable(&f.sql()).await;
     let r = f.save(batch_with_conflict_second()).await;
     let (d1, d2) = (f.find(1).await, f.find(2).await);
@@ -419,7 +270,7 @@ async fn standalone_keeps_the_changes_before_the_failure() {
 /// A failure at the first operation saves nothing, so it is not partial.
 #[tokio::test]
 async fn standalone_failure_at_the_first_change_is_not_partial() {
-    let f = Fixture::new(STANDALONE, two_docs()).await;
+    let f = Fixture::new(common::mongo_standalone(), two_docs()).await;
     let r = f
         .save(vec![update(
             1,
@@ -436,11 +287,11 @@ async fn standalone_failure_at_the_first_change_is_not_partial() {
 /// A document changed by someone else after it was loaded is never overwritten.
 #[tokio::test]
 async fn changed_document_is_a_conflict() {
-    for port in [RS, STANDALONE] {
+    for port in [common::mongo_rs(), common::mongo_standalone()] {
         let f = Fixture::new(port, vec![doc! { "_id": 1, "a": 1, "b": "x" }]).await;
         // Another user changes a after the grid loaded a: 1.
         f.client
-            .database(DB)
+            .database(common::seed::STAGING)
             .collection::<Document>(&f.coll)
             .update_one(doc! { "_id": 1 }, doc! { "$set": { "a": 5 } })
             .await
@@ -476,7 +327,7 @@ async fn changed_document_is_a_conflict() {
 /// Null and missing old values: `$type: "null"` and `$exists: false` match them.
 #[tokio::test]
 async fn null_and_missing_old_values_match() {
-    let f = Fixture::new(RS, vec![doc! { "_id": 1, "n": Bson::Null }]).await;
+    let f = Fixture::new(common::mongo_rs(), vec![doc! { "_id": 1, "n": Bson::Null }]).await;
     let r = f
         .save(vec![update(
             1,
@@ -499,7 +350,7 @@ async fn types_are_kept_after_the_save() {
     let new_oid = ObjectId::parse_str("65a1b2c3d4e5f60718293a4c").unwrap();
     let nested =
         doc! { "n": 3_i64, "d": 2.0, "a": [1.0, Bson::Decimal128("0.10".parse().unwrap())] };
-    for port in [RS, STANDALONE] {
+    for port in [common::mongo_rs(), common::mongo_standalone()] {
         let start = doc! {
             "_id": 1,
             "big": 9_007_199_254_740_993_i64,
@@ -511,7 +362,6 @@ async fn types_are_kept_after_the_save() {
             "untouched": 7_i64,
         };
         let f = Fixture::new(port, vec![start.clone()]).await;
-        let old = |k: &str| typed_of(start.get(k).unwrap());
         let r = f
             .save(vec![update(
                 1,
@@ -530,11 +380,11 @@ async fn types_are_kept_after_the_save() {
                     ),
                 ],
                 &[
-                    ("big", old("big")),
-                    ("dec", old("dec")),
-                    ("when", old("when")),
-                    ("ref", old("ref")),
-                    ("whole", old("whole")),
+                    ("big", typed("int64", "9007199254740993")),
+                    ("dec", typed("decimal128", "1.50")),
+                    ("when", typed("date", "2023-11-14T22:13:20.123Z")),
+                    ("ref", typed("objectId", &oid.to_hex())),
+                    ("whole", typed("double", "42")),
                     (
                         "nested",
                         typed("shell", &literal(&Bson::Document(nested.clone())).unwrap()),
@@ -565,7 +415,7 @@ async fn types_are_kept_after_the_save() {
 
 #[tokio::test]
 async fn insert_and_delete() {
-    for port in [RS, STANDALONE] {
+    for port in [common::mongo_rs(), common::mongo_standalone()] {
         let f = Fixture::new(port, two_docs()).await;
         let ops: Vec<EditOperation> = serde_json::from_value(json!([
             { "key": "d", "kind": "delete", "pk": { "_id": int_id(1) }, "set": {} },
@@ -604,7 +454,7 @@ async fn insert_and_delete() {
 /// A value that does not convert fails its operation before anything runs.
 #[tokio::test]
 async fn conversion_error_saves_nothing() {
-    let f = Fixture::new(STANDALONE, two_docs()).await;
+    let f = Fixture::new(common::mongo_standalone(), two_docs()).await;
     let r = f
         .save(vec![
             update(
@@ -631,27 +481,24 @@ async fn conversion_error_saves_nothing() {
 
 #[tokio::test]
 async fn read_only_connection_is_refused() {
-    let (_d, st) = state();
-    let mut input = rw(RS);
+    let (_d, st) = common::state();
+    let mut input = rw(common::mongo_rs());
     input.user = "sandb_ro".into();
     input.read_only = true;
-    let c = connections::create(&st, input, Some(ro_password())).unwrap();
+    let c = st
+        .create_connection(input, Some(common::ro_password()))
+        .unwrap();
     let sql = "db.orders.find()".to_string();
-    let editable = edit::editable_result(
-        &st,
-        EditableRequest {
+    let editable = ops::editable_result(&st, EditableRequest {
             conn_id: c.id.clone(),
-            database: DB.into(),
+            database: common::seed::STAGING.into(),
             sql: sql.clone(),
-        },
-    )
+        }, )
     .await
     .unwrap();
-    let e = edit::apply_edits(
-        &st,
-        ApplyEditsRequest {
+    let e = ops::apply_edits(&st, ApplyEditsRequest {
             conn_id: c.id,
-            database: DB.into(),
+            database: common::seed::STAGING.into(),
             sql,
             tab_id: None,
             query_id: None,
@@ -660,8 +507,7 @@ async fn read_only_connection_is_refused() {
                 &[("a", typed("int32", "1"))],
                 &[("a", typed("int32", "2"))],
             )],
-        },
-    )
+        }, )
     .await
     .unwrap_err();
     assert_eq!(
@@ -673,7 +519,7 @@ async fn read_only_connection_is_refused() {
 
 #[tokio::test]
 async fn editable_result_reasons() {
-    let f = Fixture::new(RS, two_docs()).await;
+    let f = Fixture::new(common::mongo_rs(), two_docs()).await;
     let coll = f.coll.clone();
     let mut reasons = Vec::new();
     for sql in [
@@ -689,17 +535,14 @@ async fn editable_result_reasons() {
         reasons.push(f.editable(&sql).await.reason);
     }
     let projected = f.editable(&format!("db.{coll}.find({{}}, {{a: 1}})")).await;
-    let view_save = edit::apply_edits(
-        &f.st,
-        ApplyEditsRequest {
+    let view_save = ops::apply_edits(&f.st, ApplyEditsRequest {
             conn_id: f.conn_id.clone(),
-            database: DB.into(),
+            database: common::seed::STAGING.into(),
             sql: "db.order_summary.find()".into(),
             tab_id: None,
             query_id: None,
             operations: vec![],
-        },
-    )
+        }, )
     .await;
     f.drop().await;
     let not_find = Some("Only the result of one find() on a collection can be edited".to_string());
@@ -727,7 +570,7 @@ async fn editable_result_reasons() {
 async fn cell_value_reads_the_full_value() {
     let long = "é".repeat(5000);
     let f = Fixture::new(
-        RS,
+        common::mongo_rs(),
         vec![doc! {
             "_id": 1,
             "long": long.clone(),
@@ -758,27 +601,22 @@ async fn cell_value_reads_the_full_value() {
 /// changes that database only.
 #[tokio::test]
 async fn use_in_the_run_sets_the_database_of_the_result() {
-    let mut f = Fixture::new(RS, two_docs()).await;
+    let mut f = Fixture::new(common::mongo_rs(), two_docs()).await;
     f.track_in("analytics");
     f.seed("analytics", two_docs()).await;
-    let run = query::run(
-        &f.st,
-        RunRequest {
+    let run = ops::run_query(&f.st, RunRequest {
             conn_id: f.conn_id.clone(),
-            database: Some(DB.into()),
+            database: Some(common::seed::STAGING.into()),
             sql: format!("use analytics\ndb.{}.find()", f.coll),
             query_id: uuid::Uuid::new_v4().to_string(),
             limit: None,
             tab_id: None,
             sort: None,
-        },
-    )
+        }, )
     .await;
     let edited = match &run {
         Ok(run) => Some(
-            edit::apply_edits(
-                &f.st,
-                ApplyEditsRequest {
+            ops::apply_edits(&f.st, ApplyEditsRequest {
                     conn_id: f.conn_id.clone(),
                     database: run.statements[1].database.clone().unwrap_or_default(),
                     sql: run.statements[1].sql.clone(),
@@ -789,8 +627,7 @@ async fn use_in_the_run_sets_the_database_of_the_result() {
                         &[("a", typed("int32", "10"))],
                         &[("a", typed("int32", "1"))],
                     )],
-                },
-            )
+                }, )
             .await,
         ),
         Err(_) => None,
@@ -824,7 +661,7 @@ async fn use_in_the_run_sets_the_database_of_the_result() {
 #[tokio::test]
 async fn old_value_must_match_exactly() {
     let f = Fixture::new(
-        RS,
+        common::mongo_rs(),
         vec![
             doc! { "_id": 1 },
             doc! { "_id": 2, "a": Bson::Null },
@@ -887,9 +724,9 @@ async fn old_value_must_match_exactly() {
 /// A case-insensitive default collation of the collection does not loosen the match.
 #[tokio::test]
 async fn collection_collation_does_not_loosen_the_match() {
-    let f = Fixture::open(RS).await;
+    let f = Fixture::open(common::mongo_rs()).await;
     f.client
-        .database(DB)
+        .database(common::seed::STAGING)
         .create_collection(&f.coll)
         .collation(
             Collation::builder()
@@ -899,7 +736,7 @@ async fn collection_collation_does_not_loosen_the_match() {
         )
         .await
         .unwrap();
-    f.seed(DB, vec![doc! { "_id": "A", "s": "X" }]).await;
+    f.seed(common::seed::STAGING, vec![doc! { "_id": "A", "s": "X" }]).await;
     let by_id = f
         .save(vec![update_id(
             typed("string", "a"),
@@ -917,7 +754,7 @@ async fn collection_collation_does_not_loosen_the_match() {
     let cell = f.cell(typed("string", "a"), "s").await;
     let d = f
         .client
-        .database(DB)
+        .database(common::seed::STAGING)
         .collection::<Document>(&f.coll)
         .find_one(doc! { "_id": "A" })
         .await

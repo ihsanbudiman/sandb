@@ -1,34 +1,35 @@
 //! Runs the mongosh statements of an editor run. Reads stream from the server and stop at the
 //! row limit or the page byte limit, so a large collection or large documents never land in
-//! memory whole. Every server operation except a collection `drop` (the driver has no `comment`
-//! option for it) carries the query id as `comment`, which is how a cancel finds and stops it.
+//! memory whole.
+//!
+//! Routing is `guard::kind` and nothing else: a statement that writes runs through `write`, and
+//! everything else reads, including a statement the guard cannot vouch for (the server decides
+//! those on a writable connection). Every server operation carries the run's comment, which is
+//! how a cancel finds and stops it.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use mongodb::bson::{Bson, Document, RawDocumentBuf, doc};
-use mongodb::options::{Collation, Hint};
-use mongodb::results::CollectionType;
+use mongodb::bson::{Document, RawDocumentBuf, doc};
 use mongodb::{Client, Cursor};
 
-use crate::core::connections::{self, Connection};
-use crate::core::db::query::{self, QueryRun, RunRequest, RunSort, Session, StatementResult};
+use crate::core::connections::{target_database, Connection};
+use crate::core::engine::Engine;
 use crate::core::error::AppError;
+use crate::core::mongo::client::Access;
 use crate::core::mongo::command::{Command, Method, Statement};
+use crate::core::mongo::comment::OpComment;
 use crate::core::mongo::flatten::{Flattener, Page};
 use crate::core::mongo::guard::{self, Kind};
-use crate::core::mongo::{client, introspect, parse, write};
-use crate::core::state::AppState;
-
-/// Byte limit of one read result: the sum of the BSON sizes of its documents.
-pub const PAGE_BYTES: usize = 16 * 1024 * 1024;
-/// How long a cancelled write may still answer, so the run can tell whether it applied.
-const WRITE_REPLY_WAIT: Duration = Duration::from_secs(2);
+use crate::core::mongo::options::{
+    apply_aggregate_options, collation, hint, Options, COUNT_DOCUMENTS_OPTIONS,
+};
+use crate::core::mongo::{client, introspect, parse, reply, write, WRITE_REPLY_WAIT};
+use crate::core::result::{limit, QueryRun, RunRequest, RunSort, StatementResult};
 
 /// `query::run` for a MongoDB connection.
 pub async fn run(
-    state: &AppState,
+    access: &impl Access,
     conn: &Connection,
     req: RunRequest,
     check: bool,
@@ -39,7 +40,7 @@ pub async fn run(
     }
     // No session can make MongoDB read-only, so this check is the app's barrier; a user with
     // the `read` role is the server's.
-    if check && conn.read_only {
+    if check && !conn.may_write() {
         guard::check_read_only(conn, &stmts)?;
     }
     if req.sort.is_some() && !(stmts.len() == 1 && sortable(&stmts[0].command)) {
@@ -47,17 +48,29 @@ pub async fn run(
             "Sorting requires exactly one find or aggregate",
         ));
     }
-    let mut database = connections::target_database(conn, req.database.as_deref());
-    let limit = query::clamp_limit(req.limit);
+    let mut database = target_database(conn, req.database.as_deref());
+    // The last statement's own `.limit(n)` sizes the page when the caller sets none.
+    let limit = limit(req.limit, || match &stmts.last()?.command {
+        Command::Collection {
+            method: Method::Find(f),
+            ..
+        } => f.limit.and_then(|n| u64::try_from(n).ok()),
+        _ => None,
+    });
     let started = Instant::now();
-    let run = state
-        .queries
-        .register(&req.query_id, &conn.id, &database, stmts.len())?;
+    let run = access.queries().register(
+        &req.query_id,
+        &conn.id,
+        &database,
+        Engine::Mongo,
+        stmts.len(),
+    )?;
     let cancelled = run.cancelled.clone();
-    if cancelled.load(Ordering::SeqCst) {
-        return Err(query::cancelled_error());
+    if cancelled.is_cancelled() {
+        return Err(AppError::cancelled());
     }
-    let client = client::client(state, &conn.id).await?;
+    let client = client::client(access, &conn.id).await?;
+    let comment = OpComment::new(&req.query_id);
     let lone = stmts.len() == 1;
     let mut results = Vec::with_capacity(stmts.len());
     let mut notices = Vec::new();
@@ -68,12 +81,12 @@ pub async fn run(
             notices.push(format!("Using database {name} for the rest of this run"));
             let mut r = empty_result(&s.text, true);
             r.database = Some(database.clone());
+            r.limit = limit;
             results.push(r);
         } else {
             if database.is_empty() {
                 return Err(AppError::invalid("Choose a database for this tab first"));
             }
-            let session = state.queries.attach(&req.query_id, Session::Mongo);
             // The driver can wait long on a server that does not answer (up to its monitor
             // timeout), and the kill cannot reach that server either. So a cancel also stops
             // the wait here; the server kill stays best effort.
@@ -84,7 +97,7 @@ pub async fn run(
                 &req,
                 limit,
                 lone,
-                &cancelled,
+                comment,
                 &mut notices,
             );
             tokio::pin!(work);
@@ -92,26 +105,25 @@ pub async fn run(
             let n = results.len() + 1;
             let r = tokio::select! {
                 r = &mut work => r,
-                () = until_cancelled(&cancelled) => {
+                () = cancelled.cancelled() => {
                     if !write {
-                        return Err(query::cancelled_error());
+                        return Err(AppError::cancelled());
                     }
                     // A write that reached the server can still apply. Wait a moment for its
                     // reply (the kill runs meanwhile), so the user learns what happened.
                     match tokio::time::timeout(WRITE_REPLY_WAIT, &mut work).await {
                         Ok(r) => r,
                         Err(_) => {
-                            return Err(query::cancelled_error().with_detail(format!(
+                            return Err(AppError::cancelled().with_detail(format!(
                                 "Statement {n} may have changed data before the cancel. Reload to check."
                             )));
                         }
                     }
                 }
             };
-            drop(session);
             // A killed operation fails with the server's "interrupted" error.
-            if cancelled.load(Ordering::SeqCst) {
-                let e = query::cancelled_error();
+            if cancelled.is_cancelled() {
+                let e = AppError::cancelled();
                 return Err(if write && r.is_ok() {
                     e.with_detail(format!(
                         "Statement {n} finished before the cancel, so its change stays."
@@ -122,10 +134,11 @@ pub async fn run(
             }
             let mut r = r?;
             r.elapsed_ms = t0.elapsed().as_millis() as u64;
+            r.limit = limit;
             r.database = Some(database.clone());
             results.push(r);
         }
-        run.done.fetch_add(1, Ordering::SeqCst);
+        run.done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     drop(run);
     Ok(QueryRun {
@@ -135,47 +148,17 @@ pub async fn run(
     })
 }
 
-/// Ends when the run's cancel flag is set.
-async fn until_cancelled(cancelled: &AtomicBool) {
-    while !cancelled.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
+/// A `.count()` result is one number, so a header click has nothing to sort.
 fn sortable(cmd: &Command) -> bool {
-    matches!(
-        cmd,
-        Command::Collection {
-            method: Method::Find(_) | Method::Aggregate { .. },
-            ..
-        }
-    )
-}
-
-/// Statements that `write::execute` runs; everything else reads through `open_read`.
-pub(crate) fn is_write(cmd: &Command) -> bool {
     match cmd {
-        Command::CreateCollection { .. } | Command::DropDatabase { .. } => true,
-        Command::Collection { method, .. } => matches!(
-            method,
-            Method::InsertOne { .. }
-                | Method::InsertMany { .. }
-                | Method::UpdateOne { .. }
-                | Method::UpdateMany { .. }
-                | Method::ReplaceOne { .. }
-                | Method::DeleteOne { .. }
-                | Method::DeleteMany { .. }
-                | Method::FindOneAndUpdate { .. }
-                | Method::FindOneAndReplace { .. }
-                | Method::FindOneAndDelete { .. }
-                | Method::BulkWrite { .. }
-                | Method::CreateIndex { .. }
-                | Method::CreateIndexes { .. }
-                | Method::DropIndex { .. }
-                | Method::DropIndexes
-                | Method::Drop
-                | Method::RenameCollection { .. }
-        ),
+        Command::Collection {
+            method: Method::Find(f),
+            ..
+        } => !f.count,
+        Command::Collection {
+            method: Method::Aggregate { .. },
+            ..
+        } => true,
         _ => false,
     }
 }
@@ -188,21 +171,20 @@ async fn statement(
     req: &RunRequest,
     limit: usize,
     lone: bool,
-    cancelled: &AtomicBool,
+    comment: OpComment<'_>,
     notices: &mut Vec<String>,
 ) -> Result<StatementResult, AppError> {
-    if is_write(&s.command) {
-        let out = write::execute(client, database, &s.command, &req.query_id).await?;
+    if matches!(guard::kind(&s.command), Kind::Write | Kind::Schema) {
+        let out = write::execute(client, database, &s.command, comment).await?;
         notices.push(out.notice);
         let mut r = match out.document {
             Some(d) => {
                 let mut f = Flattener::default();
                 f.push(d);
-                page_result(&s.text, f.finish(), false, false)
+                page_result(&s.text, f.finish(), false, false, false)
             }
             None => empty_result(&s.text, false),
         };
-        r.is_read = false;
         r.affected = Some(out.affected);
         return Ok(r);
     }
@@ -213,61 +195,59 @@ async fn statement(
         database,
         &s.command,
         req.sort.as_ref(),
-        &req.query_id,
+        comment,
         batch,
+        None,
     )
     .await?;
-    let mut f = Flattener::default();
-    let mut bytes = 0usize;
-    let mut truncated = false;
-    while let Some((doc, size)) = stream.next().await? {
-        if cancelled.load(Ordering::SeqCst) {
-            return Err(query::cancelled_error());
-        }
-        if f.len() == limit {
-            truncated = true;
-            break;
-        }
-        if !f.is_empty() && bytes + size > PAGE_BYTES {
-            truncated = true;
-            notices.push(format!(
-                "Stopped at the 16 MB page limit after {} documents. Use a projection or a smaller limit.",
-                f.len()
-            ));
-            break;
-        }
-        bytes += size;
-        f.push(doc);
+    let (page, end) = page(&mut stream, limit).await?;
+    if end == PageEnd::Bytes {
+        notices.push(format!(
+            "Stopped at the 16 MB page limit after {} documents. Use a projection or a smaller limit.",
+            page.rows.len()
+        ));
     }
-    if f.is_empty() {
+    if page.rows.is_empty() {
         notices.push(format!("{}: no documents", label(&s.command)));
     }
-    let mut r = page_result(&s.text, f.finish(), truncated, lone && sortable(&s.command));
-    r.is_read = guard::kind(&s.command) == Kind::Read;
-    Ok(r)
+    let guard_is_read = guard::kind(&s.command) == Kind::Read;
+    Ok(page_result(
+        &s.text,
+        page,
+        end != PageEnd::Stream,
+        lone && sortable(&s.command),
+        guard_is_read,
+    ))
 }
 
+/// The notice name of a statement: the method and its collection, or the command itself.
 fn label(cmd: &Command) -> String {
     match cmd {
-        Command::Collection { collection, method } => format!("{} on {collection}", method.name()),
-        Command::ShowDbs => "show dbs".into(),
-        Command::ShowCollections => "show collections".into(),
-        Command::RunCommand { .. } => "runCommand".into(),
-        Command::Use(_) => "use".into(),
-        Command::CreateCollection { .. } => "createCollection".into(),
-        Command::DropDatabase { .. } => "dropDatabase".into(),
+        Command::Collection { collection, .. } => {
+            format!("{} on {collection}", guard::name(cmd))
+        }
+        other => guard::name(other).to_string(),
     }
 }
 
-fn page_result(text: &str, page: Page, truncated: bool, sortable: bool) -> StatementResult {
+fn page_result(
+    text: &str,
+    page: Page,
+    truncated: bool,
+    sortable: bool,
+    is_read: bool,
+) -> StatementResult {
     StatementResult {
         sql: text.to_string(),
         row_count: page.rows.len(),
         columns: page.columns,
         rows: page.rows,
         truncated,
+        limit: 0,
         affected: None,
-        is_read: true,
+        // Only a provable read says so; a statement the guard cannot vouch for is not one, even
+        // when it runs through the read path.
+        is_read,
         sortable,
         elapsed_ms: 0,
         documents: Some(page.documents),
@@ -283,6 +263,7 @@ fn empty_result(text: &str, is_read: bool) -> StatementResult {
         rows: Vec::new(),
         row_count: 0,
         truncated: false,
+        limit: 0,
         affected: None,
         is_read,
         sortable: false,
@@ -293,9 +274,6 @@ fn empty_result(text: &str, is_read: bool) -> StatementResult {
     }
 }
 
-// ---- reads
-
-/// Documents of one read statement, streamed from the server or from a single reply.
 pub(crate) struct ReadStream {
     source: Source,
 }
@@ -312,7 +290,6 @@ impl ReadStream {
         }
     }
 
-    /// The next document and its BSON size in bytes.
     pub(crate) async fn next(&mut self) -> Result<Option<(Document, usize)>, AppError> {
         match &mut self.source {
             Source::Cursor(c) => {
@@ -333,24 +310,54 @@ impl ReadStream {
     }
 }
 
+/// Byte limit of one page: the sum of the BSON sizes of its documents.
+pub const PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Where a page stopped: the stream ended, or one of its two caps cut it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageEnd {
+    Stream,
+    Rows,
+    Bytes,
+}
+
+/// Reads a read stream into one page: at most `limit` rows and at most [`PAGE_BYTES`] of BSON,
+/// so a large collection or large documents never land in memory whole.
+pub(crate) async fn page(
+    stream: &mut ReadStream,
+    limit: usize,
+) -> Result<(Page, PageEnd), AppError> {
+    let mut f = Flattener::default();
+    let mut bytes = 0usize;
+    let end = loop {
+        let Some((doc, size)) = stream.next().await? else {
+            break PageEnd::Stream;
+        };
+        if f.len() == limit {
+            break PageEnd::Rows;
+        }
+        if !f.is_empty() && bytes + size > PAGE_BYTES {
+            break PageEnd::Bytes;
+        }
+        bytes += size;
+        f.push(doc);
+    };
+    Ok((f.finish(), end))
+}
+
 /// Opens a read: the user's own skip, limit, sort and `maxTimeMS` apply; the caller applies the
 /// page limits. `sort` (a header click) replaces the find sort or adds a `$sort` stage to the
-/// pipeline. `batch` sizes the server batches of a cursor.
+/// pipeline; `run` refuses it for anything else. `batch` sizes the server batches of a cursor.
 pub(crate) async fn open_read(
     client: &Client,
     database: &str,
     cmd: &Command,
     sort: Option<&RunSort>,
-    comment: &str,
+    comment: OpComment<'_>,
     batch: Option<u32>,
+    max_time: Option<Duration>,
 ) -> Result<ReadStream, AppError> {
     let db = client.database(database);
-    let tag = Bson::String(comment.to_string());
-    if sort.is_some() && !sortable(cmd) {
-        return Err(AppError::invalid(
-            "Sorting requires exactly one find or aggregate",
-        ));
-    }
     match cmd {
         Command::ShowDbs => {
             let names = introspect::databases(client, database).await?;
@@ -362,17 +369,13 @@ pub(crate) async fn open_read(
             let mut c = db
                 .list_collections()
                 .authorized_collections(true)
-                .comment(tag)
+                .comment(comment.tag())
                 .await?;
             let mut out = Vec::new();
             while c.advance().await? {
                 let spec = c.deserialize_current()?;
-                let kind = match spec.collection_type {
-                    CollectionType::View => "view",
-                    CollectionType::Timeseries => "timeseries",
-                    _ => "collection",
-                };
-                out.push(doc! { "name": spec.name, "type": kind });
+                let kind = reply::driver_kind(spec.collection_type);
+                out.push(doc! { "name": spec.name, "type": reply::kind_label(kind) });
             }
             out.sort_by(|a, b| a.get_str("name").ok().cmp(&b.get_str("name").ok()));
             Ok(ReadStream::docs(out))
@@ -380,11 +383,9 @@ pub(crate) async fn open_read(
         Command::RunCommand { admin, command } => {
             let target = if *admin { client.database("admin") } else { db };
             let mut command = command.clone();
-            if !command.contains_key("comment") {
-                command.insert("comment", tag);
-            }
-            Ok(ReadStream::docs(reply_docs(
-                target.run_command(command).await?,
+            comment.apply(&mut command);
+            Ok(ReadStream::docs(reply::reply_docs(
+                &target.run_command(command).await?,
             )))
         }
         Command::Use(_) | Command::CreateCollection { .. } | Command::DropDatabase { .. } => {
@@ -394,7 +395,7 @@ pub(crate) async fn open_read(
             let coll = db.collection::<RawDocumentBuf>(collection);
             match method {
                 Method::Find(f) if f.count => {
-                    let mut a = coll.count_documents(f.filter.clone()).comment(tag);
+                    let mut a = coll.count_documents(f.filter.clone()).comment(comment.tag());
                     if let Some(n) = f.skip {
                         a = a.skip(n);
                     }
@@ -402,18 +403,18 @@ pub(crate) async fn open_read(
                         a = a.limit(n as u64);
                     }
                     if let Some(h) = &f.hint {
-                        a = a.hint(hint(h)?);
+                        a = a.hint(hint("hint", h)?);
                     }
                     if let Some(c) = &f.collation {
-                        a = a.collation(collation(c)?);
+                        a = a.collation(collation("collation", c)?);
                     }
                     if let Some(ms) = f.max_time_ms {
                         a = a.max_time(Duration::from_millis(ms));
                     }
-                    Ok(count_doc(a.await?))
+                    Ok(count_stream(a.await?))
                 }
                 Method::Find(f) => {
-                    let mut a = coll.find(f.filter.clone()).comment(tag);
+                    let mut a = coll.find(f.filter.clone()).comment(comment.tag());
                     if let Some(p) = &f.projection {
                         a = a.projection(p.clone());
                     }
@@ -432,10 +433,10 @@ pub(crate) async fn open_read(
                         a = a.limit(n);
                     }
                     if let Some(h) = &f.hint {
-                        a = a.hint(hint(h)?);
+                        a = a.hint(hint("hint", h)?);
                     }
                     if let Some(c) = &f.collation {
-                        a = a.collation(collation(c)?);
+                        a = a.collation(collation("collation", c)?);
                     }
                     if let Some(b) = batch {
                         a = a.batch_size(b);
@@ -446,7 +447,7 @@ pub(crate) async fn open_read(
                     Ok(cursor(a.await?))
                 }
                 Method::FindOne { filter, projection } => {
-                    let mut a = coll.find(filter.clone()).limit(1).comment(tag);
+                    let mut a = coll.find(filter.clone()).limit(1).comment(comment.tag());
                     if let Some(p) = projection {
                         a = a.projection(p.clone());
                     }
@@ -460,52 +461,61 @@ pub(crate) async fn open_read(
                     let mut a = coll
                         .aggregate(pipeline)
                         .with_type::<RawDocumentBuf>()
-                        .comment(tag);
+                        .comment(comment.tag());
                     if let Some(b) = batch {
                         a = a.batch_size(b);
                     }
-                    for (k, v) in options.iter().flatten() {
-                        a = match k.as_str() {
-                            "allowDiskUse" => a.allow_disk_use(opt_bool(k, v)?),
-                            "collation" => a.collation(collation(opt_doc(k, v)?)?),
-                            "hint" => a.hint(hint(v)?),
-                            "let" => a.let_vars(opt_doc(k, v)?.clone()),
-                            "batchSize" => a.batch_size(opt_u32(k, v)?),
-                            "maxTimeMS" => a.max_time(Duration::from_millis(opt_u64(k, v)?)),
-                            _ => return Err(unknown_option("aggregate", k)),
-                        };
-                    }
-                    Ok(cursor(a.await?))
+                    let o = Options::new("aggregate", options.as_ref());
+                    Ok(cursor(apply_aggregate_options(a, &o)?.await?))
                 }
                 Method::CountDocuments { filter, options } => {
-                    let mut a = coll.count_documents(filter.clone()).comment(tag);
-                    for (k, v) in options.iter().flatten() {
-                        a = match k.as_str() {
-                            "limit" => a.limit(opt_u64(k, v)?),
-                            "skip" => a.skip(opt_u64(k, v)?),
-                            "hint" => a.hint(hint(v)?),
-                            "collation" => a.collation(collation(opt_doc(k, v)?)?),
-                            "maxTimeMS" => a.max_time(Duration::from_millis(opt_u64(k, v)?)),
-                            _ => return Err(unknown_option("countDocuments", k)),
-                        };
+                    let mut a = coll.count_documents(filter.clone()).comment(comment.tag());
+                    let o = Options::new("countDocuments", options.as_ref());
+                    o.check(COUNT_DOCUMENTS_OPTIONS)?;
+                    if let Some(n) = o.whole("limit", i64::MAX)? {
+                        a = a.limit(n as u64);
                     }
-                    Ok(count_doc(a.await?))
+                    if let Some(n) = o.whole("skip", i64::MAX)? {
+                        a = a.skip(n as u64);
+                    }
+                    if let Some(v) = o.hint("hint")? {
+                        a = a.hint(v);
+                    }
+                    if let Some(v) = o.collation("collation")? {
+                        a = a.collation(v);
+                    }
+                    if let Some(ms) = o.whole("maxTimeMS", i64::MAX)? {
+                        a = a.max_time(Duration::from_millis(ms as u64));
+                    }
+                    Ok(count_stream(a.await?))
                 }
-                Method::EstimatedDocumentCount => Ok(count_doc(
-                    coll.estimated_document_count().comment(tag).await?,
-                )),
+                // `distinct` and `estimatedDocumentCount` take no parsed options, so a caller
+                // that needs a server time limit passes it to `open_read`.
+                Method::EstimatedDocumentCount => {
+                    let mut a = coll.estimated_document_count().comment(comment.tag());
+                    if let Some(t) = max_time {
+                        a = a.max_time(t);
+                    }
+                    Ok(count_stream(a.await?))
+                }
                 Method::Distinct { field, filter } => {
-                    let values = coll.distinct(field, filter.clone()).comment(tag).await?;
+                    let mut a = coll.distinct(field, filter.clone()).comment(comment.tag());
+                    if let Some(t) = max_time {
+                        a = a.max_time(t);
+                    }
+                    let values = a.await?;
                     Ok(ReadStream::docs(
-                        values.into_iter().map(|v| doc! { "value": v }).collect(),
+                        values.into_iter().map(reply::value_row).collect(),
                     ))
                 }
                 Method::GetIndexes => {
-                    let command = doc! { "listIndexes": collection, "comment": tag };
-                    Ok(ReadStream::docs(reply_docs(db.run_command(command).await?)))
+                    let command = doc! { "listIndexes": collection, "comment": comment.as_str() };
+                    Ok(ReadStream::docs(reply::reply_docs(
+                        &db.run_command(command).await?,
+                    )))
                 }
                 Method::Stats => {
-                    let command = doc! { "collStats": collection, "comment": tag };
+                    let command = doc! { "collStats": collection, "comment": comment.as_str() };
                     Ok(ReadStream::docs(vec![db.run_command(command).await?]))
                 }
                 _ => Err(AppError::internal("Not a read statement")),
@@ -520,27 +530,8 @@ fn cursor(c: Cursor<RawDocumentBuf>) -> ReadStream {
     }
 }
 
-fn count_doc(n: u64) -> ReadStream {
-    ReadStream::docs(vec![doc! { "count": i64::try_from(n).unwrap_or(i64::MAX) }])
-}
-
-/// The documents of a command reply: the first batch when the reply is a cursor (as for
-/// `listCollections` or `listIndexes`), else the reply itself.
-pub(crate) fn reply_docs(mut reply: Document) -> Vec<Document> {
-    let batch = reply
-        .get_document_mut("cursor")
-        .ok()
-        .and_then(|c| c.remove("firstBatch"));
-    match batch {
-        Some(Bson::Array(items)) => items
-            .into_iter()
-            .filter_map(|b| match b {
-                Bson::Document(d) => Some(d),
-                _ => None,
-            })
-            .collect(),
-        _ => vec![reply],
-    }
+fn count_stream(n: u64) -> ReadStream {
+    ReadStream::docs(vec![reply::count_row(n)])
 }
 
 fn sort_doc(s: &RunSort) -> Document {
@@ -549,62 +540,14 @@ fn sort_doc(s: &RunSort) -> Document {
     d
 }
 
-fn unknown_option(method: &str, key: &str) -> AppError {
-    AppError::invalid(format!("Unknown {method} option: {key}"))
-}
-
-fn opt_bool(key: &str, v: &Bson) -> Result<bool, AppError> {
-    v.as_bool()
-        .ok_or_else(|| AppError::invalid(format!("{key} must be true or false")))
-}
-
-fn opt_doc<'a>(key: &str, v: &'a Bson) -> Result<&'a Document, AppError> {
-    v.as_document()
-        .ok_or_else(|| AppError::invalid(format!("{key} must be a document")))
-}
-
-fn opt_u64(key: &str, v: &Bson) -> Result<u64, AppError> {
-    let n = match v {
-        Bson::Int32(i) => i64::from(*i),
-        Bson::Int64(i) => *i,
-        Bson::Double(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => *f as i64,
-        _ => -1,
-    };
-    u64::try_from(n)
-        .map_err(|_| AppError::invalid(format!("{key} must be a whole number of 0 or more")))
-}
-
-fn opt_u32(key: &str, v: &Bson) -> Result<u32, AppError> {
-    u32::try_from(opt_u64(key, v)?).map_err(|_| AppError::invalid(format!("{key} is too large")))
-}
-
-fn hint(v: &Bson) -> Result<Hint, AppError> {
-    match v {
-        Bson::String(name) => Ok(Hint::Name(name.clone())),
-        Bson::Document(keys) => Ok(Hint::Keys(keys.clone())),
-        _ => Err(AppError::invalid(
-            "hint must be an index name or a key document",
-        )),
-    }
-}
-
-fn collation(d: &Document) -> Result<Collation, AppError> {
-    mongodb::bson::from_document(d.clone())
-        .map_err(|e| AppError::invalid("Invalid collation").with_detail(e.to_string()))
-}
-
-// ---- cancel
-
-/// Stops the server operations of a run: they carry `query_id` as their comment. Only the
-/// user's own operations are listed, which needs no extra privilege.
-pub(crate) async fn kill(state: &AppState, conn_id: &str, query_id: &str) -> Result<(), AppError> {
-    let client = client::client(state, conn_id).await?;
+/// Stops the server operations of a run: they carry its comment. Only the user's own operations
+/// are listed, which needs no extra privilege.
+pub(crate) async fn kill(access: &impl Access, conn_id: &str, query_id: &str) -> Result<(), AppError> {
+    let client = client::client(access, conn_id).await?;
+    let comment = OpComment::new(query_id);
     let admin = client.database("admin");
     let mut ops = admin
-        .aggregate(vec![
-            doc! { "$currentOp": {} },
-            doc! { "$match": { "command.comment": query_id } },
-        ])
+        .aggregate(vec![doc! { "$currentOp": {} }, comment.current_op()])
         .await?;
     let mut ids = Vec::new();
     while ops.advance().await? {

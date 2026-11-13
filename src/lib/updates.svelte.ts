@@ -10,7 +10,6 @@ export const appVersion = version;
 const SEEN_KEY = 'sandb.version.seen';
 export const whatsNew = $state({ releases: [] as Release[] });
 
-/** Shows the changes since the last version that was opened; the dev server skips it. */
 export function showWhatsNew() {
   if (import.meta.env.DEV) return;
   const seen = localStorage.getItem(SEEN_KEY);
@@ -19,7 +18,6 @@ export function showWhatsNew() {
   if (!whatsNew.releases.length) localStorage.setItem(SEEN_KEY, appVersion);
 }
 
-/** Closing the dialog marks this version as seen, so it opens once per version. */
 export function closeWhatsNew() {
   whatsNew.releases = [];
   localStorage.setItem(SEEN_KEY, appVersion);
@@ -29,7 +27,7 @@ type Status = 'idle' | 'checking' | 'latest' | 'available' | 'installing' | 'res
 export const updates = $state({ status: 'idle' as Status, next: '', notes: '', error: '' });
 
 // The updater plugin only exists inside the desktop app.
-export const updatesEnabled = api.kind === 'tauri' && !import.meta.env.DEV;
+export const updatesEnabled = api.capabilities.updates && !import.meta.env.DEV;
 let found: import('@tauri-apps/plugin-updater').Update | null = null;
 
 /** `quiet`: the startup check; a failure (offline, no release yet) shows nothing. */
@@ -59,7 +57,6 @@ export async function installUpdate() {
   await restartApp();
 }
 
-/** The update is installed; it takes effect on restart. */
 export async function restartApp() {
   // A transaction can start while the update downloads, so ask again right before the restart.
   if (!(await settlePending(tabs.list, 'Restarting to update', true))) return;

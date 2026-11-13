@@ -1,7 +1,6 @@
-//! Connection pools per saved connection, plus the one-shot probe used by "Test connection".
+//! Connection pools per saved connection and database, plus the one-shot probe used by
+//! "Test connection". SQL only: a MongoDB connection is probed through its own client.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use sqlx::Connection as _;
@@ -11,12 +10,11 @@ use sqlx::mysql::{
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions};
 
-use crate::core::connections::{Connection, Engine, SslMode, Topology, expand_home};
+use crate::core::cache::GenerationCache;
+use crate::core::connections::{Connection, SslMode, Topology, expand_home};
+use crate::core::engine::{CONNECT_TIMEOUT, MAX_CONNECTIONS, SqlEngine};
 use crate::core::error::{AppError, ErrorCode};
-use crate::core::mongo;
 
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const MAX_CONNECTIONS: u32 = 5;
 /// Database pools kept per saved connection; browsing more databases closes the least recently used.
 const MAX_POOLS_PER_CONNECTION: usize = 8;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -37,6 +35,7 @@ impl DbPool {
         }
     }
 
+    #[cfg(any(test, feature = "it"))]
     pub fn is_closed(&self) -> bool {
         match self {
             DbPool::Pg(p) => p.is_closed(),
@@ -46,33 +45,28 @@ impl DbPool {
     }
 }
 
-#[derive(Default)]
-struct Pools {
-    /// Keyed by (connection id, database): PG needs one pool per database. The `u64` is the
-    /// `tick` of the last use.
-    open: HashMap<(String, String), (DbPool, u64)>,
-    tick: u64,
-    /// Bumped by `close`. A pool built from settings read before the bump is never cached.
-    generation: HashMap<String, u64>,
+/// Pools by connection and database, opened lazily (no I/O), so a std mutex is enough. The
+/// generation rule is the shared `GenerationCache` one: a pool is never cached from settings that
+/// changed while it was being opened.
+pub struct PoolCache {
+    cache: GenerationCache<(String, String), DbPool>,
 }
 
-/// Pools by connection and database. Opening is lazy (no I/O), so a std mutex is enough.
-#[derive(Default)]
-pub struct PoolCache {
-    inner: Mutex<Pools>,
+impl Default for PoolCache {
+    fn default() -> Self {
+        Self {
+            cache: GenerationCache::with_cap(MAX_POOLS_PER_CONNECTION),
+        }
+    }
 }
 
 impl PoolCache {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Pools> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     /// Read this before reading the connection settings and secret that go into `get_or_open`.
     pub fn generation(&self, id: &str) -> u64 {
-        self.lock().generation.get(id).copied().unwrap_or(0)
+        self.cache.generation(id)
     }
 
-    /// The cached pool for (`conn.id`, `database`), or a new one opened with `conn` and `password`.
     /// `None` when `close` ran after `generation` was read: the caller must re-read the settings.
     pub fn get_or_open(
         &self,
@@ -81,64 +75,54 @@ impl PoolCache {
         password: Option<&str>,
         generation: u64,
     ) -> Result<Option<DbPool>, AppError> {
-        let mut pools = self.lock();
-        if pools.generation.get(&conn.id).copied().unwrap_or(0) != generation {
+        let key = (conn.id.clone(), database.to_string());
+        if let Some(p) = self.cache.get(&key, generation) {
+            return Ok(Some(p));
+        }
+        if !self.cache.is_current(&conn.id, generation) {
             return Ok(None);
         }
-        pools.tick += 1;
-        let tick = pools.tick;
-        let key = (conn.id.clone(), database.to_string());
-        if let Some((p, used)) = pools.open.get_mut(&key) {
-            *used = tick;
-            return Ok(Some(p.clone()));
-        }
+        let engine = conn
+            .engine
+            .sql()
+            .ok_or_else(AppError::not_sql)?;
         let mut target = conn.clone();
         target.database = database.to_string();
-        let p = open_lazy(&target, password)?;
-        let evicted = evict_lru(&mut pools, &conn.id);
-        pools.open.insert(key, (p.clone(), tick));
-        if let Some(old) = evicted {
+        let p = open_lazy(&target, engine, password)?;
+        let Some(cached) = self.cache.insert(key, generation, p) else {
+            return Ok(None);
+        };
+        if let Some(old) = cached.evicted {
             // `close` waits for checked-out connections, so a run on the old pool finishes first.
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 rt.spawn(async move { old.close().await });
             }
         }
-        Ok(Some(p))
+        Ok(Some(cached.value))
     }
 
     pub fn contains(&self, id: &str) -> bool {
-        self.lock().open.keys().any(|(c, _)| c == id)
+        self.cache.contains(id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    #[cfg(test)]
+    fn holds(&self, conn_id: &str, database: &str) -> bool {
+        self.cache
+            .get(&(conn_id.to_string(), database.to_string()), self.generation(conn_id))
+            .is_some()
     }
 
     /// Closes every pool of `id` and invalidates pools that are being opened right now.
     pub async fn close(&self, id: &str) {
-        let closing: Vec<DbPool> = {
-            let mut pools = self.lock();
-            *pools.generation.entry(id.to_string()).or_insert(0) += 1;
-            let keys: Vec<_> = pools
-                .open
-                .keys()
-                .filter(|(c, _)| c == id)
-                .cloned()
-                .collect();
-            keys.into_iter()
-                .filter_map(|k| pools.open.remove(&k).map(|(p, _)| p))
-                .collect()
-        };
-        for p in closing {
+        for p in self.cache.close(id) {
             p.close().await;
         }
     }
-}
-
-/// Removes the least recently used pool of `id` when `id` already has the maximum.
-fn evict_lru(pools: &mut Pools, id: &str) -> Option<DbPool> {
-    let mine = pools.open.iter().filter(|((c, _), _)| c == id);
-    if mine.clone().count() < MAX_POOLS_PER_CONNECTION {
-        return None;
-    }
-    let oldest = mine.min_by_key(|(_, (_, used))| *used)?.0.clone();
-    pools.open.remove(&oldest).map(|(p, _)| p)
 }
 
 fn pg_options(c: &Connection, password: Option<&str>) -> PgConnectOptions {
@@ -200,41 +184,14 @@ pub(crate) fn sqlite_options(
         .read_only(read_only))
 }
 
-/// A single connection outside any pool.
-pub(crate) enum OneConnection {
-    Pg(PgConnection),
-    MySql(MySqlConnection),
-}
-
-/// Opens one connection for `database` (never pooled, never cached) for the AI read's
-/// safety-net cancel, which must not queue behind the user's busy pool.
-pub(crate) async fn connect_one(
+fn open_lazy(
     c: &Connection,
-    database: &str,
+    engine: SqlEngine,
     password: Option<&str>,
-) -> Result<OneConnection, AppError> {
-    let mut target = c.clone();
-    target.database = database.to_string();
-    match c.engine {
-        Engine::Pg => PgConnection::connect_with(&pg_options(&target, password))
-            .await
-            .map(OneConnection::Pg)
-            .map_err(AppError::from),
-        Engine::Mysql => MySqlConnection::connect_with(&mysql_options(&target, password))
-            .await
-            .map(OneConnection::MySql)
-            .map_err(AppError::from),
-        Engine::Sqlite => Err(AppError::internal(
-            "SQLite kills never use a second connection",
-        )),
-        Engine::Mongo => Err(AppError::unsupported_mongo()),
-    }
-}
-
-fn open_lazy(c: &Connection, password: Option<&str>) -> Result<DbPool, AppError> {
+) -> Result<DbPool, AppError> {
     let read_only = c.read_only;
-    Ok(match c.engine {
-        Engine::Pg => DbPool::Pg(
+    Ok(match engine {
+        SqlEngine::Pg => DbPool::Pg(
             PgPoolOptions::new()
                 .max_connections(MAX_CONNECTIONS)
                 .min_connections(0)
@@ -242,7 +199,7 @@ fn open_lazy(c: &Connection, password: Option<&str>) -> Result<DbPool, AppError>
                 .acquire_timeout(CONNECT_TIMEOUT)
                 .connect_lazy_with(pg_options(c, password)),
         ),
-        Engine::Mysql => {
+        SqlEngine::Mysql => {
             let mut o = MySqlPoolOptions::new()
                 .max_connections(MAX_CONNECTIONS)
                 .min_connections(0)
@@ -262,7 +219,7 @@ fn open_lazy(c: &Connection, password: Option<&str>) -> Result<DbPool, AppError>
             }
             DbPool::MySql(o.connect_lazy_with(mysql_options(c, password)))
         }
-        Engine::Sqlite => {
+        SqlEngine::Sqlite => {
             let mut o = SqlitePoolOptions::new()
                 .max_connections(MAX_CONNECTIONS)
                 .min_connections(0)
@@ -280,9 +237,6 @@ fn open_lazy(c: &Connection, password: Option<&str>) -> Result<DbPool, AppError>
             }
             DbPool::Sqlite(o.connect_lazy_with(sqlite_options(c, read_only)?))
         }
-        // MongoDB has its own client; no SQL pool opens for it. This refuses every SQL path
-        // (browse, query, chat, export, edit) on a Mongo connection with `unsupported`.
-        Engine::Mongo => return Err(AppError::unsupported_mongo()),
     })
 }
 
@@ -293,73 +247,68 @@ pub struct ServerInfo {
     pub topology: Option<Topology>,
 }
 
-/// Opens one connection (not pooled), reads the server version and closes it. Times out after 10 s.
-pub async fn probe(c: &Connection, password: Option<&str>) -> Result<ServerInfo, AppError> {
+/// Closes a probe connection. The version was already read, so a failed close cannot change
+/// the answer.
+async fn close_quietly<C: sqlx::Connection>(c: C) {
+    let _ = c.close().await;
+}
+
+pub async fn probe(
+    c: &Connection,
+    engine: SqlEngine,
+    password: Option<&str>,
+) -> Result<ServerInfo, AppError> {
     let work = async {
-        match c.engine {
-            Engine::Pg => {
+        match engine {
+            SqlEngine::Pg => {
                 let mut conn = PgConnection::connect_with(&pg_options(c, password)).await?;
                 let v: String = sqlx::query_scalar("SELECT current_setting('server_version')")
                     .fetch_one(&mut conn)
                     .await?;
-                let _ = conn.close().await;
-                Ok::<_, AppError>(ServerInfo {
+                close_quietly(conn).await;
+                Ok(ServerInfo {
                     version: format_pg_version(&v),
                     topology: None,
                 })
             }
-            Engine::Mysql => {
+            SqlEngine::Mysql => {
                 let mut conn = MySqlConnection::connect_with(&mysql_options(c, password)).await?;
                 let v: String = sqlx::query_scalar("SELECT VERSION()")
                     .fetch_one(&mut conn)
                     .await?;
-                let _ = conn.close().await;
+                close_quietly(conn).await;
                 Ok(ServerInfo {
                     version: format_mysql_version(&v),
                     topology: None,
                 })
             }
-            Engine::Sqlite => {
-                let mut conn = SqliteConnection::connect_with(&sqlite_options(c, true)?).await?;
+            SqlEngine::Sqlite => {
+                let mut conn =
+                    SqliteConnection::connect_with(&sqlite_options(c, c.read_only)?).await?;
                 let v: String = sqlx::query_scalar("SELECT sqlite_version()")
                     .fetch_one(&mut conn)
                     .await?;
-                let _ = conn.close().await;
+                close_quietly(conn).await;
                 Ok(ServerInfo {
                     version: format!("SQLite {v}"),
                     topology: None,
-                })
-            }
-            Engine::Mongo => {
-                let (version, topology) = mongo::conn::probe(c, password).await?;
-                Ok(ServerInfo {
-                    version,
-                    topology: Some(topology),
                 })
             }
         }
     };
     match tokio::time::timeout(CONNECT_TIMEOUT, work).await {
         Ok(r) => r,
-        Err(_) => Err(AppError::new(
-            ErrorCode::Timeout,
-            format!(
-                "No answer from the server within {} s",
-                CONNECT_TIMEOUT.as_secs()
-            ),
-        )),
+        Err(_) => Err(AppError::connect_timeout()),
     }
 }
 
-/// `16.4 (Debian 16.4-1.pgdg120+2)` → `PostgreSQL 16.4`.
 fn format_pg_version(v: &str) -> String {
     format!("PostgreSQL {}", v.split_whitespace().next().unwrap_or(v))
 }
 
-/// `11.4.2-MariaDB-ubu2404` → `MariaDB 11.4.2`; `8.4.3` → `MySQL 8.4.3`.
 fn format_mysql_version(v: &str) -> String {
     let num = v.split('-').next().unwrap_or(v);
-    if v.to_ascii_lowercase().contains("mariadb") {
+    if SqlEngine::is_mariadb(v) {
         format!("MariaDB {num}")
     } else {
         format!("MySQL {num}")
@@ -370,6 +319,7 @@ fn format_mysql_version(v: &str) -> String {
 mod tests {
     use super::*;
     use crate::core::connections::Env;
+    use crate::core::engine::Engine;
 
     fn sqlite_conn(file: &std::path::Path) -> Connection {
         Connection {
@@ -414,11 +364,10 @@ mod tests {
         let p = cache.get_or_open(&c, "main", None, g).unwrap().unwrap();
         assert!(cache.contains("c1"));
         cache.get_or_open(&c, "main", None, g).unwrap().unwrap();
-        assert_eq!(cache.lock().open.len(), 1, "the same key reuses its pool");
+        assert_eq!(cache.len(), 1, "the same key reuses its pool");
         cache.close("c1").await;
         assert!(p.is_closed());
         assert!(!cache.contains("c1"));
-        // Other connections keep their generation.
         assert_eq!(cache.generation("other"), 0);
     }
 
@@ -431,7 +380,7 @@ mod tests {
         let cache = PoolCache::default();
         let a = cache.get_or_open(&c, "a", None, 0).unwrap().unwrap();
         let b = cache.get_or_open(&c, "b", None, 0).unwrap().unwrap();
-        assert_eq!(cache.lock().open.len(), 2);
+        assert_eq!(cache.len(), 2);
         cache.close("c1").await;
         assert!(a.is_closed() && b.is_closed());
     }
@@ -450,9 +399,9 @@ mod tests {
         // db0 is used again, so db1 is now the least recently used.
         open("db0");
         open("extra");
-        assert_eq!(cache.lock().open.len(), MAX_POOLS_PER_CONNECTION);
-        assert!(!cache.lock().open.contains_key(&("c1".into(), "db1".into())));
-        assert!(cache.lock().open.contains_key(&("c1".into(), "db0".into())));
+        assert_eq!(cache.len(), MAX_POOLS_PER_CONNECTION);
+        assert!(!cache.holds("c1", "db1"));
+        assert!(cache.holds("c1", "db0"));
         tokio::time::timeout(Duration::from_secs(5), async {
             while !first[1].is_closed() {
                 tokio::task::yield_now().await;

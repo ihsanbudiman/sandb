@@ -1,22 +1,17 @@
-<script lang="ts" module>
-  import type { ColumnInfo, TableProperties as TableProps } from '../api';
-  // Survives the remount when the tab switches between Data and Properties; `rev` is the structure
-  // revision it was loaded at, so a change made while the view was closed reloads it.
-  const cache = new Map<string, { columns: ColumnInfo[]; info: TableProps; ddl: string; rev: number }>();
-</script>
-
 <script lang="ts">
   import { untrack } from 'svelte';
   import { Columns2, KeyRound, Link, Link2, ListTree, FileCode, Network, ShieldCheck, SlidersHorizontal, Gauge, LoaderCircle, RotateCw, CircleAlert, Plus, Pencil, Trash2 } from '@lucide/svelte';
-  import { api, ApiError } from '../api';
-  import { canWrite, structure, type Conn } from '../state.svelte';
+  import { catalog, loadColumns, loadDdl, loadProperties, structureChanged } from '../catalog.svelte';
+  import { canWrite, type Conn } from '../connections.svelte';
   import { displayName, canAlterConstraints, columnDef, constraintDef, foreignKeyDef, indexDef, indexEdit, type SchemaChange, type TableRef } from '../tableActions';
+  import { tableKey } from '../tableId';
   import SchemaChangeDialog, { type SchemaAsk, type SchemaEdit } from './SchemaChangeDialog.svelte';
   import MongoSchemaDialog, { type MongoAsk } from './MongoSchemaDialog.svelte';
   import ErDiagram from './ErDiagram.svelte';
+  import { ask as askDialog } from '../ask.svelte';
 
-  /** `onchanged`: after a structure change, so the caller can reload what depends on the columns. `onopen`: open a related table from the ER diagram. */
-  let { conn, table, onchanged, onopen }: { conn: Conn; table: TableRef; onchanged?: () => void; onopen?: (t: TableRef) => void } = $props();
+  /** `onopen`: open a related table from the ER diagram. */
+  let { conn, table, onopen }: { conn: Conn; table: TableRef; onopen?: (t: TableRef) => void } = $props();
 
   type Section = 'columns' | 'constraints' | 'foreignKeys' | 'references' | 'indexes' | 'ddl' | 'diagram' | 'validator' | 'options' | 'stats';
   const sqlSections: { id: Section; label: string; icon: typeof Columns2 }[] = [
@@ -31,7 +26,6 @@
   let section = $state<Section>('columns');
 
   const mongo = $derived(conn.engine === 'mongo');
-  // A collection has no constraints, foreign keys or diagram; a view has fields, options and the script only.
   const isView = $derived(table.kind !== 'table');
   const sections = $derived<{ id: Section; label: string; icon: typeof Columns2 }[]>(
     !mongo
@@ -46,45 +40,25 @@
         ],
   );
 
-  // The parent keys this component by tab, and a tab's table never changes.
-  const key = untrack(() => `${conn.id}/${table.database}/${table.schema ?? ''}/${table.name}`);
-  const hit = cache.get(key);
-  const fresh = hit && hit.rev === structure.rev ? hit : undefined;
-  let columns = $state<ColumnInfo[] | null>(fresh?.columns ?? null);
-  let info = $state<TableProps | null>(fresh?.info ?? null);
-  let ddl = $state<string | null>(fresh?.ddl ?? null);
-  let error = $state('');
-  let loading = $state(false);
+  // One catalog entry per table: the Data view's foreign keys and this view share it, and a structure
+  // change reloads it in place (the catalog's revision covers the views that watch it).
+  const key = untrack(() => tableKey({ connId: conn.id, database: table.database, schema: table.schema, name: table.name }));
+  const columns = $derived(catalog.columns[key]?.items ?? null);
+  const info = $derived(catalog.properties[key]?.items ?? null);
+  const ddl = $derived(catalog.ddl[key]?.items ?? null);
+  const loads = $derived([catalog.columns[key], catalog.properties[key], catalog.ddl[key]]);
+  const error = $derived(loads.find((l) => l?.status === 'error')?.error ?? '');
+  const loading = $derived(loads.some((l) => l?.status === 'loading') || loads.every((l) => !l));
 
   // One load fills every section, so switching sections never waits.
-  async function load() {
-    loading = true;
-    error = '';
-    const { database, schema, name } = table;
-    try {
-      const [c, p, d] = await Promise.all([
-        api.listColumns(conn.id, database, schema, name),
-        api.tableProperties(conn.id, database, schema, name),
-        api.tableDdl(conn.id, database, schema, name),
-      ]);
-      cache.set(key, { columns: c, info: p, ddl: d, rev: structure.rev });
-      [columns, info, ddl] = [c, p, d];
-    } catch (e) {
-      error = ApiError.from(e).message;
-    } finally {
-      loading = false;
-    }
+  function load(force = false) {
+    void Promise.all([
+      loadColumns(conn.id, table.database, table.schema, table.name, force),
+      loadProperties(conn.id, table.database, table.schema, table.name, force),
+      loadDdl(conn.id, table.database, table.schema, table.name, force),
+    ]);
   }
-  if (!fresh) load();
-
-  // A structure change elsewhere (an editor run, a grid save, an approved AI write) makes the
-  // cached data stale, so the open view reloads.
-  let rev = structure.rev;
-  $effect(() => {
-    if (structure.rev === rev) return;
-    rev = structure.rev;
-    load();
-  });
+  load();
 
   const count = (s: Section) =>
     s === 'columns' ? columns?.length : s === 'ddl' || s === 'diagram' || s === 'validator' || s === 'options' || s === 'stats' ? undefined : info?.[s].length;
@@ -115,19 +89,24 @@
   const add = $derived(mongo ? (section === 'indexes' ? 'index' : undefined) : addable[section]);
   const dropCol = $derived(editable && !!add && !locked(section));
 
-  let ask = $state<SchemaAsk | null>(null);
-  let mongoAsk = $state<MongoAsk | null>(null);
-  const askDrop = (drop: SchemaChange, label: string) => (ask = { drop, label });
+  async function runChange(a: SchemaAsk) {
+    if (await askDialog<boolean>(SchemaChangeDialog, { conn, table, columns: columns ?? [], ask: a })) afterChange();
+  }
+
+  async function runMongoChange(a: MongoAsk) {
+    if (await askDialog<boolean>(MongoSchemaDialog, { conn, table, columns: columns ?? [], ask: a })) afterChange();
+  }
+
+  function afterChange() {
+    // The catalog reloads the loaded columns, properties and DDL of the connection and the tree's lists.
+    structureChanged(conn);
+  }
+
+  const askDrop = (drop: SchemaChange, label: string) => void runChange({ drop, label });
   // A collection has its own dialog: the SQL one would write CREATE INDEX text the Mongo parser refuses.
   function askAdd(kind: 'column' | 'constraint' | 'foreignKey' | 'index') {
-    if (mongo && kind === 'index') mongoAsk = { add: 'index' };
-    else ask = { add: kind };
-  }
-  function changed() {
-    ask = null;
-    mongoAsk = null;
-    load();
-    onchanged?.();
+    if (mongo && kind === 'index') void runMongoChange({ add: 'index' });
+    else void runChange({ add: kind });
   }
 </script>
 
@@ -137,7 +116,7 @@
 
 {#snippet actions(edit: SchemaEdit | null, drop: SchemaChange | null, label: string)}
   <td class="w-16 !px-1 text-right">
-    {#if edit}<button class="btn btn-ghost size-6 p-0 text-faint opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-ink" title="Edit {label}" aria-label="Edit {label}" onclick={() => (ask = { edit })}><Pencil size={13} /></button>{/if}
+    {#if edit}<button class="btn btn-ghost size-6 p-0 text-faint opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-ink" title="Edit {label}" aria-label="Edit {label}" onclick={() => runChange({ edit })}><Pencil size={13} /></button>{/if}
     {#if drop}<button class="btn btn-ghost size-6 p-0 text-faint opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-red-600 dark:hover:text-red-400" title="Drop {label}" aria-label="Drop {label}" onclick={() => askDrop(drop, label)}><Trash2 size={13} /></button>{/if}
   </td>
 {/snippet}
@@ -154,7 +133,7 @@
     {/each}
     <div class="mt-auto flex items-center gap-1.5 px-1 pt-2 text-[11.5px] text-faint">
       <span class="min-w-0 flex-1 truncate" title={displayName(table)}>{displayName(table)}</span>
-      <button class="btn btn-ghost size-6 p-0" title="Refresh properties" aria-label="Refresh properties" disabled={loading} onclick={load}>
+      <button class="btn btn-ghost size-6 p-0" title="Refresh properties" aria-label="Refresh properties" disabled={loading} onclick={() => load(true)}>
         {#if loading}<LoaderCircle size={13} class="animate-spin" />{:else}<RotateCw size={13} />{/if}
       </button>
     </div>
@@ -164,7 +143,7 @@
   {#if editable && !error && columns}
     {#if mongo && section === 'validator'}
       <div class="flex h-9 shrink-0 items-center gap-2 border-b border-line px-2">
-        <button class="btn btn-ghost h-7 px-2" onclick={() => (mongoAsk = { validator: { validator: coll?.validator ?? '', level: coll?.validationLevel ?? '', action: coll?.validationAction ?? '' } })}>
+        <button class="btn btn-ghost h-7 px-2" onclick={() => runMongoChange({ validator: { validator: coll?.validator ?? '', level: coll?.validationLevel ?? '', action: coll?.validationAction ?? '' } })}>
           {#if coll?.validator}<Pencil size={13} /> Edit validator{:else}<Plus size={13} /> Add validator{/if}
         </button>
       </div>
@@ -233,7 +212,7 @@
                 <td class="w-16 !px-1 text-right">
                   <!-- MongoDB cannot change an index's keys: a change drops it and adds it again. -->
                   {#if !x.primary}
-                    <button class="btn btn-ghost size-6 p-0 text-faint opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-red-600 dark:hover:text-red-400" title="Drop index {x.name}" aria-label="Drop index {x.name}" onclick={() => (mongoAsk = { drop: { name: x.name, keys: m?.keys ?? x.columns.join(', ') } })}><Trash2 size={13} /></button>
+                    <button class="btn btn-ghost size-6 p-0 text-faint opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:text-red-600 dark:hover:text-red-400" title="Drop index {x.name}" aria-label="Drop index {x.name}" onclick={() => runMongoChange({ drop: { name: x.name, keys: m?.keys ?? x.columns.join(', ') } })}><Trash2 size={13} /></button>
                   {/if}
                 </td>
               {/if}
@@ -350,11 +329,3 @@
   </div>
   </div>
 </div>
-
-{#if ask}
-  <SchemaChangeDialog {conn} {table} columns={columns ?? []} {ask} onclose={() => (ask = null)} ondone={changed} />
-{/if}
-
-{#if mongoAsk}
-  <MongoSchemaDialog {conn} {table} columns={columns ?? []} ask={mongoAsk} onclose={() => (mongoAsk = null)} ondone={changed} />
-{/if}

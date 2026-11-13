@@ -51,6 +51,17 @@ pub async fn tables(p: &SqlitePool) -> Result<Vec<TableInfo>, AppError> {
         .collect())
 }
 
+/// Whether `table` has SQLite's implicit rowid (`WITHOUT ROWID` tables have none).
+pub async fn has_rowid(p: &SqlitePool, table: &str) -> Result<bool, AppError> {
+    let sql: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE",
+    )
+    .bind(table)
+    .fetch_optional(p)
+    .await?;
+    Ok(sql.is_some_and(|sql| !without_rowid(sql.as_deref().unwrap_or(""))))
+}
+
 pub async fn columns(p: &SqlitePool, table: &str) -> Result<Vec<ColumnInfo>, AppError> {
     let rows: Vec<(String, String, i64, Option<String>, i64)> = sqlx::query_as(
         "SELECT name, CAST(type AS TEXT), \"notnull\", CAST(dflt_value AS TEXT), pk \

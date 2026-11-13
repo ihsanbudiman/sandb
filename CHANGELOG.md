@@ -4,6 +4,11 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+- Fixed: in a chat on a MongoDB database, the assistant's list-tables and describe-table steps now answer. Before, they failed with "Not a SQL connection", so the assistant could not see the collection or field list.
+- Fixed: sandb no longer stops at launch when the connections file has a connection that this version cannot read. A newer version can write such a connection, for example a MongoDB connection that version 0.11.0 does not know. sandb now starts with the other connections and hides that connection. When sandb saves the list, it keeps the hidden connection unchanged. If you install the newer version again, the connection is still there.
+- Fixed: in the Data view of a MongoDB collection, a filter on a UUID field now finds the documents. Before, the filter sent the value as a string, so it found no document.
+- Fixed: when you stop an approved AI write on MySQL, or when a statement in it fails, the message no longer says "Nothing changed" if an earlier statement in the batch can already be committed. MySQL commits some statements (for example `CREATE TABLE`) at once. The message now tells you to check the database.
+
 ## [0.12.0] - 2026-11-11
 
 - New: you can now sort the connection list. Drag a connection up or down in the sidebar. You can also select a connection and press Alt+↑ or Alt+↓. sandb saves the order. If the save fails, the list shows the old order again and a message shows the error.

@@ -2,10 +2,10 @@
 import { highlightCode, tagHighlighter, tags as t } from '@lezer/highlight';
 import { PostgreSQL, MySQL, SQLite, StandardSQL, type SQLDialect } from '@codemirror/lang-sql';
 import type { Engine } from './api';
+import type { SqlEngine } from './sql/text';
 
 const byFence: Record<string, SQLDialect> = { sql: StandardSQL, postgres: PostgreSQL, postgresql: PostgreSQL, pgsql: PostgreSQL, psql: PostgreSQL, mysql: MySQL, mariadb: MySQL, sqlite: SQLite };
-// MongoDB text is never highlighted as SQL; the entry only completes the map.
-const byEngine: Record<Engine, SQLDialect> = { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite, mongo: StandardSQL };
+const byEngine: Record<SqlEngine, SQLDialect> = { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite };
 const looksSql = /^\s*(?:--[^\n]*\n\s*)*(?:SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|EXPLAIN|SHOW|DESCRIBE|GRANT|REVOKE|BEGIN|COMMIT|ROLLBACK)\b/i;
 
 const tokens = tagHighlighter([
@@ -19,7 +19,6 @@ const tokens = tagHighlighter([
 
 const escape = (s: string) => s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 
-/** The dialect of a Markdown code fence. A fence without a language is SQL when it starts with a SQL statement. */
 export function fenceDialect(lang: string | undefined, code: string): SQLDialect | undefined {
   const name = lang?.trim().split(/\s/)[0].toLowerCase();
   return name ? byFence[name] : looksSql.test(code) ? StandardSQL : undefined;

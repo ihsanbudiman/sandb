@@ -16,7 +16,7 @@ const toolScenarios = {
   chart: ['render_chart', { sql: 'SELECT status, count(*) AS orders FROM orders GROUP BY status ORDER BY status', type: 'bar', title: 'Orders by status', x: 'status', y: ['orders'] }],
 };
 // MongoDB scenarios on the seed database shop_staging. "mongo write" and "mongo out" use the
-// first ai_it_* name in the message as their scratch collection (default ai_it_mock).
+// first it_* name in the message as their scratch collection (default it_mock).
 const mongoScenarios = {
   'mongo read': () => ['run_mongo_read', { query: 'db.orders.find({status: "paid"}, {status: 1, total: 1}).sort({_id: 1}).limit(5)' }],
   'mongo chart': () => ['render_mongo_chart', {
@@ -70,7 +70,7 @@ function plan(body) {
   if (kw === 'error') return { kind: 'error' };
   if (kw === 'slow') return { kind: 'slow' };
   if (kw in mongoScenarios) {
-    const coll = q.match(/\bai_it_\w+/)?.[0] ?? 'ai_it_mock';
+    const coll = q.match(/\b(?:ai_)?it_[0-9a-f]+/)?.[0] ?? 'it_mock';
     const [name, args] = mongoScenarios[kw](coll);
     return { kind: 'tool', name, args: JSON.stringify(args) };
   }

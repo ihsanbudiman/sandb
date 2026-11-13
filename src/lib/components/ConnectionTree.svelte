@@ -1,10 +1,13 @@
 <script lang="ts">
   import { ChevronRight, Table2, Plus, Layers, KeyRound, Columns2, Database, Pencil, Copy, Trash, Ellipsis, LoaderCircle, RotateCw, Eye, ScanEye, ListTree, Lock, Hash, FileCode, FileSearch, FilePlus, Download, Sheet, Eraser } from '@lucide/svelte';
   import { untrack } from 'svelte';
-  import { db, active, engines, envDot, envTag, canWrite, isSql, type Conn } from '../state.svelte';
-  import { schemas, nsOf, pkOf, colType } from '../mock';
-  import { api, ApiError, type ColumnInfo, type TableInfo, type TableKind } from '../api';
+  import { api, type TableInfo, type TableKind } from '../api';
+  import { catalog, databases, forget as forgetCatalog, listKey, loadColumns, loadDatabases, loadSchemas, loadTables, reloadLists, schemas, tables, type Loaded } from '../catalog.svelte';
+  import { db, engines, envDot, envTag, canWrite, defaultDb, isSql, sameTarget, type Conn } from '../connections.svelte';
+  import { active } from '../tabs.svelte';
+  import { Pref } from '../persist.svelte';
   import { displayName, kindLabel, type TableAction, type TableRef } from '../tableActions';
+  import { tableKey } from '../tableId';
 
   let {
     selected,
@@ -28,7 +31,6 @@
     onreorder: (ids: string[]) => void;
   } = $props();
 
-  // A single click marks a table row; the highlight then follows the active tab again when it changes.
   let picked = $state<string | null>(null);
   $effect(() => {
     selected;
@@ -41,7 +43,7 @@
     if (e.metaKey || e.ctrlKey) onopen(c, t);
     else picked = key;
   }
-  function tableKey(e: KeyboardEvent, c: Conn, t: TableRef) {
+  function tableKeydown(e: KeyboardEvent, c: Conn, t: TableRef) {
     if (e.key !== 'Enter') return;
     e.preventDefault();
     onopen(c, t);
@@ -78,10 +80,12 @@
   // window's own file-drop handling can swallow HTML5 drag events. `to`: the gap the row goes to,
   // 0 = above the first row, n = below the last. The drag starts after 4px, so a click still toggles.
   let drag = $state<{ id: string; y0: number; on: boolean; to: number } | null>(null);
+  // The click that ends a drag must not collapse the row; the next press clears the flag.
   let dragged = false;
 
   function dragStart(e: PointerEvent, c: Conn) {
     if (e.button !== 0 || e.metaKey || e.ctrlKey) return;
+    dragged = false;
     drag = { id: c.id, y0: e.clientY, on: false, to: 0 };
   }
 
@@ -103,9 +107,7 @@
     const d = drag;
     drag = null;
     if (!d?.on) return;
-    // The click that follows this pointerup must not toggle the row.
     dragged = true;
-    setTimeout(() => (dragged = false));
     move(d.id, d.to);
   }
 
@@ -125,16 +127,16 @@
     move(c.id, e.key === 'ArrowUp' ? i - 1 : i + 2);
   }
 
-  // Table menu. `list`: the tree key of the table list, so Refresh reloads it.
-  let tableMenu = $state<{ x: number; y: number; c: Conn; t: TableRef; list: string | null } | null>(null);
+  // Table menu. `list`: the table list the table belongs to, for Refresh.
+  let tableMenu = $state<{ x: number; y: number; c: Conn; t: TableRef } | null>(null);
 
-  function openTableMenu(e: MouseEvent, c: Conn, t: TableRef, list: string | null) {
+  function openTableMenu(e: MouseEvent, c: Conn, t: TableRef) {
     e.preventDefault();
     e.stopPropagation();
     menu = null;
     const r = e.clientX === 0 && e.clientY === 0 ? (e.currentTarget as HTMLElement).getBoundingClientRect() : null;
     // Menu is w-60 (240px) and about 470px tall; keep it inside the window.
-    tableMenu = { x: Math.max(4, Math.min(r ? r.left + 16 : e.clientX, innerWidth - 244)), y: Math.max(4, Math.min(r ? r.bottom + 2 : e.clientY, innerHeight - 474)), c, t, list };
+    tableMenu = { x: Math.max(4, Math.min(r ? r.left + 16 : e.clientX, innerWidth - 244)), y: Math.max(4, Math.min(r ? r.bottom + 2 : e.clientY, innerHeight - 474)), c, t };
   }
 
   function tableAct(a: TableAction) {
@@ -149,54 +151,15 @@
     if (m) navigator.clipboard?.writeText(displayName(m.t)).catch(() => {});
   }
 
-  // Files are written by the desktop app only.
-  const canExport = api.kind === 'tauri';
+  const canExport = api.capabilities.fileExport;
 
-  /** Reloads the table list that holds `t`, e.g. after a drop. */
-  export function refreshTables(c: Conn, t: TableRef) {
-    if (!isMock || !isSql(c)) refresh(t.schema === null ? `${c.id}/${t.database}` : `${c.id}/${t.database}/${t.schema}`);
-  }
-
-  // Node keys that hold a table list, and where that list comes from.
-  const tableLists = $state<Record<string, { connId: string; database: string; schema: string | null }>>({});
-
-  /** Every table the tree has loaded, hidden partitions included, for the palette search. Partitions come last. */
-  export function loadedTables(): { c: Conn; t: TableRef; partition: boolean }[] {
-    const out: { c: Conn; t: TableRef; partition: boolean }[] = [];
-    for (const [k, l] of Object.entries(tableLists)) {
-      const c = db.connections.find((x) => x.id === l.connId);
-      if (!c || nodes[k]?.status !== 'ok') continue;
-      for (const t of tableList(k)) out.push({ c, t: { database: l.database, schema: l.schema, name: t.name, kind: t.kind }, partition: !!t.partitionOf });
-    }
-    return out.sort((a, b) => +a.partition - +b.partition);
-  }
-
-  // Keys: connection id, `id/db`, `id/db/schema` (pg only), then `…/table`. Kept for the session only.
+  // Keys: connection id, `id/db`, `id/db/schema` (pg only), `…/table`, and `…/<folder>#<kind>`. Kept for the session only.
   const open = $state<Record<string, boolean>>({});
-
-  function groups(c: Conn) {
-    const out: Record<string, string[]> = {};
-    for (const t of Object.keys(schemas[c.schema])) (out[nsOf(c.engine, t)] ??= []).push(t);
-    return Object.entries(out);
-  }
-
-  // A connection opened for the first time also opens its database and, on pg, its first schema.
-  // Mock SQL connections browse the local prototype data; a mock MongoDB connection uses the API
-  // path like a real one, because the mock backend answers its browse calls.
-  function expand(c: Conn) {
-    if (!isMock || !isSql(c)) return expandReal(c);
-    open[c.id] = true;
-    const dk = `${c.id}/db`;
-    if (open[dk] === undefined) open[dk] = true;
-    if (c.engine !== 'pg') return;
-    const first = `${dk}/${groups(c)[0]?.[0]}`;
-    if (open[first] === undefined) open[first] = true;
-  }
 
   // The active connection starts expanded; also applies after a switch or a new connection.
   $effect(() => {
     const c = db.connections.find((x) => x.id === active().id);
-    if (c && open[c.id] === undefined) untrack(() => expand(c));
+    if (c && open[c.id] === undefined) untrack(() => expandReal(c));
   });
 
   const toggle = (k: string) => (open[k] = !open[k]);
@@ -210,30 +173,10 @@
   /** The connection's own guide: a red 2px rail on production, so every row under it shows where it lives. */
   const rootGuide = (c: Conn) => (c.env === 'production' ? `linear-gradient(#dc2626b3,#dc2626b3) ${guide(0) - 0.5}px 0/2px 100% no-repeat` : guides([0]));
 
-  // ---- lazy introspection through the API: every real backend, and MongoDB in mock mode ----
-  const isMock = api.kind === 'mock';
-  type Node = { status: 'loading' | 'ok' | 'error'; items: unknown[]; error: string };
-  // Keys: `<id>` databases, `<id>/<db>` schemas (pg) or tables, `<id>/<db>/<schema>` pg tables, then `…/<table>` columns.
-  // Open state reuses these keys with an `o:` prefix.
-  const nodes = $state<Record<string, Node>>({});
-  const loaders: Record<string, () => Promise<unknown[]>> = {};
-  const seq: Record<string, number> = {};
-
-  async function load(key: string, fn: () => Promise<unknown[]>) {
-    loaders[key] = fn;
-    const n = (seq[key] = (seq[key] ?? 0) + 1);
-    nodes[key] = { status: 'loading', items: nodes[key]?.items ?? [], error: '' };
-    try {
-      const items = await fn();
-      if (seq[key] === n) nodes[key] = { status: 'ok', items, error: '' };
-    } catch (e) {
-      if (seq[key] === n) nodes[key] = { status: 'error', items: [], error: ApiError.from(e).message };
-    }
-  }
-  const ensure = (key: string, fn: () => Promise<unknown[]>) => (nodes[key] ? Promise.resolve() : load(key, fn));
-  const strings = (key: string) => (nodes[key]?.items ?? []) as string[];
-  const tableList = (key: string) => (nodes[key]?.items ?? []) as TableInfo[];
-  const colList = (key: string) => (nodes[key]?.items ?? []) as ColumnInfo[];
+  const dbLoad = (c: Conn): Loaded<string[]> | undefined => databases(c.id);
+  const schemaLoad = (c: Conn, d: string): Loaded<string[]> | undefined => schemas(c.id, d);
+  const tableLoad = (c: Conn, d: string, s: string | null): Loaded<TableInfo[]> | undefined => tables(c.id, d, s);
+  const colLoad = (c: Conn, d: string, s: string | null, t: string) => catalog.columns[tableKey({ connId: c.id, database: d, schema: s, name: t })];
 
   // Tables, views and materialized views are separate folders; each shows PAGE rows, then Load more.
   const PAGE = 100;
@@ -247,112 +190,80 @@
   const shown = $state<Record<string, number>>({});
 
   // PG partitions stay out of the tree unless the user shows them. One choice for all connections, kept across restarts.
-  const PARTITIONS_KEY = 'sandb.tree.show-partitions';
-  let showPartitions = $state(localStorage.getItem(PARTITIONS_KEY) === '1');
-  function setShowPartitions(on: boolean) {
-    showPartitions = on;
-    localStorage.setItem(PARTITIONS_KEY, on ? '1' : '0');
-  }
+  const partitions = new Pref('sandb.tree.show-partitions', false, { version: 1, migrate: (v) => v === 1 || v === '1' || v === true });
+  const showPartitions = $derived(partitions.value);
+  const setShowPartitions = (on: boolean) => partitions.set(on);
   const visible = (list: TableInfo[]) => (showPartitions ? list : list.filter((t) => !t.partitionOf));
 
-  /** After a structure change: reloads the connection's databases and every loaded list below them.
-   *  The open state is untouched, so expanded nodes stay open. */
-  export function refreshStructure(c: Conn) {
-    refresh(c.id);
-  }
-
-  /** Whether the tree already lists this collection. A Mongo write into an unlisted name may create it. */
-  export function hasCollection(c: Conn, database: string, collection: string): boolean {
-    const key = `${c.id}/${database}`;
-    if (nodes[key]?.status !== 'ok') return false;
-    return tableList(key).some((t) => t.name === collection);
-  }
-
-  /** Reloads a node and every loaded node below it. */
-  function refresh(key: string) {
-    for (const k of Object.keys(nodes).sort((a, b) => a.length - b.length)) {
-      if ((k === key || k.startsWith(key + '/')) && loaders[k]) load(k, loaders[k]);
-    }
+  /** After a structure change the catalog reloads its lists; the tree's Refresh reloads what was loaded. */
+  function refresh(c: Conn) {
+    void reloadLists(c.id);
   }
 
   /** `auto`: on pg, also open `public` (or the first schema) once the schemas are in. */
   async function openDb(c: Conn, d: string, auto = false) {
     const k = `${c.id}/${d}`;
-    open['o:' + k] = true;
+    open[k] = true;
     if (c.engine !== 'pg') {
-      tableLists[k] = { connId: c.id, database: d, schema: null };
-      return ensure(k, () => api.listTables(c.id, d, null));
+      await loadTables(c.id, d, null);
+      return;
     }
-    await ensure(k, () => api.listSchemas(c.id, d));
-    const list = strings(k);
+    await loadSchemas(c.id, d);
+    const list = schemas(c.id, d)?.items ?? [];
     const s = list.includes('public') ? 'public' : list[0];
-    if (auto && s && open[`o:${k}/${s}`] === undefined) openSchema(c, d, s);
+    if (auto && s && open[`${k}/${s}`] === undefined) openSchema(c, d, s);
   }
 
   function openSchema(c: Conn, d: string, s: string) {
-    const k = `${c.id}/${d}/${s}`;
-    open['o:' + k] = true;
-    tableLists[k] = { connId: c.id, database: d, schema: s };
-    ensure(k, () => api.listTables(c.id, d, s));
+    open[`${c.id}/${d}/${s}`] = true;
+    void loadTables(c.id, d, s);
   }
 
-  function toggleCols(c: Conn, d: string, s: string | null, t: string, k: string) {
-    open['o:' + k] = !open['o:' + k];
-    if (open['o:' + k]) ensure(k, () => api.listColumns(c.id, d, s, t));
+  function toggleCols(c: Conn, d: string, s: string | null, t: string) {
+    const k = tableKey({ connId: c.id, database: d, schema: s, name: t });
+    open[k] = !open[k];
+    if (open[k]) void loadColumns(c.id, d, s, t);
   }
 
   // First expand loads the databases and opens the connection's own one (when it names one).
   function expandReal(c: Conn) {
     open[c.id] = true;
-    ensure(c.id, () => api.listDatabases(c.id));
-    const own = c.engine === 'sqlite' ? 'main' : c.database;
-    if (own && open[`o:${c.id}/${own}`] === undefined) openDb(c, own, true);
+    void loadDatabases(c.id);
+    const own = defaultDb(c);
+    if (own && open[`${c.id}/${own}`] === undefined) void openDb(c, own, true);
   }
 
-  // An edit that points a connection elsewhere makes its loaded tree stale.
-  const sigs: Record<string, string> = {};
+  // An edit that points a connection elsewhere makes everything loaded for it stale: the catalog
+  // forgets it and the tree opens it again from scratch.
+  const targets: Record<string, Conn> = {};
   $effect(() => {
     for (const c of db.connections) {
-      // In the mock, SQL connections browse the fixed prototype data; MongoDB goes through the API.
-      if (isMock && isSql(c)) continue;
-      const sig = [c.engine, c.host, c.port, c.database, c.user, c.file].join('|');
-      if (sigs[c.id] !== undefined && sigs[c.id] !== sig) untrack(() => forget(c));
-      sigs[c.id] = sig;
+      const now = $state.snapshot(c);
+      const prev = targets[c.id];
+      if (prev && (!sameTarget(prev, now) || prev.database !== now.database)) {
+        untrack(() => {
+          const wasOpen = open[c.id];
+          forgetCatalog(c);
+          for (const k of Object.keys(open)) if (k === c.id || k.startsWith(c.id + '/')) delete open[k];
+          for (const k of Object.keys(shown)) if (k.startsWith(c.id + '/')) delete shown[k];
+          if (wasOpen) expandReal(c);
+        });
+      }
+      targets[c.id] = now;
     }
   });
+</script>
 
-  function forget(c: Conn) {
-    const mine = (k: string) => k === c.id || k.startsWith(c.id + '/');
-    for (const k of Object.keys(nodes)) if (mine(k)) (delete nodes[k], delete loaders[k], seq[k]++);
-    for (const k of Object.keys(shown)) if (mine(k)) delete shown[k];
-    const wasOpen = open[c.id];
-    for (const k of Object.keys(open)) if (mine(k.replace(/^o:/, ''))) delete open[k];
-    if (wasOpen) expandReal(c);
-  }</script>
-
-{#snippet status(key: string, level: number, empty: boolean)}
-  {@const n = nodes[key]}
-  {#if n?.status === 'loading' && !n.items.length}
+{#snippet status(load: Loaded<unknown[]> | undefined, level: number, empty: boolean)}
+  {#if load?.status === 'loading' && !load.items.length}
     <div class="flex h-[26px] items-center gap-2 text-[12px] text-faint" style={pad(level, 20)}><LoaderCircle size={12} class="animate-spin" /> Loading…</div>
-  {:else if n?.status === 'error'}
+  {:else if load?.status === 'error'}
     <div class="flex h-[26px] items-center gap-1 pr-1 text-[12px] text-red-700 dark:text-red-400" style={pad(level, 20)} role="alert">
-      <span class="min-w-0 flex-1 truncate" title={n.error}>{n.error}</span>
-      <button class="grid size-5 shrink-0 place-items-center rounded hover:bg-hover" title="Retry" aria-label="Retry" onclick={() => refresh(key)}><RotateCw size={12} /></button>
+      <span class="min-w-0 flex-1 truncate" title={load.error}>{load.error}</span>
     </div>
-  {:else if n?.status === 'ok' && !n.items.length && empty}
+  {:else if load?.status === 'ok' && !load.items.length && empty}
     <div class="flex h-[26px] items-center text-[12px] text-faint" style={pad(level, 20)}>Empty</div>
   {/if}
-{/snippet}
-
-{#snippet refreshBtn(key: string, label: string)}
-  <button
-    class="absolute top-[3px] right-1 grid size-5 place-items-center rounded text-faint opacity-0 group-hover/n:opacity-100 focus-visible:opacity-100 hover:bg-hover hover:text-ink"
-    title="Refresh {label}"
-    aria-label="Refresh {label}"
-    onclick={() => refresh(key)}
-  >
-    <RotateCw size={12} class={nodes[key]?.status === 'loading' ? 'animate-spin' : ''} />
-  </button>
 {/snippet}
 
 {#snippet toggleBtn(level: number, isOpen: boolean, label: string, onclick: () => void)}
@@ -362,8 +273,8 @@
 {/snippet}
 
 {#snippet realTables(c: Conn, d: string, s: string | null, level: number, anc: number[])}
-  {@const pk0 = s === null ? `${c.id}/${d}` : `${c.id}/${d}/${s}`}
-  {@const all = tableList(pk0)}
+  {@const pk0 = listKey(c.id, d, s)}
+  {@const all = tableLoad(c, d, s)?.items ?? []}
   {@const parts = all.filter((t) => t.partitionOf).length}
   {@const shownList = visible(all)}
   <div class="relative" style="background:{guides(anc)}">
@@ -376,10 +287,10 @@
       {#if items.length || toggle}
         {@const gk = `${pk0}#${g.kind}`}
         <!-- The Tables folder starts open; the others start closed. -->
-        {@const gOpen = open['o:' + gk] ?? g.kind === 'table'}
+        {@const gOpen = open[gk] ?? g.kind === 'table'}
         {@const n = shown[gk] ?? PAGE}
         <div class="group/n relative">
-          <button class="nav-item {toggle ? 'pr-7' : ''}" style={pad(level)} aria-expanded={gOpen} title={toggle && !showPartitions ? `${parts} partitions hidden` : undefined} onclick={() => (open['o:' + gk] = !gOpen)}>
+          <button class="nav-item {toggle ? 'pr-7' : ''}" style={pad(level)} aria-expanded={gOpen} title={toggle && !showPartitions ? `${parts} partitions hidden` : undefined} onclick={() => (open[gk] = !gOpen)}>
             <ChevronRight size={12} class="shrink-0 text-faint transition-transform {gOpen ? 'rotate-90' : ''}" />
             <g.icon size={13} class="shrink-0 text-faint" />
             <span class="min-w-0 flex-1 truncate">{gLabel}</span>
@@ -399,7 +310,7 @@
           {/if}
         </div>
         {#if gOpen}
-          {@render tableItems(c, d, s, pk0, items.slice(0, n), level + 1)}
+          {@render tableItems(c, d, s, items.slice(0, n), level + 1)}
           {#if items.length > n}
             <div class="relative" style="background:{guides([level])}">
               <button class="nav-item text-faint hover:text-ink" style={pad(level + 1, 20)} onclick={() => (shown[gk] = n + PAGE)}>
@@ -423,11 +334,11 @@
   </div>
 {/snippet}
 
-{#snippet tableItems(c: Conn, d: string, s: string | null, pk0: string, items: TableInfo[], level: number)}
+{#snippet tableItems(c: Conn, d: string, s: string | null, items: TableInfo[], level: number)}
   <div class="relative" style="background:{guides([level - 1])}">
     {#each items as t (t.name)}
-      {@const tk = `${pk0}/${t.name}`}
-      {@const sel = hl === `${c.id}/${d}/${s ?? ''}/${t.name}`}
+      {@const tk = tableKey({ connId: c.id, database: d, schema: s, name: t.name })}
+      {@const sel = hl === tk}
       {@const ref = { database: d, schema: s, name: t.name, kind: t.kind }}
       {@const Icon = kindIcon[t.kind]}
       <div class="relative">
@@ -435,26 +346,27 @@
           class="nav-item select-none {sel ? 'nav-item-active' : ''}"
           style={pad(level, 20)}
           title="{s ? s + '.' : ''}{t.name}{t.kind === 'table' ? '' : ` (${kindLabel[t.kind]})`}{t.partitionOf ? ` · partition of ${t.partitionOf}` : ''}{t.rowEstimate != null && t.rowEstimate >= 0 ? ` · ~${t.rowEstimate} rows` : ''}"
-          onclick={(e) => tableClick(e, `${c.id}/${d}/${s ?? ''}/${t.name}`, c, ref)}
+          onclick={(e) => tableClick(e, tk, c, ref)}
           ondblclick={() => onopen(c, ref)}
-          onkeydown={(e) => tableKey(e, c, ref)}
-          oncontextmenu={(e) => openTableMenu(e, c, ref, pk0)}
+          onkeydown={(e) => tableKeydown(e, c, ref)}
+          oncontextmenu={(e) => openTableMenu(e, c, ref)}
         >
           <Icon size={13} class="shrink-0 {sel ? 'text-accent' : 'text-faint'}" />
           <span class="min-w-0 flex-1 truncate">{t.name}</span>
         </button>
-        {@render toggleBtn(level, !!open['o:' + tk], `Toggle columns of ${t.name}`, () => toggleCols(c, d, s, t.name, tk))}
+        {@render toggleBtn(level, !!open[tk], `Toggle columns of ${t.name}`, () => toggleCols(c, d, s, t.name))}
       </div>
-      {#if open['o:' + tk]}
+      {#if open[tk]}
         {@const mongo = !isSql(c)}
+        {@const cols = colLoad(c, d, s, t.name)}
         <div class="relative" style="background:{guides([level])}">
-          {@render status(tk, level + 1, !mongo)}
-          {#if mongo && nodes[tk]?.status === 'ok'}
-            {@const n = colList(tk)[0]?.sampleSize}
+          {@render status(cols, level + 1, !mongo)}
+          {#if mongo && cols?.status === 'ok'}
+            {@const n = cols.items[0]?.sampleSize}
             {@const label = n === undefined ? 'No documents' : `Fields from a sample of ${n} document${n === 1 ? '' : 's'}`}
             <div class="flex h-[24px] items-center pr-2 text-[12px] text-faint" style={pad(level + 1, 20)} title={label}><span class="min-w-0 truncate">{label}</span></div>
           {/if}
-          {#each colList(tk) as col (col.name)}
+          {#each cols?.items ?? [] as col (col.name)}
             {@const title = mongo && col.frequency !== undefined ? `${col.name} ${col.dataType} · ${Math.round(col.frequency * 100)}%` : `${col.name} ${col.dataType}${col.nullable ? '' : ' NOT NULL'}${col.default != null ? ` DEFAULT ${col.default}` : ''}`}
             <div class="flex h-[24px] items-center gap-2 pr-2 text-[12px] text-muted" style={pad(level + 1, 20)} {title}>
               {#if col.isPk}<KeyRound size={12} class="shrink-0 text-accent" />{:else}<Columns2 size={12} class="shrink-0 text-faint" />{/if}
@@ -462,35 +374,6 @@
               <span class="{mongo ? 'min-w-10' : 'min-w-0'} flex-1 truncate {col.isPk ? 'text-ink' : ''}">{col.name}</span>
               <span class="max-w-24 shrink-0 truncate font-mono text-[10.5px] text-faint">{col.dataType}</span>
               {#if mongo && col.frequency !== undefined}<span class="shrink-0 font-mono text-[10.5px] text-faint tabular-nums">{Math.round(col.frequency * 100)}%</span>{/if}
-            </div>
-          {/each}
-        </div>
-      {/if}
-    {/each}
-  </div>
-{/snippet}
-
-{#snippet tableRows(c: Conn, pk0: string, tables: string[], level: number, anc: number[])}
-  <div class="relative" style="background:{guides(anc)}">
-    {#each tables as t (t)}
-      {@const tk = `${pk0}/${t}`}
-      {@const sel = hl === `${c.id}/${nsOf(c.engine, t)}/${t}`}
-      {@const ref = { database: c.database, schema: c.engine === 'pg' ? nsOf(c.engine, t) : null, name: t, kind: 'table' as const }}
-      <div class="relative">
-        <button class="nav-item select-none {sel ? 'nav-item-active' : ''}" style={pad(level, 20)} title={c.engine === 'pg' ? `${nsOf(c.engine, t)}.${t}` : t} onclick={(e) => tableClick(e, `${c.id}/${nsOf(c.engine, t)}/${t}`, c, ref)} ondblclick={() => onopen(c, ref)} onkeydown={(e) => tableKey(e, c, ref)} oncontextmenu={(e) => openTableMenu(e, c, ref, null)}>
-          <Table2 size={13} class="shrink-0 {sel ? 'text-accent' : 'text-faint'}" />
-          <span class="min-w-0 flex-1 truncate">{t}</span>
-        </button>
-        {@render toggleBtn(level, !!open[tk], `Toggle columns of ${t}`, () => toggle(tk))}
-      </div>
-      {#if open[tk]}
-        <div class="relative" style="background:{guides([level])}">
-          {#each schemas[c.schema][t] as col (col)}
-            {@const pk = pkOf(t).includes(col)}
-            <div class="flex h-[24px] items-center gap-2 pr-2 text-[12px] text-muted" style={pad(level + 1, 20)}>
-              {#if pk}<KeyRound size={12} class="shrink-0 text-accent" />{:else}<Columns2 size={12} class="shrink-0 text-faint" />{/if}
-              <span class="min-w-0 flex-1 truncate {pk ? 'text-ink' : ''}">{col}</span>
-              <span class="shrink-0 font-mono text-[10.5px] text-faint">{colType(schemas[c.schema], t, col)}</span>
             </div>
           {/each}
         </div>
@@ -523,7 +406,6 @@
 {#each db.connections as c, i (c.id)}
   {@const isActive = c.id === active().id}
   {@const menuOn = menu?.c.id === c.id}
-  {@const sql = isSql(c)}
   <div class="group relative {drag?.on && drag.id === c.id ? 'opacity-50' : ''}" data-conn-row>
     {#if drag?.on && drag.to === i}<div class="pointer-events-none absolute inset-x-1 -top-px z-10 h-0.5 rounded-full bg-accent" aria-hidden="true"></div>{/if}
     <!-- detail > 1: the 2nd click of a double-click must not collapse the row again. -->
@@ -532,7 +414,7 @@
       style={pad(0)}
       title="{c.name} · {c.version} · Environment: {c.env}{canWrite(c) ? '' : ' · read-only'} · Drag or Alt+↑/↓ to reorder"
       aria-expanded={!!open[c.id]}
-      onclick={(e) => { if (e.detail > 1 || dragged) return; open[c.id] ? (open[c.id] = false) : expand(c); }}
+      onclick={(e) => { if (e.detail > 1 || dragged) { dragged = false; return; } open[c.id] ? (open[c.id] = false) : expandReal(c); }}
       oncontextmenu={(e) => openMenu(e, c)}
       onpointerdown={(e) => dragStart(e, c)}
       onkeydown={(e) => rowKey(e, c, i)}
@@ -556,77 +438,43 @@
       <Ellipsis size={13} />
     </button>
   </div>
-  {#if open[c.id] && (!isMock || !sql)}
+  {#if open[c.id]}
     <div class="relative" style="background:{rootGuide(c)}">
-      {@render status(c.id, 1, true)}
-      {#each strings(c.id) as d (d)}
+      {@render status(dbLoad(c), 1, true)}
+      {#each dbLoad(c)?.items ?? [] as d (d)}
         {@const dk = `${c.id}/${d}`}
-        {@const dn = nodes[dk]}
-        <div class="group/n relative">
-          <button class="nav-item pr-7" style={pad(1)} title={d} aria-expanded={!!open['o:' + dk]} onclick={() => (open['o:' + dk] ? (open['o:' + dk] = false) : openDb(c, d))}>
-            <ChevronRight size={12} class="shrink-0 text-faint transition-transform {open['o:' + dk] ? 'rotate-90' : ''}" />
-            <Database size={13} class="shrink-0 text-faint" />
-            <span class="min-w-0 flex-1 truncate {d === c.database ? 'text-ink' : ''}">{d}</span>
-            {#if dn?.status === 'ok'}<span class="text-[11px] text-faint tabular-nums group-hover/n:invisible">{dn.items.length}</span>{/if}
-          </button>
-          {@render refreshBtn(dk, d)}
-        </div>
-        {#if open['o:' + dk]}
+        {@const dn = schemaLoad(c, d)}
+        <button class="nav-item" style={pad(1)} title={d} aria-expanded={!!open[dk]} onclick={() => (open[dk] ? (open[dk] = false) : openDb(c, d))}>
+          <ChevronRight size={12} class="shrink-0 text-faint transition-transform {open[dk] ? 'rotate-90' : ''}" />
+          <Database size={13} class="shrink-0 text-faint" />
+          <span class="min-w-0 flex-1 truncate {d === c.database ? 'text-ink' : ''}">{d}</span>
+          {#if dn?.status === 'ok'}<span class="text-[11px] text-faint tabular-nums">{dn.items.length}</span>{/if}
+        </button>
+        {#if open[dk]}
           <div class="relative" style="background:{guides([1])}">
-            {@render status(dk, 2, true)}
             {#if c.engine === 'pg'}
-              {#each strings(dk) as s (s)}
+              {@render status(dn, 2, true)}
+              {#each dn?.items ?? [] as s (s)}
                 {@const sk = `${dk}/${s}`}
-                {@const sn = nodes[sk]}
-                <div class="group/n relative">
-                  <button class="nav-item pr-7" style={pad(2)} aria-expanded={!!open['o:' + sk]} onclick={() => (open['o:' + sk] ? (open['o:' + sk] = false) : openSchema(c, d, s))}>
-                    <ChevronRight size={12} class="shrink-0 text-faint transition-transform {open['o:' + sk] ? 'rotate-90' : ''}" />
-                    <Layers size={13} class="shrink-0 text-faint" />
-                    <span class="min-w-0 flex-1 truncate">{s}</span>
-                    {#if sn?.status === 'ok'}<span class="text-[11px] text-faint tabular-nums group-hover/n:invisible">{visible(sn.items as TableInfo[]).length}</span>{/if}
-                  </button>
-                  {@render refreshBtn(sk, s)}
-                </div>
-                {#if open['o:' + sk]}
-                  <div class="relative" style="background:{guides([2])}">{@render status(sk, 3, true)}</div>
+                {@const sn = tableLoad(c, d, s)}
+                <button class="nav-item" style={pad(2)} aria-expanded={!!open[sk]} onclick={() => (open[sk] ? (open[sk] = false) : openSchema(c, d, s))}>
+                  <ChevronRight size={12} class="shrink-0 text-faint transition-transform {open[sk] ? 'rotate-90' : ''}" />
+                  <Layers size={13} class="shrink-0 text-faint" />
+                  <span class="min-w-0 flex-1 truncate">{s}</span>
+                  {#if sn?.status === 'ok'}<span class="text-[11px] text-faint tabular-nums">{visible(sn.items).length}</span>{/if}
+                </button>
+                {#if open[sk]}
+                  <div class="relative" style="background:{guides([2])}">{@render status(sn, 3, true)}</div>
                   {@render realTables(c, d, s, 3, [2])}
                 {/if}
               {/each}
             {:else}
+              {@render status(tableLoad(c, d, null), 2, true)}
               {@render realTables(c, d, null, 2, [])}
             {/if}
           </div>
         {/if}
       {/each}
-    </div>
-  {:else if open[c.id]}
-    {@const dk = `${c.id}/db`}
-    {@const gs = groups(c)}
-    <div class="relative" style="background:{rootGuide(c)}">
-      <button class="nav-item" style={pad(1)} title={c.database} aria-expanded={!!open[dk]} onclick={() => toggle(dk)}>
-        <ChevronRight size={12} class="shrink-0 text-faint transition-transform {open[dk] ? 'rotate-90' : ''}" />
-        <Database size={13} class="shrink-0 text-faint" />
-        <span class="min-w-0 flex-1 truncate">{c.database}</span>
-        <span class="text-[11px] text-faint tabular-nums">{c.engine === 'pg' ? gs.length : Object.keys(schemas[c.schema]).length}</span>
-      </button>
-      {#if open[dk]}
-        <div class="relative" style="background:{guides([1])}">
-          {#if c.engine === 'pg'}
-            {#each gs as [ns, tables] (ns)}
-              {@const nk = `${dk}/${ns}`}
-              <button class="nav-item" style={pad(2)} aria-expanded={!!open[nk]} onclick={() => toggle(nk)}>
-                <ChevronRight size={12} class="shrink-0 text-faint transition-transform {open[nk] ? 'rotate-90' : ''}" />
-                <Layers size={13} class="shrink-0 text-faint" />
-                <span class="min-w-0 flex-1 truncate">{ns}</span>
-                <span class="text-[11px] text-faint tabular-nums">{tables.length}</span>
-              </button>
-              {#if open[nk]}{@render tableRows(c, nk, tables, 3, [2])}{/if}
-            {/each}
-          {:else}
-            {@render tableRows(c, dk, Object.keys(schemas[c.schema]), 2, [])}
-          {/if}
-        </div>
-      {/if}
     </div>
   {/if}
 {/each}
@@ -638,7 +486,7 @@
     <div class="truncate px-2 pt-1 pb-1 text-[11.5px] text-faint">{m.c.name}</div>
     <button class="nav-item" role="menuitem" onclick={() => act(onedit)}><Pencil size={13} /> Edit connection…</button>
     <button class="nav-item" role="menuitem" onclick={() => act(onduplicate)}><Copy size={13} /> Duplicate</button>
-    {#if !isMock || !isSql(m.c)}<button class="nav-item" role="menuitem" onclick={() => act((c) => refresh(c.id))}><RotateCw size={13} /> Refresh</button>{/if}
+    <button class="nav-item" role="menuitem" onclick={() => act((c) => refresh(c))}><RotateCw size={13} /> Refresh connection</button>
     <div class="mx-2 my-1 h-px bg-line"></div>
     <button class="nav-item text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300" role="menuitem" onclick={() => act(ondelete)}><Trash size={13} /> Delete…</button>
   </div>
@@ -648,6 +496,7 @@
   {@const m = tableMenu}
   {@const isView = m.t.kind !== 'table'}
   {@const noExport = canExport ? undefined : 'Needs the desktop app'}
+  {@const readOnly = !canWrite(m.c)}
   <!-- A MongoDB collection has its own menu: the script that creates it, and the document export. -->
   {@const mongo = !isSql(m.c)}
   <div class="popover fixed z-40 w-60 p-1" style="left:{m.x}px;top:{m.y}px" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
@@ -674,15 +523,10 @@
       <button class="nav-item" role="menuitem" disabled={!canExport} title={noExport} onclick={() => tableAct('exportSql')}><Download size={13} /> Export as SQL (DDL + data)...</button>
       <button class="nav-item" role="menuitem" disabled={!canExport} title={noExport} onclick={() => tableAct('exportCsv')}><Sheet size={13} /> Export as CSV...</button>
     {/if}
-    {#if m.list}
-      {@const list = m.list}
-      <div class="mx-2 my-1 h-px bg-line"></div>
-      <button class="nav-item" role="menuitem" onclick={() => { tableMenu = null; refresh(list); }}><RotateCw size={13} /> Refresh</button>
-    {/if}
+    <div class="mx-2 my-1 h-px bg-line"></div>
     {#if !mongo}
-      <div class="mx-2 my-1 h-px bg-line"></div>
-      <button class="nav-item text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300" role="menuitem" disabled={isView || m.c.readOnly} title={m.c.readOnly ? 'The connection is read-only' : undefined} onclick={() => tableAct('truncate')}><Eraser size={13} /> Truncate…</button>
-      <button class="nav-item text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300" role="menuitem" disabled={m.c.readOnly} title={m.c.readOnly ? 'The connection is read-only' : undefined} onclick={() => tableAct('drop')}><Trash size={13} /> Drop {kindLabel[m.t.kind]}…</button>
+      <button class="nav-item text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300" role="menuitem" disabled={isView || readOnly} title={readOnly ? 'The connection is read-only' : undefined} onclick={() => tableAct('truncate')}><Eraser size={13} /> Truncate…</button>
+      <button class="nav-item text-red-600 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300" role="menuitem" disabled={readOnly} title={readOnly ? 'The connection is read-only' : undefined} onclick={() => tableAct('drop')}><Trash size={13} /> Drop {kindLabel[m.t.kind]}…</button>
     {/if}
   </div>
 {/if}

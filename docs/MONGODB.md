@@ -104,7 +104,7 @@ Frontend:
 2. `ConnectionDialog.svelte`: engine option "MongoDB", a switch between "Fields" and "Connection string", the `authSource` field, the read-only note.
 3. `ConnectionTree.svelte`: a MongoDB icon.
 4. Hide or turn off every SQL-only action for Mongo connections until its phase is done.
-5. `src/lib/api/mock.ts`: one Mongo connection, so the UI works without a backend.
+5. `src/lib/api/mock/`: one Mongo connection, so the UI works without a backend.
 
 Tests:
 - Unit: connection string parse and the copy without the password; `reuse_secret` with a different host and with a different SRV host; field validation.
@@ -301,7 +301,7 @@ Tasks:
 1. Memory and size: measure again as in phase 0, with the full feature. Record the numbers in section 8.
 2. Atlas: test with a real Atlas cluster (`mongodb+srv://`, TLS). This test uses a real service, so the owner must give permission and a test cluster first.
 3. Network errors: the server stops during a run, during a save, and during a chat. The app shows an error and stays usable.
-4. Mock backend and bridge: every Mongo feature works in `mock.ts` and through the bridge, so QA can test in the browser.
+4. Mock backend and bridge: every Mongo feature works in the mock (`src/lib/api/mock/`) and through the bridge, so QA can test in the browser.
 5. Documents: `README.md` (Connections, editor and AI sections), `CHANGELOG.md`, the What's New dialog (`src/lib/changelog.ts`).
 6. Final review and QA on the final code.
 

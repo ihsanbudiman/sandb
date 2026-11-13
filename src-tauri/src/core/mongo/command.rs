@@ -3,14 +3,10 @@
 
 use mongodb::bson::{Bson, Document};
 
-/// One statement of the editor text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
-    /// The statement text as written, without the trailing `;`. Shown in the result header and
-    /// used for a source rerun ("Load more", sort).
+    /// The statement text as written, without the trailing `;`. Shown in the result header.
     pub text: String,
-    /// Byte offset of `text` in the full editor text.
-    pub start: usize,
     pub command: Command,
 }
 
@@ -60,7 +56,6 @@ pub struct Find {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Method {
-    // ---- reads
     Find(Find),
     FindOne {
         filter: Document,
@@ -81,7 +76,6 @@ pub enum Method {
     },
     GetIndexes,
     Stats,
-    // ---- writes
     InsertOne {
         document: Document,
     },
@@ -130,7 +124,6 @@ pub enum Method {
         operations: Vec<Document>,
         options: Option<Document>,
     },
-    // ---- schema changes
     CreateIndex {
         keys: Document,
         options: Option<Document>,

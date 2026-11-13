@@ -4,8 +4,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TIMEOUT="${TIMEOUT:-180}"
-SERVICES=(pg16 pg13 mysql mariadb mongo-rs mongo-standalone mock-llm)
 dc() { docker compose -p sandb-test -f compose.yaml --env-file .env.test "$@"; }
+
+# The service list is compose.yaml's own, so a new service is waited for without an edit here.
+SERVICES=()
+while IFS= read -r s; do
+  [ -n "$s" ] && SERVICES+=("$s")
+done < <(dc config --services)
 
 start=$(date +%s)
 while true; do

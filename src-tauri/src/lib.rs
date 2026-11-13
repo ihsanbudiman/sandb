@@ -1,13 +1,16 @@
 pub mod commands;
 pub mod core;
 
+#[cfg(test)]
+mod wire;
+
 use std::path::PathBuf;
 
 use tauri::menu::{Menu, MenuItem, MenuItemKind, WINDOW_SUBMENU_ID};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
 
-use crate::core::ai::settings::AI_KEY_ACCOUNT;
+use crate::core::ai::session as chat;
 use crate::core::secrets::{self, KeychainStore, VaultStore};
 use crate::core::state::AppState;
 
@@ -16,10 +19,8 @@ const CLOSE_TAB_ID: &str = "sandb-close-tab";
 const CLOSE_WINDOW_ID: &str = "sandb-close-window";
 
 fn has_pending<R: Runtime, M: Manager<R>>(m: &M) -> bool {
-    m.try_state::<AppState>().is_some_and(|s| {
-        !s.sessions.pending_tab_ids().is_empty()
-            || s.unsaved_edits.load(std::sync::atomic::Ordering::Relaxed)
-    })
+    m.try_state::<AppState>()
+        .is_some_and(|s| s.has_pending_work())
 }
 
 /// The default menu's Quit is the native `terminate:` action, which exits without a close request
@@ -99,18 +100,11 @@ pub fn run() {
                 );
             }
             let state = AppState::new(dir, Box::new(vault))?;
-            let mut accounts: Vec<String> = state
-                .connections
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .map(|c| secrets::password_account(&c.id))
-                .collect();
-            accounts.push(AI_KEY_ACCOUNT.to_string());
+            let accounts = state.secret_accounts();
             // Not fatal either: the old entries stay and the next start tries again.
             if let Err(e) = secrets::migrate_keychain_entries(
                 &KeychainStore::new(service),
-                state.secrets.as_ref(),
+                state.secrets(),
                 &accounts,
             ) {
                 eprintln!(
@@ -139,7 +133,7 @@ pub fn run() {
                 && webview.label() == "main"
                 && let Some(state) = webview.try_state::<AppState>()
             {
-                state.chats.cancel_all();
+                chat::cancel_all(&state);
             }
         })
         .on_menu_event(|app, event| {
@@ -157,51 +151,7 @@ pub fn run() {
                 let _ = w.close();
             }
         })
-        .invoke_handler(tauri::generate_handler![
-            commands::list_connections,
-            commands::create_connection,
-            commands::update_connection,
-            commands::duplicate_connection,
-            commands::delete_connection,
-            commands::reorder_connections,
-            commands::test_connection,
-            commands::list_databases,
-            commands::list_schemas,
-            commands::list_tables,
-            commands::list_columns,
-            commands::table_properties,
-            commands::schema_snapshot,
-            commands::table_ddl,
-            commands::export_table_sql,
-            commands::run_query,
-            commands::editable_result,
-            commands::apply_edits,
-            commands::cell_value,
-            commands::cancel_query,
-            commands::query_progress,
-            commands::commit_transaction,
-            commands::rollback_transaction,
-            commands::tab_status,
-            commands::close_tab_session,
-            commands::quit_app,
-            commands::set_unsaved_edits,
-            commands::export_csv,
-            commands::export_result_sql,
-            commands::export_documents,
-            commands::save_pdf,
-            commands::guard_check,
-            commands::classify_write,
-            commands::run_ai_read,
-            commands::get_ai_settings,
-            commands::save_ai_settings,
-            commands::set_ai_key,
-            commands::test_ai,
-            commands::list_ai_models,
-            commands::chat_send,
-            commands::chat_cancel,
-            commands::approve_write,
-            commands::deny_write,
-        ])
+        .invoke_handler(commands::handler())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

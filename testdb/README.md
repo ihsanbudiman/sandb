@@ -2,17 +2,22 @@
 
 Throwaway databases and a mock LLM for sandb tests. Compose project: `sandb-test`.
 
-| Service  | Image          | Host port (127.0.0.1) | Databases |
-|----------|----------------|-----------------------|-----------|
-| pg16     | postgres:16    | 55416 | `shop`, `shop_staging` (schemas `public`, `analytics`) |
-| pg13     | postgres:13    | 55413 | same as pg16 |
-| mysql    | mysql:8.4      | 53384 | `shop`, `analytics` |
-| mariadb  | mariadb:11     | 53311 | `shop`, `analytics` |
-| mongo-rs | mongo:8        | 57017 | `shop_staging`, `analytics` (one-node replica set `rs0`, transactions work) |
-| mongo-standalone | mongo:8 | 57018 | same as mongo-rs (standalone, no transactions) |
-| mock-llm | node:22-alpine | 58080 | OpenAI-compatible API at `/v1` |
+The host ports are keys in `.env.test` (bound to 127.0.0.1); compose, the scripts and the
+integration tests read that one file, so a port changes in one place.
 
-SQLite fixtures: `sqlite/shop.db` and `sqlite/empty.db` (built by `pnpm db:sqlite`, ignored by git).
+| Service  | Image          | Host port key  | Databases |
+|----------|----------------|----------------|-----------|
+| pg16     | postgres:16    | `PG16_PORT`     | `shop`, `shop_staging` (schemas `public`, `analytics`) |
+| pg13     | postgres:13    | `PG13_PORT`     | same as pg16 |
+| mysql    | mysql:8.4      | `MYSQL_PORT`    | `shop`, `analytics` |
+| mariadb  | mariadb:11     | `MARIADB_PORT`  | `shop`, `analytics` |
+| mongo-rs | mongo:8        | `MONGO_RS_PORT` | `shop_staging`, `analytics` (one-node replica set `rs0`, transactions work) |
+| mongo-standalone | mongo:8 | `MONGO_STANDALONE_PORT` | same as mongo-rs (standalone, no transactions) |
+| mock-llm | node:22-alpine | `MOCK_LLM_PORT` | OpenAI-compatible API at `/v1` |
+
+The integration tests read the same keys through `src-tauri/tests/common/mod.rs`.
+
+SQLite fixture: `sqlite/shop.db` (built by `pnpm db:sqlite`, ignored by git).
 
 ## Credentials (local test-only, see `.env.test`)
 
@@ -24,10 +29,12 @@ SQLite fixtures: `sqlite/shop.db` and `sqlite/empty.db` (built by `pnpm db:sqlit
 
 ## Commands (from `sandb/`)
 
+- `pnpm test`: svelte-check plus the Rust unit tests.
+- `pnpm test:it`: every integration suite against this stack (run `pnpm db:up` first).
 - `pnpm db:up`: start all services and wait until healthy (fails after 180 s and names the service).
 - `pnpm db:down`: stop and remove the stack. Data is on tmpfs, so nothing is left.
 - `pnpm db:reset`: down, then up with fresh seed data.
-- `pnpm db:sqlite`: rebuild the SQLite fixtures.
+- `pnpm db:sqlite`: rebuild the SQLite fixture.
 - `pnpm mock-llm`: run the mock LLM locally on 58080 without Docker (stop the container first).
 
 ## Mock LLM scenarios
@@ -37,7 +44,7 @@ The keyword in the last user message picks the reply: `list`, `describe`, `count
 MongoDB scenarios (seed database `shop_staging`): `mongo read` (`run_mongo_read`, five paid orders), `mongo chart` (`render_mongo_chart`,
 orders and revenue by status), `mongo write` (`propose_mongo_write`, `insertOne` into a scratch collection), `mongo out`
 (`run_mongo_read` with an `$out` stage into a scratch collection, which the guard must refuse). The scratch collection is the
-first `ai_it_*` name in the message (default `ai_it_mock`).
+first `it_*` name in the message (default `it_mock`).
 If the last message has role `tool`, the reply is text that quotes the first 200 characters of the tool result.
 `mixed` is multi-step: `run_read_query` on source `db1` (`SELECT count(*) AS orders FROM orders`), after that tool result
 `run_mongo_read` on source `db2` (`db.orders.countDocuments({})`), then text that quotes the first 200 characters of each tool result.

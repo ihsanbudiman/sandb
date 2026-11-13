@@ -8,7 +8,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -32,12 +32,38 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Anthropic requires `max_tokens`; this leaves room for a long report.
 const ANTHROPIC_MAX_TOKENS: u32 = 8192;
 
-/// The wire format of the AI server.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Api {
+/// The wire format of the AI server; the `provider` value in the settings JSON.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
     #[default]
     OpenAi,
     Anthropic,
+}
+
+impl<'de> Deserialize<'de> for Provider {
+    /// Settings files saved before this was an enum hold `ollama`, `custom` and other labels;
+    /// every label but `anthropic` means an OpenAI-compatible server.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let label = String::deserialize(deserializer)?;
+        Ok(if label.trim() == "anthropic" {
+            Self::Anthropic
+        } else {
+            Self::OpenAi
+        })
+    }
+}
+
+impl Provider {
+    /// Model-id suffixes this provider may add to a name the user wrote. Ollama lists `llama3`
+    /// as `llama3:latest` and accepts either name; Anthropic lists exact ids.
+    pub fn model_suffixes(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenAi => &[":latest"],
+            Self::Anthropic => &[],
+        }
+    }
 }
 
 /// One tool call of a model answer. `arguments` is the raw JSON text the model sent.
@@ -48,7 +74,6 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
-/// A whole streamed answer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Completion {
     pub text: String,
@@ -59,7 +84,6 @@ pub struct Completion {
 /// What `chat_stream` reports while the answer streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamEvent<'a> {
-    /// A text delta.
     Text(&'a str),
     /// The name of a tool call, once per call, before its arguments finish streaming.
     ToolStarting(&'a str),
@@ -67,7 +91,7 @@ pub enum StreamEvent<'a> {
 
 pub struct AiClient {
     http: reqwest::Client,
-    api: Api,
+    provider: Provider,
     base: String,
     key: Option<String>,
     idle: Duration,
@@ -76,7 +100,7 @@ pub struct AiClient {
 impl AiClient {
     /// `base_url`: the API root without a trailing `/`. `key`: sent as a bearer token
     /// (OpenAI) or as `x-api-key` (Anthropic) when present.
-    pub fn new(api: Api, base_url: &str, key: Option<String>) -> Result<Self, AppError> {
+    pub fn new(provider: Provider, base_url: &str, key: Option<String>) -> Result<Self, AppError> {
         // reqwest is built without a bundled crypto provider; use ring, as sqlx and the updater
         // do. An error only means a provider is already installed.
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -88,14 +112,14 @@ impl AiClient {
             })?;
         Ok(Self {
             http,
-            api,
+            provider,
             base: base_url.trim_end_matches('/').to_string(),
             key: key.filter(|k| !k.is_empty()),
             idle: DEFAULT_IDLE_TIMEOUT,
         })
     }
 
-    /// Replaces the wait limit for the response headers and for each stream chunk.
+    #[cfg(test)]
     pub fn with_idle_timeout(mut self, idle: Duration) -> Self {
         self.idle = idle;
         self
@@ -113,9 +137,9 @@ impl AiClient {
         }
         let work = async {
             // Anthropic pages the list at 20 by default.
-            let url = match self.api {
-                Api::OpenAi => format!("{}/models", self.base),
-                Api::Anthropic => format!("{}/models?limit=1000", self.base),
+            let url = match self.provider {
+                Provider::OpenAi => format!("{}/models", self.base),
+                Provider::Anthropic => format!("{}/models?limit=1000", self.base),
             };
             let req = self.auth(self.http.get(url));
             let resp = req.send().await.map_err(|e| self.send_error(e))?;
@@ -157,9 +181,9 @@ impl AiClient {
         cancel: &CancellationToken,
         mut on_event: impl FnMut(StreamEvent<'_>) -> bool,
     ) -> Result<Completion, AppError> {
-        let (path, body) = match self.api {
-            Api::OpenAi => ("chat/completions", serde_json::to_vec(body)?),
-            Api::Anthropic => ("messages", serde_json::to_vec(&anthropic_body(body))?),
+        let (path, body) = match self.provider {
+            Provider::OpenAi => ("chat/completions", serde_json::to_vec(body)?),
+            Provider::Anthropic => ("messages", serde_json::to_vec(&anthropic_body(body))?),
         };
         let req = self
             .auth(self.http.post(format!("{}/{path}", self.base)))
@@ -172,19 +196,19 @@ impl AiClient {
         };
         let resp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(cancelled()),
+            _ = cancel.cancelled() => return Err(AppError::stopped()),
             r = tokio::time::timeout(self.idle, send) => r.map_err(|_| timeout_error(self.idle))??,
         };
         let mut stream = resp.bytes_stream();
         let mut lines = LineBuffer::default();
         let mut acc = Accumulator {
-            api: self.api,
+            provider: self.provider,
             ..Default::default()
         };
         loop {
             let next = tokio::select! {
                 biased;
-                _ = cancel.cancelled() => return Err(cancelled()),
+                _ = cancel.cancelled() => return Err(AppError::stopped()),
                 n = tokio::time::timeout(self.idle, stream.next()) => n,
             };
             let chunk = match next {
@@ -221,13 +245,13 @@ impl AiClient {
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match (self.api, &self.key) {
-            (Api::OpenAi, Some(k)) => req.header(AUTHORIZATION, format!("Bearer {k}")),
-            (Api::OpenAi, None) => req,
-            (Api::Anthropic, Some(k)) => req
+        match (self.provider, &self.key) {
+            (Provider::OpenAi, Some(k)) => req.header(AUTHORIZATION, format!("Bearer {k}")),
+            (Provider::OpenAi, None) => req,
+            (Provider::Anthropic, Some(k)) => req
                 .header("x-api-key", k)
                 .header("anthropic-version", ANTHROPIC_VERSION),
-            (Api::Anthropic, None) => req.header("anthropic-version", ANTHROPIC_VERSION),
+            (Provider::Anthropic, None) => req.header("anthropic-version", ANTHROPIC_VERSION),
         }
     }
 
@@ -256,9 +280,19 @@ impl AiClient {
                 "The AI server refused the API key",
             ));
         }
-        let body = tokio::time::timeout(self.idle.min(MODELS_TIMEOUT), read_capped(resp))
-            .await
-            .unwrap_or_default();
+        let body =
+            match tokio::time::timeout(self.idle.min(MODELS_TIMEOUT), read_capped(resp)).await {
+                Ok(body) => body,
+                // The server refused the request but did not send its explanation in time; saying
+                // so is different from a server that sent no body at all.
+                Err(_) => {
+                    return Err(AppError::new(
+                        ErrorCode::AiUpstream,
+                        format!("The AI server answered HTTP {}", status.as_u16()),
+                    )
+                    .with_detail("The error details did not arrive in time"));
+                }
+            };
         let err = AppError::new(
             ErrorCode::AiUpstream,
             format!("The AI server answered HTTP {}", status.as_u16()),
@@ -288,7 +322,6 @@ impl AiClient {
     }
 }
 
-/// The start of an error body, at most `ERROR_BODY_BYTES`.
 async fn read_capped(resp: reqwest::Response) -> String {
     let mut out = Vec::new();
     let mut stream = resp.bytes_stream();
@@ -302,10 +335,6 @@ async fn read_capped(resp: reqwest::Response) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn cancelled() -> AppError {
-    AppError::new(ErrorCode::Cancelled, "Stopped")
-}
-
 fn timeout_error(limit: Duration) -> AppError {
     AppError::new(
         ErrorCode::Timeout,
@@ -316,7 +345,6 @@ fn timeout_error(limit: Duration) -> AppError {
     )
 }
 
-/// The error and its sources, joined with `: `.
 fn chain(e: &dyn std::error::Error) -> String {
     let mut out = e.to_string();
     let mut src = e.source();
@@ -371,10 +399,9 @@ fn utf8(line: &[u8]) -> Result<String, AppError> {
         .map_err(|e| protocol("The AI server sent a malformed stream", e.to_string()))
 }
 
-/// Builds the answer from SSE lines.
 #[derive(Default)]
 struct Accumulator {
-    api: Api,
+    provider: Provider,
     out: Completion,
     /// Anthropic: (content block index, tool call position) of each `tool_use` block.
     tool_blocks: Vec<(u64, usize)>,
@@ -414,7 +441,7 @@ impl Accumulator {
             )
             .with_detail(msg));
         }
-        if self.api == Api::Anthropic {
+        if self.provider == Provider::Anthropic {
             return self.anthropic_event(&v, on_event);
         }
         let Some(choice) = v
@@ -431,7 +458,7 @@ impl Accumulator {
         {
             self.out.text.push_str(text);
             if !on_event(StreamEvent::Text(text)) {
-                return Err(cancelled());
+                return Err(AppError::stopped());
             }
         }
         if let Some(calls) = delta
@@ -522,7 +549,7 @@ impl Accumulator {
         }
         self.announced[pos] = true;
         if !on_event(StreamEvent::ToolStarting(name)) {
-            return Err(cancelled());
+            return Err(AppError::stopped());
         }
         Ok(())
     }
@@ -603,7 +630,7 @@ impl Accumulator {
         if let Some(text) = text.filter(|t| !t.is_empty()) {
             self.out.text.push_str(text);
             if !on_event(StreamEvent::Text(text)) {
-                return Err(cancelled());
+                return Err(AppError::stopped());
             }
         }
         Ok(false)
@@ -626,7 +653,7 @@ impl Accumulator {
                 call.id = format!("call_{i}");
             }
             // Anthropic streams no input JSON for a tool without arguments.
-            if self.api == Api::Anthropic && call.arguments.trim().is_empty() {
+            if self.provider == Provider::Anthropic && call.arguments.trim().is_empty() {
                 call.arguments = "{}".into();
             }
         }
@@ -714,97 +741,14 @@ fn anthropic_body(body: &Value) -> Value {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::core::ai::test_support::{
+        Part, done, finish_chunk, head, serve, serve_raw, sse, text_chunk,
+    };
     use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
-
-    /// One part of a scripted response: wait `ms`, then write `bytes`.
-    pub(crate) type Part = (u64, String);
-
-    /// A tiny HTTP server on a free port. Every connection gets `script`, then the socket
-    /// closes. The handle yields the raw requests received.
-    pub(crate) async fn serve(
-        script: Vec<Part>,
-    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = listener.accept().await {
-                let script = script.clone();
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let req = read_request(&mut sock).await;
-                    let _ = tx.send(req);
-                    for (ms, bytes) in script {
-                        if ms > 0 {
-                            tokio::time::sleep(Duration::from_millis(ms)).await;
-                        }
-                        if sock.write_all(bytes.as_bytes()).await.is_err() {
-                            return;
-                        }
-                        let _ = sock.flush().await;
-                    }
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
-        (format!("http://{addr}/v1"), rx)
-    }
-
-    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 4096];
-        loop {
-            let n = sock.read(&mut tmp).await.unwrap_or(0);
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            let text = String::from_utf8_lossy(&buf);
-            if let Some(end) = text.find("\r\n\r\n") {
-                let len = text[..end]
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    })
-                    .unwrap_or(0);
-                if buf.len() >= end + 4 + len {
-                    break;
-                }
-            }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    }
-
-    pub(crate) fn head(status: &str, content_type: &str) -> Part {
-        (
-            0,
-            format!(
-                "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\nconnection: close\r\n\r\n"
-            ),
-        )
-    }
-
-    pub(crate) fn sse(v: Value) -> Part {
-        (0, format!("data: {v}\n\n"))
-    }
-
-    pub(crate) fn text_chunk(s: &str) -> Part {
-        sse(json!({"choices": [{"index": 0, "delta": {"content": s}, "finish_reason": null}]}))
-    }
-
-    pub(crate) fn finish_chunk(reason: &str) -> Part {
-        sse(json!({"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}))
-    }
-
-    pub(crate) fn done() -> Part {
-        (0, "data: [DONE]\n\n".into())
-    }
 
     fn body() -> Value {
         json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "hi"}]})
@@ -819,7 +763,7 @@ pub(crate) mod tests {
     }
 
     async fn run(base: &str, key: Option<&str>) -> (Result<Completion, AppError>, Vec<String>) {
-        let client = AiClient::new(Api::OpenAi, base, key.map(String::from))
+        let client = AiClient::new(Provider::OpenAi, base, key.map(String::from))
             .unwrap()
             .with_idle_timeout(Duration::from_millis(500));
         let mut events = Vec::new();
@@ -896,7 +840,7 @@ pub(crate) mod tests {
             ev(json!({"type": "message_stop"})),
         ];
         let (base, mut reqs) = serve(script).await;
-        let client = AiClient::new(Api::Anthropic, &base, Some("sk-ant".into())).unwrap();
+        let client = AiClient::new(Provider::Anthropic, &base, Some("sk-ant".into())).unwrap();
         // A second step: the earlier tool call and its result must reach Anthropic as blocks.
         let body = json!({
             "model": "claude", "stream": true, "tool_choice": "auto",
@@ -1037,8 +981,8 @@ pub(crate) mod tests {
                 format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()),
             )
         };
-        let rest = |api: Api| match api {
-            Api::OpenAi => vec![
+        let rest = |api: Provider| match api {
+            Provider::OpenAi => vec![
                 sse(json!({"choices": [{"index": 0, "delta": {"tool_calls": [
                     {"index": 0, "id": "call_a", "type": "function", "function": {"name": "run_read_query", "arguments": ""}}
                 ]}}]})),
@@ -1047,7 +991,7 @@ pub(crate) mod tests {
                 ]}}]})),
                 (3_000, done().1),
             ],
-            Api::Anthropic => vec![
+            Provider::Anthropic => vec![
                 anthropic(
                     json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "run_read_query", "input": {}}}),
                 ),
@@ -1057,7 +1001,7 @@ pub(crate) mod tests {
                 (3_000, anthropic(json!({"type": "message_stop"})).1),
             ],
         };
-        for api in [Api::OpenAi, Api::Anthropic] {
+        for api in [Provider::OpenAi, Provider::Anthropic] {
             let mut script = vec![head("200 OK", "text/event-stream")];
             script.extend(rest(api));
             let (base, _r) = serve(script).await;
@@ -1259,7 +1203,7 @@ pub(crate) mod tests {
             (3_000, done().1),
         ];
         let (base, _r) = serve(script).await;
-        let client = AiClient::new(Api::OpenAi, &base, None).unwrap();
+        let client = AiClient::new(Provider::OpenAi, &base, None).unwrap();
         let token = CancellationToken::new();
         let t = token.clone();
         let started = std::time::Instant::now();
@@ -1283,7 +1227,7 @@ pub(crate) mod tests {
             done(),
         ];
         let (base, _r) = serve(script).await;
-        let client = AiClient::new(Api::OpenAi, &base, None).unwrap();
+        let client = AiClient::new(Provider::OpenAi, &base, None).unwrap();
         let mut n = 0;
         let e = client
             .chat_stream(&body(), &CancellationToken::new(), |_| {
@@ -1321,7 +1265,7 @@ pub(crate) mod tests {
                 let _ = sock.shutdown().await;
             }
         });
-        let client = AiClient::new(Api::OpenAi, &format!("https://{addr}/v1"), None).unwrap();
+        let client = AiClient::new(Provider::OpenAi, &format!("https://{addr}/v1"), None).unwrap();
         let e = client.list_models().await.unwrap_err();
         assert_eq!(e.code, ErrorCode::ConnectFailed, "{e:?}");
     }
@@ -1336,8 +1280,9 @@ pub(crate) mod tests {
                     .to_string(),
             ),
         ];
-        let (base, mut reqs) = serve(script).await;
-        let client = AiClient::new(Api::OpenAi, &format!("{base}/"), Some("k1".into())).unwrap();
+        let (base, mut reqs) = serve_raw(script).await;
+        let client =
+            AiClient::new(Provider::OpenAi, &format!("{base}/"), Some("k1".into())).unwrap();
         assert_eq!(client.list_models().await.unwrap(), vec!["a", "b"]);
         let req = reqs.recv().await.unwrap();
         assert!(req.starts_with("GET /v1/models "), "{req}");
@@ -1347,8 +1292,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn bad_model_list_is_ai_protocol() {
         let script = vec![head("200 OK", "application/json"), (0, "[1, 2]".into())];
-        let (base, _r) = serve(script).await;
-        let e = AiClient::new(Api::OpenAi, &base, None)
+        let (base, _r) = serve_raw(script).await;
+        let e = AiClient::new(Provider::OpenAi, &base, None)
             .unwrap()
             .list_models()
             .await
@@ -1366,7 +1311,7 @@ pub(crate) mod tests {
             head("200 OK", "application/json"),
             (0, json!({"data": [{"id": "mock-gpt"}]}).to_string()),
         ];
-        let (base, mut reqs) = serve(script).await;
+        let (base, mut reqs) = serve_raw(script).await;
         let dir = tempfile::tempdir().unwrap();
         let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
         settings::set_key(&st, Some("stored-key".into())).unwrap();

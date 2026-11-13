@@ -1,17 +1,14 @@
-import type { BytesValue, QueryRun, SchemaSnapshot, SnapshotTable, StatementResult } from './api';
-import type { Cell, Engine, QueryResult, Schema } from './mock';
+import type { BytesValue, Cell, QueryResult, QueryRun, Schema, SchemaSnapshot, StatementResult } from './api';
+import { MAX_LIMIT, PREVIEW_BYTES } from './api/generated/constants';
+import { tableLabel } from './tableId';
 
 export const isBytes = (v: unknown): v is BytesValue => !!v && typeof v === 'object' && '$bytes' in v && 'len' in v;
-
-/** Longest text cell the backend sends (`PREVIEW_BYTES` in `core/db/value.rs`); longer text is cut and ends with `…`. */
-const PREVIEW_BYTES = 4096;
 
 /** A text cell the backend cut at the preview limit. The cut backs off at most 3 bytes to a character start and `…` adds 3, so a cut cell has at least `PREVIEW_BYTES` UTF-8 bytes. */
 export function isCutOff(v: unknown): v is string {
   return typeof v === 'string' && v.endsWith('…') && new TextEncoder().encode(v).length >= PREVIEW_BYTES;
 }
 
-/** Short text for a JSON or bytes cell. */
 export function formatCell(v: object): string {
   if (isBytes(v)) {
     const head = atob(v.$bytes.slice(0, 12)).slice(0, 8);
@@ -24,14 +21,12 @@ export function formatCell(v: object): string {
 
 // ---- MongoDB: the `documents` of a result arrive as relaxed Extended JSON ----
 
-/** The one `$…` key of a relaxed EJSON wrapper (`{"$oid": …}`), or undefined for a plain object or array. */
 export function ejsonWrapper(v: unknown): [string, unknown] | undefined {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return undefined;
   const keys = Object.keys(v);
   return keys.length === 1 && keys[0].startsWith('$') ? [keys[0], (v as Record<string, unknown>)[keys[0]]] : undefined;
 }
 
-/** ISO text of a relaxed EJSON date: an ISO string, or the canonical `{"$numberLong": millis}`. */
 function ejsonDate(x: unknown): string {
   if (typeof x === 'string') return x;
   const ms = Number((x as Record<string, unknown> | undefined)?.$numberLong);
@@ -85,7 +80,7 @@ export function ejsonText(v: unknown): string {
 }
 
 /** The value as plain JSON for copying: wrappers become their values (ObjectId → its string, …); binary, timestamps and min/max keys have no plain form and stay as they are. */
-export function ejsonPlain(v: unknown): unknown {
+function ejsonPlain(v: unknown): unknown {
   if (v === null || typeof v !== 'object') return v;
   if (Array.isArray(v)) return v.map(ejsonPlain);
   const wrap = ejsonWrapper(v);
@@ -107,24 +102,17 @@ export function copyValue(v: unknown): string {
   return typeof v === 'string' ? v : JSON.stringify(ejsonPlain(v), null, 2);
 }
 
-/** CSV text of a cell: NULL is empty, bytes are base64 (the loaded preview), JSON is JSON. */
+/** One cell as text: empty for null, the byte text for binary, JSON for other objects. */
+export const cellText = (v: Cell): string => (v == null ? '' : typeof v === 'object' ? (isBytes(v) ? v.$bytes : JSON.stringify(v)) : String(v));
+
 export function csvCell(v: Cell): string {
-  const s = v == null ? '' : typeof v === 'object' ? (isBytes(v) ? v.$bytes : JSON.stringify(v)) : String(v);
+  const s = cellText(v);
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-/** Always quoted: names from the tree may be reserved words, mixed case or contain any character. */
-export function quoteIdent(engine: Engine, name: string): string {
-  return engine === 'mysql' ? '`' + name.replace(/`/g, '``') + '`' : '"' + name.replace(/"/g, '""') + '"';
-}
-
-/** Palette and autocomplete name of a snapshot table: PG tables outside `public` are `schema.table`. */
-export const snapshotKey = (t: SnapshotTable, engine: Engine) => (engine === 'pg' && t.schema && t.schema !== 'public' ? `${t.schema}.${t.name}` : t.name);
-
-/** Table → columns for autocomplete and the palette, keyed by `snapshotKey`. */
-export function snapshotSchema(s: SchemaSnapshot | null, engine: Engine): Schema {
+export function snapshotSchema(s: SchemaSnapshot | null): Schema {
   const out: Schema = {};
-  for (const t of s?.tables ?? []) out[snapshotKey(t, engine)] = t.columns.map((c) => c.name);
+  for (const t of s?.tables ?? []) out[tableLabel(t)] = t.columns.map((c) => c.name);
   return out;
 }
 
@@ -146,8 +134,7 @@ function uniqueNames(names: string[]) {
   });
 }
 
-/** One grid result for a statement that returned columns. */
-function rowResult(s: StatementResult, mock: boolean, limit: number, database: string): QueryResult {
+function rowResult(s: StatementResult, database: string): QueryResult {
   const columns = uniqueNames(s.columns.map((c) => c.name));
   const rows = s.rows.map((r) => Object.fromEntries(columns.map((c, i) => [c, r[i] as Cell])));
   return {
@@ -155,22 +142,17 @@ function rowResult(s: StatementResult, mock: boolean, limit: number, database: s
     types: s.columns.map((c) => c.dataType),
     rows,
     truncated: s.truncated,
-    limit,
+    limit: s.limit,
     isRead: s.isRead,
     sortable: s.isRead && s.sortable,
-    table: s.table,
     sql: s.sql,
     ms: s.elapsedMs,
     // A Mongo `use` earlier in the run moves the statement to another database; edits and re-runs go there.
     database: s.database ?? database,
-    live: !mock,
     documents: s.documents,
     cellTypes: s.cellTypes,
   };
 }
-
-/** Largest row limit of a run, as `MAX_LIMIT` in `core/db/query.rs`. */
-const MAX_LIMIT = 100_000;
 
 /**
  * Whether Load more can bring more rows. It runs the statement again with twice the row limit, so it helps only when
@@ -184,13 +166,13 @@ export function moreRows(r: QueryResult) {
  * The result tabs of a run: one per statement that returned columns, plus one Messages tab for
  * statements that changed rows or returned none. The active tab is the last grid result.
  */
-export function toResults(run: QueryRun, mock: boolean, limit: number, database: string): { results: QueryResult[]; active: number } {
+export function toResults(run: QueryRun, database: string): { results: QueryResult[]; active: number } {
   const results: QueryResult[] = [];
   const messages: string[] = [];
   let lastRow = -1;
   for (const [i, s] of run.statements.entries()) {
     if (s.columns.length) {
-      results.push(rowResult(s, mock, limit, database));
+      results.push(rowResult(s, database));
       lastRow = results.length - 1;
     } else {
       messages.push(`${i + 1}. ${shortSql(s.sql)} — ${outcome(s)} · ${s.elapsedMs} ms`);
@@ -198,11 +180,7 @@ export function toResults(run: QueryRun, mock: boolean, limit: number, database:
   }
   if (messages.length) {
     const only = run.statements.length === 1 ? run.statements[0] : undefined;
-    const note = only
-      ? mock
-        ? 'Statement ran (mock). 0 rows affected.'
-        : `Statement ran. ${only.affected ?? 0} row${only.affected === 1 ? '' : 's'} affected.`
-      : `${run.statements.length} statements ran.`;
+    const note = only ? `Statement ran. ${only.affected ?? 0} row${only.affected === 1 ? '' : 's'} affected.` : `${run.statements.length} statements ran.`;
     results.push({
       columns: [],
       rows: [],
@@ -211,7 +189,6 @@ export function toResults(run: QueryRun, mock: boolean, limit: number, database:
       title: only ? undefined : 'Messages',
       summary: only ? undefined : messages,
       database,
-      live: !mock,
     });
     if (lastRow < 0) lastRow = results.length - 1;
   }
@@ -221,8 +198,7 @@ export function toResults(run: QueryRun, mock: boolean, limit: number, database:
   return { results, active: Math.max(0, lastRow) };
 }
 
-/** The active result of a run, as a single grid result. */
-export function toResult(run: QueryRun, mock: boolean, limit: number, database: string): QueryResult {
-  const { results, active } = toResults(run, mock, limit, database);
+export function toResult(run: QueryRun, database: string): QueryResult {
+  const { results, active } = toResults(run, database);
   return results[active] ?? { columns: [], rows: [], ms: run.elapsedMs, note: 'Statement ran.' };
 }

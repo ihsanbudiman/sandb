@@ -3,28 +3,30 @@
 //! which sqlx's typed `String` decode rejects.
 
 use sqlx::mysql::MySqlRow;
-use sqlx::{Decode, MySql, MySqlPool, Row};
+use sqlx::MySqlPool;
 
 use super::{
     ColumnInfo, ConstraintInfo, ConstraintKind, ForeignKeyInfo, IndexInfo, SNAPSHOT_MAX_COLUMNS,
     SNAPSHOT_MAX_TABLES, SnapRow, SnapTable, TableInfo, TableKind, TableProperties, fold_runs,
 };
+use crate::core::db::reader::mysql_text;
+use crate::core::engine::SqlEngine;
 use crate::core::error::AppError;
 
-const SYSTEM_DBS: &str = "('information_schema', 'mysql', 'performance_schema', 'sys')";
-
-fn text(row: &MySqlRow, i: usize) -> Option<String> {
-    let v = row.try_get_raw(i).ok()?;
-    if sqlx::ValueRef::is_null(&v) {
-        return None;
-    }
-    <&[u8] as Decode<MySql>>::decode(v)
-        .ok()
-        .map(|b| String::from_utf8_lossy(b).into_owned())
+/// The browser's `NOT IN` list, from the one system-schema table on the engine descriptor.
+fn system_dbs() -> String {
+    let names: Vec<String> = SqlEngine::Mysql
+        .system_schemas()
+        .iter()
+        .map(|s| format!("'{}'", s.name))
+        .collect();
+    format!("({})", names.join(", "))
 }
 
+/// A catalog value for display. A value the server could not decode shows as empty: the only
+/// consequence is a hidden or blank row in the browser, never SQL text.
 fn req(row: &MySqlRow, i: usize) -> String {
-    text(row, i).unwrap_or_default()
+    mysql_text(row, i).unwrap_or_default()
 }
 
 fn kind(table_type: &str) -> TableKind {
@@ -38,7 +40,8 @@ fn kind(table_type: &str) -> TableKind {
 pub async fn databases(p: &MySqlPool) -> Result<Vec<String>, AppError> {
     let rows = sqlx::query(&format!(
         "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
-         WHERE SCHEMA_NAME NOT IN {SYSTEM_DBS} ORDER BY SCHEMA_NAME"
+         WHERE SCHEMA_NAME NOT IN {} ORDER BY SCHEMA_NAME",
+        system_dbs()
     ))
     .fetch_all(p)
     .await?;
@@ -61,7 +64,7 @@ pub async fn tables(p: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, App
                 name: req(r, 0),
                 kind: k,
                 row_estimate: match k {
-                    TableKind::Table => text(r, 2).and_then(|s| s.parse().ok()),
+                    TableKind::Table => mysql_text(r, 2).and_then(|s| s.parse().ok()),
                     TableKind::View | TableKind::Matview => None,
                 },
                 has_rowid: None,
@@ -92,13 +95,13 @@ pub async fn columns(
     Ok(rows
         .iter()
         .map(|r| {
-            let pk = text(r, 4).and_then(|s| s.parse::<u32>().ok());
+            let pk = mysql_text(r, 4).and_then(|s| s.parse::<u32>().ok());
             ColumnInfo {
                 name: req(r, 0),
                 data_type: req(r, 1),
                 nullable: req(r, 2).eq_ignore_ascii_case("YES"),
                 // MariaDB reports "no default" on a nullable column as the literal NULL.
-                default: text(r, 3).filter(|d| d != "NULL"),
+                default: mysql_text(r, 3).filter(|d| d != "NULL"),
                 is_pk: pk.is_some(),
                 pk_ordinal: pk,
                 frequency: None,
@@ -142,7 +145,6 @@ async fn features(p: &MySqlPool) -> Result<Features, AppError> {
     Ok(f)
 }
 
-/// One key part of an index: index name, column (or expression), non-unique, index type.
 struct IndexPart {
     name: String,
     column: String,
@@ -167,8 +169,7 @@ fn group_indexes(parts: Vec<IndexPart>) -> Vec<IndexInfo> {
     )
 }
 
-/// One column of a foreign key, as `KEY_COLUMN_USAGE` joined with `REFERENTIAL_CONSTRAINTS`
-/// lists it. Rows arrive sorted by (table, name, position).
+/// Rows arrive sorted by (table, name, position).
 struct FkPart {
     table: String,
     name: String,
@@ -323,7 +324,7 @@ pub async fn properties(
             name: req(r, 0),
             kind: ConstraintKind::Check,
             columns: vec![],
-            definition: text(r, 1),
+            definition: mysql_text(r, 1),
         }));
     }
 

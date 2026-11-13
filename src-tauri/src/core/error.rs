@@ -2,6 +2,9 @@
 
 use serde::Serialize;
 
+use crate::core::engine::{CONNECT_TIMEOUT, Engine};
+
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -14,7 +17,6 @@ pub enum ErrorCode {
     Io,
     /// The server answered with an error that has no more specific code (e.g. unknown database).
     Database,
-    /// The user cancelled a running query.
     Cancelled,
     /// The AI read guard (layer 1) refused the SQL before it reached the database.
     GuardRejected,
@@ -32,22 +34,76 @@ pub enum ErrorCode {
     WriteBlocked,
     /// The user denied a proposed write, or nobody decided in time. Nothing ran.
     WriteDenied,
-    /// The feature is not available for this engine yet (MongoDB before its phase lands).
+    /// The feature does not apply to this engine (e.g. Extended JSON export on a SQL connection).
     Unsupported,
+    /// The dev bridge rejected the request because its bearer token was missing or wrong.
+    Unauthorized,
     Internal,
 }
 
+impl ErrorCode {
+    /// The HTTP status the dev bridge answers with. One function next to the list, so a new
+    /// variant cannot compile without a status; the desktop app has no HTTP layer.
+    pub fn http_status(self) -> u16 {
+        match self {
+            ErrorCode::Unauthorized => 401,
+            ErrorCode::NotFound => 404,
+            ErrorCode::InvalidInput | ErrorCode::Unsupported => 400,
+            ErrorCode::AuthFailed | ErrorCode::Database | ErrorCode::ModelNotFound => 422,
+            ErrorCode::ConnectFailed | ErrorCode::AiUpstream | ErrorCode::AiProtocol => 502,
+            ErrorCode::Timeout => 504,
+            ErrorCode::Cancelled | ErrorCode::WriteDenied => 409,
+            ErrorCode::GuardRejected
+            | ErrorCode::ReadOnlyViolation
+            | ErrorCode::ConnectionReadOnly
+            | ErrorCode::WriteBlocked => 403,
+            ErrorCode::SecretStore | ErrorCode::Io | ErrorCode::Internal => 500,
+        }
+    }
+}
+
+/// The server's own error code and the vocabulary that names it. Comparisons are numeric or
+/// exact (`engine` + `code`); the label a user or the model sees is built in one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerCode {
+    /// The server that sent the code; it decides the label's words.
+    pub engine: Engine,
+    pub code: String,
+}
+
+impl ServerCode {
+    pub fn new(engine: Engine, code: impl Into<String>) -> Self {
+        Self {
+            engine,
+            code: code.into(),
+        }
+    }
+
+    /// `SQLSTATE 22P02`, `MySQL error 1366`, `SQLite error 787`, `MongoDB error 11000`.
+    pub fn label(&self) -> String {
+        let prefix = match self.engine {
+            Engine::Pg => "SQLSTATE",
+            Engine::Mysql => "MySQL error",
+            Engine::Sqlite => "SQLite error",
+            Engine::Mongo => "MongoDB error",
+        };
+        format!("{prefix} {}", self.code)
+    }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, thiserror::Error)]
 #[error("{message}")]
 pub struct AppError {
     pub code: ErrorCode,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub detail: Option<String>,
-    /// The server's own error code when `message` is the server's text, e.g. `SQLSTATE 22P02`
-    /// or `MySQL error 1366`. Not serialized: it lets a caller name the error without the text.
+    /// The server's own error code when `message` is the server's text, e.g. SQLSTATE 22P02 or
+    /// MongoDB 11000. Not serialized: it lets a caller name the error without the text.
     #[serde(skip)]
-    pub server_code: Option<String>,
+    pub server_code: Option<ServerCode>,
 }
 
 impl AppError {
@@ -77,11 +133,29 @@ impl AppError {
         Self::new(ErrorCode::Internal, message)
     }
 
-    /// A SQL feature used on a MongoDB connection.
-    pub fn unsupported_mongo() -> Self {
+    pub fn cancelled() -> Self {
+        Self::new(ErrorCode::Cancelled, "Query cancelled")
+    }
+
+    /// A chat run the user stopped, or one whose receiver went away.
+    pub fn stopped() -> Self {
+        Self::new(ErrorCode::Cancelled, "Stopped")
+    }
+
+    /// A SQL-only path reached a connection of another engine. The routing layer resolves the
+    /// engine first, so this is a caller bug, not a user error.
+    pub fn not_sql() -> Self {
+        Self::internal("Not a SQL connection")
+    }
+
+    /// The opener of a connection gave up after `CONNECT_TIMEOUT`.
+    pub fn connect_timeout() -> Self {
         Self::new(
-            ErrorCode::Unsupported,
-            "This feature is not available for MongoDB connections yet",
+            ErrorCode::Timeout,
+            format!(
+                "No answer from the server within {} s",
+                CONNECT_TIMEOUT.as_secs()
+            ),
         )
     }
 }
@@ -143,20 +217,20 @@ impl From<sqlx::Error> for AppError {
     }
 }
 
-/// `MySQL error 1366`, `SQLite error 787`, else `SQLSTATE 22P02`; `None` without a code.
 fn server_code_label(
     db: &(dyn sqlx::error::DatabaseError + 'static),
     mysql_number: Option<u16>,
-) -> Option<String> {
+) -> Option<ServerCode> {
     if let Some(n) = mysql_number {
-        return Some(format!("MySQL error {n}"));
+        return Some(ServerCode::new(Engine::Mysql, n.to_string()));
     }
     let code = db.code()?;
-    if db.try_downcast_ref::<sqlx::sqlite::SqliteError>().is_some() {
-        Some(format!("SQLite error {code}"))
+    let engine = if db.try_downcast_ref::<sqlx::sqlite::SqliteError>().is_some() {
+        Engine::Sqlite
     } else {
-        Some(format!("SQLSTATE {code}"))
-    }
+        Engine::Pg
+    };
+    Some(ServerCode::new(engine, code.to_string()))
 }
 
 #[cfg(test)]
@@ -182,30 +256,66 @@ mod tests {
         assert_eq!(v, serde_json::json!({"code": "not_found", "message": "x"}));
     }
 
+    /// Every variant, in declaration order.
+    const ALL: [ErrorCode; 20] = [
+        ErrorCode::NotFound,
+        ErrorCode::InvalidInput,
+        ErrorCode::AuthFailed,
+        ErrorCode::ConnectFailed,
+        ErrorCode::Timeout,
+        ErrorCode::SecretStore,
+        ErrorCode::Io,
+        ErrorCode::Database,
+        ErrorCode::Cancelled,
+        ErrorCode::GuardRejected,
+        ErrorCode::ReadOnlyViolation,
+        ErrorCode::ConnectionReadOnly,
+        ErrorCode::ModelNotFound,
+        ErrorCode::AiUpstream,
+        ErrorCode::AiProtocol,
+        ErrorCode::WriteBlocked,
+        ErrorCode::WriteDenied,
+        ErrorCode::Unsupported,
+        ErrorCode::Unauthorized,
+        ErrorCode::Internal,
+    ];
+
+    /// The wire name of each variant. The `match` is exhaustive, so a new variant does not
+    /// compile until it is named here, and `ALL` must then list it.
+    fn wire_name(c: ErrorCode) -> &'static str {
+        match c {
+            ErrorCode::NotFound => "not_found",
+            ErrorCode::InvalidInput => "invalid_input",
+            ErrorCode::AuthFailed => "auth_failed",
+            ErrorCode::ConnectFailed => "connect_failed",
+            ErrorCode::Timeout => "timeout",
+            ErrorCode::SecretStore => "secret_store",
+            ErrorCode::Io => "io",
+            ErrorCode::Database => "database",
+            ErrorCode::Cancelled => "cancelled",
+            ErrorCode::GuardRejected => "guard_rejected",
+            ErrorCode::ReadOnlyViolation => "read_only_violation",
+            ErrorCode::ConnectionReadOnly => "connection_read_only",
+            ErrorCode::ModelNotFound => "model_not_found",
+            ErrorCode::AiUpstream => "ai_upstream",
+            ErrorCode::AiProtocol => "ai_protocol",
+            ErrorCode::WriteBlocked => "write_blocked",
+            ErrorCode::WriteDenied => "write_denied",
+            ErrorCode::Unsupported => "unsupported",
+            ErrorCode::Unauthorized => "unauthorized",
+            ErrorCode::Internal => "internal",
+        }
+    }
+
     #[test]
-    fn all_codes_are_snake_case() {
-        let codes = [
-            (ErrorCode::NotFound, "not_found"),
-            (ErrorCode::InvalidInput, "invalid_input"),
-            (ErrorCode::AuthFailed, "auth_failed"),
-            (ErrorCode::ConnectFailed, "connect_failed"),
-            (ErrorCode::Timeout, "timeout"),
-            (ErrorCode::SecretStore, "secret_store"),
-            (ErrorCode::Io, "io"),
-            (ErrorCode::Database, "database"),
-            (ErrorCode::Cancelled, "cancelled"),
-            (ErrorCode::GuardRejected, "guard_rejected"),
-            (ErrorCode::ReadOnlyViolation, "read_only_violation"),
-            (ErrorCode::ConnectionReadOnly, "connection_read_only"),
-            (ErrorCode::ModelNotFound, "model_not_found"),
-            (ErrorCode::AiUpstream, "ai_upstream"),
-            (ErrorCode::AiProtocol, "ai_protocol"),
-            (ErrorCode::WriteBlocked, "write_blocked"),
-            (ErrorCode::Unsupported, "unsupported"),
-            (ErrorCode::Internal, "internal"),
-        ];
-        for (c, s) in codes {
-            assert_eq!(serde_json::to_value(c).unwrap(), serde_json::json!(s));
+    fn every_code_serializes_to_its_wire_name() {
+        for c in ALL {
+            let name = wire_name(c);
+            assert_eq!(serde_json::to_value(c).unwrap(), serde_json::json!(name));
+            assert!(
+                name.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_'),
+                "{name} is not snake_case"
+            );
         }
     }
 
@@ -271,10 +381,23 @@ mod tests {
         let e = AppError::from(other);
         assert_eq!(e.code, ErrorCode::Database);
         assert_eq!(e.message, "fake server error");
-        assert_eq!(e.server_code.as_deref(), Some("SQLSTATE 3D000"));
+        assert_eq!(e.server_code, Some(ServerCode::new(Engine::Pg, "3D000")));
         assert_eq!(AppError::invalid("x").server_code, None);
 
         let cfg = sqlx::Error::Configuration("bad".into());
         assert_eq!(AppError::from(cfg).code, ErrorCode::InvalidInput);
+    }
+
+    /// The one place the human-readable form of a server code is written.
+    #[test]
+    fn server_code_labels_name_their_server() {
+        for (engine, code, label) in [
+            (Engine::Pg, "22P02", "SQLSTATE 22P02"),
+            (Engine::Mysql, "1366", "MySQL error 1366"),
+            (Engine::Sqlite, "787", "SQLite error 787"),
+            (Engine::Mongo, "11000", "MongoDB error 11000"),
+        ] {
+            assert_eq!(ServerCode::new(engine, code).label(), label);
+        }
     }
 }

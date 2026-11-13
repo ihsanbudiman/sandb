@@ -10,14 +10,15 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::ai::approval::APPROVAL_TIMEOUT;
-use crate::core::ai::client::{AiClient, Completion, StreamEvent};
+use crate::core::ai::client::{Completion, StreamEvent};
+use crate::core::ai::event::ChatEvent;
 use crate::core::ai::prompt::{self, PromptInput};
 use crate::core::ai::settings;
 use crate::core::ai::tools::{self, Decision, ToolContext};
-use crate::core::connections::{self, Engine};
-use crate::core::db::introspect;
+use crate::core::connections::target_database;
 use crate::core::error::{AppError, ErrorCode};
-use crate::core::guard::WriteInfo;
+use crate::core::ops;
+use crate::core::result::{Engines, Source};
 use crate::core::state::AppState;
 
 /// Model calls in one `chat_send`.
@@ -25,6 +26,7 @@ pub const MAX_STEPS: usize = 8;
 /// Databases in one chat. Each adds its schema summary to the prompt.
 pub const MAX_SOURCES: usize = 8;
 
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
@@ -32,30 +34,34 @@ pub enum ChatRole {
     Assistant,
 }
 
-/// An earlier turn of the chat.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatTurn {
     pub role: ChatRole,
     pub content: String,
 }
 
-/// One database the chat can use.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatSource {
     pub conn_id: String,
     /// `None`: the connection's own database.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub database: Option<String>,
     /// PG schema for `list_tables` and `describe_table`; `None` is `public`.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub schema: Option<String>,
-    /// The chat's write mode for this database. `propose_write` also needs a connection that
-    /// is not read-only.
+    /// The chat's write mode for this database. `propose_write` also needs the connection's
+    /// saved AI writes and a connection that is not read-only.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub allow_writes: bool,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatRequest {
@@ -65,65 +71,9 @@ pub struct ChatRequest {
     pub sources: Vec<ChatSource>,
     /// Earlier turns, oldest first, without `message`.
     #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub history: Vec<ChatTurn>,
     pub message: String,
-}
-
-/// One streamed event. JSON: `{"type": "text", "delta": "…"}` and so on.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ChatEvent {
-    Text {
-        delta: String,
-    },
-    /// The model has begun a tool call; its arguments are still streaming. Once per call,
-    /// before that call's `tool_call`.
-    ToolStarting {
-        name: String,
-    },
-    ToolCall {
-        id: String,
-        name: String,
-        /// The parsed arguments; `{}` when they are not a JSON object.
-        args: Value,
-    },
-    ToolResult {
-        id: String,
-        ok: bool,
-        /// Short text for the UI: `12 tables`, `5 rows · 42 ms`, or the error message.
-        summary: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        columns: Option<Vec<String>>,
-        /// At most `tools::UI_ROWS` rows, for the local UI only.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        rows: Option<Vec<Vec<Value>>>,
-        /// More rows exist than `rows` holds.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        truncated: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<AppError>,
-    },
-    /// A proposed write, sent before its `tool_result`. Nothing has run: the `tool_result`
-    /// comes after the user approves (`approve_write`) or denies (`deny_write`) it.
-    WritePreview {
-        id: String,
-        sql: String,
-        info: WriteInfo,
-    },
-    /// The chart of a `render_chart` read, sent before its `tool_result`. For the local UI only;
-    /// at most `tools::CHART_ROWS` rows.
-    Chart {
-        id: String,
-        spec: tools::ChartSpec,
-        columns: Vec<String>,
-        rows: Vec<Vec<Value>>,
-        /// More rows exist than `rows` holds.
-        truncated: bool,
-    },
-    Error {
-        error: AppError,
-    },
-    Done,
 }
 
 /// Running chats by id, for `chat_cancel`.
@@ -194,14 +144,31 @@ impl ChatRegistry {
         }
     }
 
+    #[cfg(any(test, feature = "it"))]
     pub fn is_running(&self, id: &str) -> bool {
         self.lock().chats.contains_key(id)
     }
 }
 
-/// Stops a running chat; its stream ends with a `cancelled` error.
 pub fn cancel(state: &AppState, chat_id: &str) {
     state.chats.cancel(chat_id);
+}
+
+pub fn cancel_all(state: &AppState) {
+    state.chats.cancel_all();
+}
+
+#[cfg(any(test, feature = "it"))]
+pub fn decide(state: &AppState, chat_id: &str, id: &str, approve: bool) -> Result<(), AppError> {
+    state.approvals.decide(chat_id, id, approve)
+}
+
+pub fn approve(state: &AppState, chat_id: &str, id: &str) -> Result<(), AppError> {
+    state.approvals.decide(chat_id, id, true)
+}
+
+pub fn deny(state: &AppState, chat_id: &str, id: &str) -> Result<(), AppError> {
+    state.approvals.decide(chat_id, id, false)
 }
 
 /// Runs one user message to the end. `emit` returns false when the receiver is gone; the run
@@ -214,10 +181,6 @@ pub async fn run(state: &AppState, req: ChatRequest, mut emit: impl FnMut(ChatEv
         Ok(()) => ChatEvent::Done,
         Err(error) => ChatEvent::Error { error },
     });
-}
-
-fn cancelled() -> AppError {
-    AppError::new(ErrorCode::Cancelled, "Stopped")
 }
 
 fn receiver_gone() -> AppError {
@@ -251,15 +214,15 @@ async fn converse(
     }
     let mut sources = Vec::with_capacity(req.sources.len());
     for (i, s) in req.sources.iter().enumerate() {
-        let conn = connections::get(state, &s.conn_id)?;
-        let database = connections::target_database(&conn, s.database.as_deref());
-        if conn.engine == Engine::Mongo && database.is_empty() {
+        let conn = state.connection(&s.conn_id)?;
+        let database = target_database(&conn, s.database.as_deref());
+        if conn.engine.sql().is_none() && database.is_empty() {
             return Err(AppError::invalid(format!(
                 "Choose a database for {}",
                 conn.name
             )));
         }
-        sources.push(tools::Source {
+        sources.push(Source {
             id: format!("db{}", i + 1),
             database,
             schema: s
@@ -272,30 +235,33 @@ async fn converse(
             conn,
         });
     }
-    let settings = settings::load(state)?;
-    if settings.model.trim().is_empty() {
-        return Err(AppError::invalid("Choose an AI model in Settings first"));
-    }
-    let client = AiClient::new(
-        settings.api(),
-        &settings.base_url,
-        settings::stored_key(state)?,
-    )?;
+    let engines = Engines::of(&sources);
+    let (settings, client) = settings::for_chat(state).await?;
 
     // The summaries are a help, not a need: on an error or a slow server the model uses the tools.
-    let limit = Duration::from_secs(settings.timeout_sec);
+    let timeout_sec = settings.timeout_sec;
+    let limit = Duration::from_secs(timeout_sec);
     let reads = sources.iter().map(|s| async move {
-        tokio::time::timeout(
-            limit,
-            introspect::schema_snapshot(state, &s.conn.id, &s.database),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)
+        match tokio::time::timeout(limit, ops::schema_snapshot(state, &s.conn.id, &s.database))
+            .await
+        {
+            Ok(Ok(snap)) => Some(snap),
+            Ok(Err(e)) => {
+                eprintln!("sandb: no schema summary for {}: {e}", s.id);
+                None
+            }
+            Err(_) => {
+                eprintln!(
+                    "sandb: the schema summary of {} took longer than {timeout_sec} s",
+                    s.id
+                );
+                None
+            }
+        }
     });
     let snapshots = tokio::select! {
         biased;
-        _ = token.cancelled() => return Err(cancelled()),
+        _ = token.cancelled() => return Err(AppError::stopped()),
         r = futures_util::future::join_all(reads) => r,
     };
     let today = chrono::Local::now()
@@ -303,6 +269,7 @@ async fn converse(
         .to_string();
     let system = prompt::system_prompt(&PromptInput {
         sources: &sources,
+        engines,
         snapshots: &snapshots,
         settings: &settings,
         today: &today,
@@ -312,7 +279,7 @@ async fn converse(
         "model": settings.model,
         "messages": [{"role": "system", "content": system}],
         "stream": true,
-        "tools": tools::definitions(&sources),
+        "tools": tools::definitions(&sources, engines),
         "tool_choice": "auto",
     });
     for turn in &req.history {
@@ -337,6 +304,7 @@ async fn converse(
                     },
                     StreamEvent::ToolStarting(name) => ChatEvent::ToolStarting {
                         name: name.to_string(),
+                        kind: tools::kind(name),
                     },
                 })
             })
@@ -361,19 +329,18 @@ async fn converse(
             json!({"role": "assistant", "content": text, "tool_calls": calls}),
         );
         for call in &answer.tool_calls {
-            let args = tools::parse_args(&call.arguments)
-                .map(Value::Object)
-                .unwrap_or_else(|| json!({}));
+            let args = tools::parse_args(&call.arguments).unwrap_or_default();
             if !emit(ChatEvent::ToolCall {
                 id: call.id.clone(),
                 name: call.name.clone(),
+                kind: tools::kind(&call.name),
                 args,
             }) {
                 return Err(receiver_gone());
             }
             let out = tokio::select! {
                 biased;
-                _ = token.cancelled() => return Err(cancelled()),
+                _ = token.cancelled() => return Err(AppError::stopped()),
                 out = tools::execute(&ctx, &call.id, &call.name, &call.arguments) => out,
             };
             // Registered before the preview goes out, so a fast click finds it.
@@ -390,7 +357,7 @@ async fn converse(
                 (Some(w), Some(waiting)) => {
                     let decision = tokio::select! {
                         biased;
-                        _ = token.cancelled() => return Err(cancelled()),
+                        _ = token.cancelled() => return Err(AppError::stopped()),
                         d = tokio::time::timeout(APPROVAL_TIMEOUT, waiting.decision()) => match d {
                             Ok(true) => Decision::Approved,
                             Ok(false) => Decision::Denied,
@@ -423,9 +390,11 @@ async fn converse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::ai::client::tests::{done, finish_chunk, head, serve, sse, text_chunk};
+    use crate::core::ai::event::{ToolKind, ToolResultData};
     use crate::core::ai::settings::AiSettings;
-    use crate::core::connections::{ConnectionInput, Engine, Env, SslMode};
+    use crate::core::ai::test_support::{done, finish_chunk, head, serve, sse, text_chunk};
+    use crate::core::connections::{ConnectionInput, Env, SslMode};
+    use crate::core::engine::Engine;
     use crate::core::secrets::MemoryStore;
 
     fn state_with(base: &str) -> (tempfile::TempDir, AppState, String) {
@@ -443,28 +412,28 @@ mod tests {
         let db = dir.path().join("t.db");
         // An empty file is an empty SQLite database.
         std::fs::write(&db, b"").unwrap();
-        let conn = connections::create(
-            &st,
-            ConnectionInput {
-                name: "t".into(),
-                engine: Engine::Sqlite,
-                env: Env::Local,
-                host: String::new(),
-                port: 0,
-                database: "main".into(),
-                user: String::new(),
-                ssl: SslMode::Disable,
-                file: db.to_string_lossy().into_owned(),
-                ai_write: false,
-                read_only: false,
-                version: None,
-                uri: String::new(),
-                auth_source: String::new(),
-                topology: None,
-            },
-            None,
-        )
-        .unwrap();
+        let conn = st
+            .create_connection(
+                ConnectionInput {
+                    name: "t".into(),
+                    engine: Engine::Sqlite,
+                    env: Env::Local,
+                    host: String::new(),
+                    port: 0,
+                    database: "main".into(),
+                    user: String::new(),
+                    ssl: SslMode::Disable,
+                    file: db.to_string_lossy().into_owned(),
+                    ai_write: true,
+                    read_only: false,
+                    version: None,
+                    uri: String::new(),
+                    auth_source: String::new(),
+                    topology: None,
+                },
+                None,
+            )
+            .unwrap();
         (dir, st, conn.id)
     }
 
@@ -489,8 +458,7 @@ mod tests {
             .await
             .unwrap();
         c.close().await.unwrap();
-        connections::create(
-            st,
+        st.create_connection(
             ConnectionInput {
                 name: name.into(),
                 engine: Engine::Sqlite,
@@ -501,7 +469,7 @@ mod tests {
                 user: String::new(),
                 ssl: SslMode::Disable,
                 file: file.to_string_lossy().into_owned(),
-                ai_write: false,
+                ai_write: true,
                 read_only: false,
                 version: None,
                 uri: String::new(),
@@ -544,39 +512,53 @@ mod tests {
             allow_writes: false,
         });
         let events = collect(&st, req).await;
-        let summary = |id: &str| {
+        let result_of = |id: &str| {
             events.iter().find_map(|e| match e {
                 ChatEvent::ToolResult {
-                    id: i, ok, summary, ..
-                } if i == id => Some((*ok, summary.clone())),
+                    id: i,
+                    ok,
+                    result,
+                    error,
+                    ..
+                } if i == id => Some((*ok, *result, error.clone())),
                 _ => None,
             })
         };
-        let (ok, s) = summary("a").unwrap();
-        assert!(ok && s.starts_with("3 rows"), "{s}");
-        let (ok, s) = summary("b").unwrap();
-        assert!(ok && s.starts_with("5 rows"), "{s}");
+        let (ok, data, error) = result_of("a").unwrap();
+        assert!(ok, "{error:?}");
+        // The UI reads the typed count, not the English summary.
+        assert_eq!(data.and_then(|d| d.rows), Some(3));
+        assert!(data.and_then(|d| d.ms).is_some());
+        let (ok, data, error) = result_of("b").unwrap();
+        assert!(ok, "{error:?}");
+        assert_eq!(data.and_then(|d| d.rows), Some(5));
         // Without a source the call fails; it never falls back to the first database.
-        let (ok, s) = summary("c").unwrap();
+        let (ok, data, error) = result_of("c").unwrap();
+        assert!(!ok && data.is_none());
+        let error = error.expect("the call fails");
+        assert_eq!(error.code, ErrorCode::InvalidInput);
         assert!(
-            !ok && s == "The tool needs \"source\", one of: db1, db2",
-            "{s}"
+            error.message.contains("db1") && error.message.contains("db2"),
+            "{}",
+            error.message
         );
 
         let raw = reqs.recv().await.unwrap();
         let body: Value = serde_json::from_str(&raw[raw.find("\r\n\r\n").unwrap() + 4..]).unwrap();
         let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(
-            system.contains("Source db1:\n- Connection: \"small\""),
-            "{system}"
-        );
-        assert!(
-            system.contains("Source db2:\n- Connection: \"big\""),
-            "{system}"
-        );
+        for want in ["Source db1", "\"small\"", "Source db2", "\"big\""] {
+            assert!(system.contains(want), "{want}: {system}");
+        }
         assert!(system.contains("Schema summary of db2"), "{system}");
-        let read = &body["tools"][2]["function"]["parameters"];
-        assert_eq!(read["properties"]["source"]["enum"], json!(["db1", "db2"]));
+        let tools = body["tools"].as_array().unwrap();
+        let read = tools
+            .iter()
+            .find(|t| t["function"]["name"] == "run_read_query")
+            .expect("the SQL read tool");
+        assert_eq!(
+            read["function"]["parameters"]["properties"]["source"]["enum"],
+            json!(["db1", "db2"])
+        );
     }
 
     fn request(conn_id: &str, message: &str) -> ChatRequest {
@@ -611,17 +593,23 @@ mod tests {
         let v = serde_json::to_value(ChatEvent::ToolCall {
             id: "c1".into(),
             name: "list_tables".into(),
-            args: json!({}),
+            kind: ToolKind::List,
+            args: serde_json::Map::new(),
         })
         .unwrap();
         assert_eq!(
             v,
-            json!({"type": "tool_call", "id": "c1", "name": "list_tables", "args": {}})
+            json!({"type": "tool_call", "id": "c1", "name": "list_tables", "kind": "list", "args": {}})
         );
         let v = serde_json::to_value(ChatEvent::ToolResult {
             id: "c1".into(),
             ok: true,
             summary: "1 row".into(),
+            result: Some(ToolResultData {
+                rows: Some(1),
+                ms: Some(4),
+                committed: None,
+            }),
             columns: None,
             rows: None,
             truncated: None,
@@ -630,7 +618,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             v,
-            json!({"type": "tool_result", "id": "c1", "ok": true, "summary": "1 row"})
+            json!({"type": "tool_result", "id": "c1", "ok": true, "summary": "1 row", "result": {"rows": 1, "ms": 4}})
         );
         assert_eq!(
             serde_json::to_value(ChatEvent::Done).unwrap(),
@@ -638,10 +626,11 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(ChatEvent::ToolStarting {
-                name: "run_read_query".into()
+                name: "run_read_query".into(),
+                kind: ToolKind::Read,
             })
             .unwrap(),
-            json!({"type": "tool_starting", "name": "run_read_query"})
+            json!({"type": "tool_starting", "name": "run_read_query", "kind": "read"})
         );
     }
 
@@ -694,7 +683,16 @@ mod tests {
         assert_eq!(msgs[1], json!({"role": "user", "content": "earlier"}));
         assert_eq!(msgs[2], json!({"role": "user", "content": "hello"}));
         assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["tools"].as_array().unwrap().len(), 5);
+        // The SQL sources get the SQL tool set: named, not counted.
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"run_read_query"), "{names:?}");
+        assert!(names.contains(&"propose_write"), "{names:?}");
+        assert!(!names.iter().any(|n| n.contains("mongo")), "{names:?}");
     }
 
     #[tokio::test]
@@ -729,7 +727,7 @@ mod tests {
         assert!(matches!(
             &events[..3],
             [
-                ChatEvent::ToolStarting { name },
+                ChatEvent::ToolStarting { name, .. },
                 ChatEvent::ToolCall { name: n2, .. },
                 ChatEvent::ToolResult { ok: true, .. },
             ] if name == "list_tables" && n2 == "list_tables"
@@ -786,14 +784,19 @@ mod tests {
         .await;
         let (_d, st, conn) = state_with(&base);
         let started = std::time::Instant::now();
-        let mut n = 0;
-        run(&st, request(&conn, "hi"), |_| {
-            n += 1;
+        let mut events = Vec::new();
+        run(&st, request(&conn, "hi"), |e| {
+            events.push(e);
             false
         })
         .await;
-        // The text delta, then the terminal event that nobody receives.
-        assert_eq!(n, 2);
+        // The delta reached the receiver; the run then stopped instead of waiting for the
+        // server's delayed end, and it never reported success.
+        assert!(
+            matches!(events.first(), Some(ChatEvent::Text { .. })),
+            "{events:?}"
+        );
+        assert!(!events.contains(&ChatEvent::Done), "{events:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(!st.chats.is_running("chat-1"));
     }
@@ -815,7 +818,7 @@ mod tests {
         n
     }
 
-    fn propose(sql: &str) -> Vec<crate::core::ai::client::tests::Part> {
+    fn propose(sql: &str) -> Vec<crate::core::ai::test_support::Part> {
         vec![
             head("200 OK", "text/event-stream"),
             sse(json!({"choices": [{"delta": {"tool_calls": [
@@ -849,13 +852,17 @@ mod tests {
             .await;
             match result.unwrap() {
                 ChatEvent::ToolResult {
-                    ok, summary, error, ..
+                    ok,
+                    result,
+                    error,
+                    ..
                 } if approve => {
                     assert!(ok, "{error:?}");
-                    assert!(
-                        summary.starts_with("2 rows changed · committed"),
-                        "{summary}"
-                    );
+                    // The audit log reads the typed result: 2 changed rows, committed.
+                    let data = result.unwrap();
+                    assert_eq!(data.rows, Some(2));
+                    assert_eq!(data.committed, Some(true));
+                    assert!(data.ms.is_some());
                 }
                 ChatEvent::ToolResult { ok, error, .. } => {
                     assert!(!ok);

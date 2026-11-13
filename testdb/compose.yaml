@@ -5,7 +5,7 @@ name: sandb-test
 # server without TCP, so a TCP login of sandb_ro (created by the last seed script)
 # only passes after all seed scripts have finished.
 # The Mongo services listen on the same port inside and outside the container, so the
-# replica set member address (127.0.0.1:57017) also works from the host.
+# replica set member address (127.0.0.1:${MONGO_RS_PORT}) also works from the host.
 
 x-pg: &pg
   env_file: .env.test
@@ -31,13 +31,13 @@ services:
   pg16:
     <<: *pg
     image: postgres:16
-    ports: ["127.0.0.1:55416:5432"]
+    ports: ["127.0.0.1:${PG16_PORT}:5432"]
     tmpfs: [/var/lib/postgresql/data]
 
   pg13:
     <<: *pg
     image: postgres:13
-    ports: ["127.0.0.1:55413:5432"]
+    ports: ["127.0.0.1:${PG13_PORT}:5432"]
     tmpfs: [/var/lib/postgresql/data]
 
   mysql:
@@ -45,7 +45,7 @@ services:
     env_file: .env.test
     networks: [testnet]
     command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci", "--innodb-use-native-aio=0"]
-    ports: ["127.0.0.1:53384:3306"]
+    ports: ["127.0.0.1:${MYSQL_PORT}:3306"]
     tmpfs: [/var/lib/mysql]
     volumes:
       - ./seed/mysql:/docker-entrypoint-initdb.d:ro
@@ -61,7 +61,7 @@ services:
     env_file: .env.test
     networks: [testnet]
     command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci", "--innodb-use-native-aio=0"]
-    ports: ["127.0.0.1:53311:3306"]
+    ports: ["127.0.0.1:${MARIADB_PORT}:3306"]
     tmpfs: [/var/lib/mysql]
     volumes:
       - ./seed/mysql:/docker-entrypoint-initdb.d:ro
@@ -80,10 +80,10 @@ services:
     entrypoint:
       - bash
       - -c
-      - openssl rand -base64 756 > /tmp/rs.key && chmod 400 /tmp/rs.key && chown mongodb:mongodb /tmp/rs.key && exec docker-entrypoint.sh mongod --port 57017 --replSet rs0 --keyFile /tmp/rs.key
-    ports: ["127.0.0.1:57017:57017"]
+      - openssl rand -base64 756 > /tmp/rs.key && chmod 400 /tmp/rs.key && chown mongodb:mongodb /tmp/rs.key && exec docker-entrypoint.sh mongod --port ${MONGO_RS_PORT} --replSet rs0 --keyFile /tmp/rs.key
+    ports: ["127.0.0.1:${MONGO_RS_PORT}:${MONGO_RS_PORT}"]
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet --port 57017 -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'try { rs.status() } catch (e) { rs.initiate({ _id: \"rs0\", members: [{ _id: 0, host: \"127.0.0.1:57017\" }] }) }' >/dev/null && mongosh --quiet 'mongodb://sandb_ro:'$$SANDB_RO_PASSWORD'@127.0.0.1:57017/analytics?authSource=admin&directConnection=true' --eval 'db.events.countDocuments()' | grep -q 10000"]
+      test: ["CMD-SHELL", "mongosh --quiet --port ${MONGO_RS_PORT} -u $$MONGO_INITDB_ROOT_USERNAME -p $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'try { rs.status() } catch (e) { rs.initiate({ _id: \"rs0\", members: [{ _id: 0, host: \"127.0.0.1:${MONGO_RS_PORT}\" }] }) }' >/dev/null && mongosh --quiet 'mongodb://sandb_ro:'$$SANDB_RO_PASSWORD'@127.0.0.1:${MONGO_RS_PORT}/analytics?authSource=admin&directConnection=true' --eval 'db.events.countDocuments()' | grep -q 10000"]
       interval: 2s
       timeout: 10s
       retries: 90
@@ -92,10 +92,10 @@ services:
   # Standalone server: no transactions.
   mongo-standalone:
     <<: *mongo
-    command: ["mongod", "--port", "57018"]
-    ports: ["127.0.0.1:57018:57018"]
+    command: ["mongod", "--port", "${MONGO_STANDALONE_PORT}"]
+    ports: ["127.0.0.1:${MONGO_STANDALONE_PORT}:${MONGO_STANDALONE_PORT}"]
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet 'mongodb://sandb_ro:'$$SANDB_RO_PASSWORD'@127.0.0.1:57018/analytics?authSource=admin' --eval 'db.events.countDocuments()' | grep -q 10000"]
+      test: ["CMD-SHELL", "mongosh --quiet 'mongodb://sandb_ro:'$$SANDB_RO_PASSWORD'@127.0.0.1:${MONGO_STANDALONE_PORT}/analytics?authSource=admin' --eval 'db.events.countDocuments()' | grep -q 10000"]
       interval: 2s
       timeout: 10s
       retries: 90
@@ -106,14 +106,14 @@ services:
     env_file: .env.test
     environment:
       HOST: 0.0.0.0
-      PORT: "58080"
+      PORT: "${MOCK_LLM_PORT}"
     networks: [testnet]
     command: ["node", "/app/server.mjs"]
-    ports: ["127.0.0.1:58080:58080"]
+    ports: ["127.0.0.1:${MOCK_LLM_PORT}:${MOCK_LLM_PORT}"]
     volumes:
       - ./mock-llm:/app:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:58080/health >/dev/null"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${MOCK_LLM_PORT}/health >/dev/null"]
       interval: 2s
       timeout: 3s
       retries: 30

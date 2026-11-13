@@ -1,94 +1,46 @@
 import { untrack } from 'svelte';
-import { schemas, tableData, nsOf, type Row, type Cell } from './mock';
-import { active, ui, db, canWrite, flushAi, type Conn } from './state.svelte';
-import { activeTab, defaultDb } from './tabs.svelte';
-import { api, ApiError, type CellValue, type ChartSpec, type ChatEvent, type ChatRequest, type ErrorCode, type WriteInfo } from './api';
+import { api, ApiError, type Cell, type ChatEvent, type ChatRequest, type ErrorCode, type ToolKind } from './api';
 import { logQuery, type AuditResult } from './audit.svelte';
-
-/** `denied`: the user denied a proposed write, or the guard refused it. `failed`: the tool or the database returned an error. */
-export type ToolStatus = 'running' | 'done' | 'blocked' | 'awaiting' | 'approved' | 'denied' | 'failed';
-/**
- * `id`: the backend's tool call id (live replies only). `args`: the arguments the model sent.
- * `ms`: time from the call to its result. `truncated`: more rows exist than `rows` holds. `error`: the error code of a failed step.
- * `source`: the database the step ran on (live replies only).
- */
-export type ToolPart = {
-  kind: 'tool';
-  id?: string;
-  name: string;
-  args?: Record<string, unknown>;
-  sql?: string;
-  status: ToolStatus;
-  rows?: Row[];
-  truncated?: boolean;
-  note?: string;
-  started?: number;
-  ms?: number;
-  error?: string;
-  /** `write_preview` info: the guard's per-statement kinds and warnings, kept for the preview badge. */
-  info?: WriteInfo;
-  source?: Source;
-};
-/** `answer`: missing while the question is open, null when the user skipped it. */
-export type QuestionPart = { kind: 'question'; text: string; options: string[]; answer?: string | null };
-/** The reply stopped: an error, or the user pressed Stop. */
-export type ErrorPart = { kind: 'error'; text: string };
-/** A chart of a `render_chart` read. `rows` are arrays in `columns` order. `truncated`: the read had more rows than the chart keeps. */
-export type ChartPart = { kind: 'chart'; spec: ChartSpec; columns: string[]; rows: CellValue[][]; truncated: boolean };
-export type Part = { kind: 'text'; text: string } | ToolPart | QuestionPart | ErrorPart | ChartPart;
-/** `started`/`ended`: when the assistant reply was sent and when it finished, stopped or failed (missing in chats saved before they were kept). */
-export interface Msg {
-  role: 'user' | 'assistant';
-  parts: Part[];
-  started?: number;
-  ended?: number;
-}
-/** A database of a chat. `database` null: the connection's own database (chats saved before a chat had several databases). */
-export interface Source {
-  connId: string;
-  database: string | null;
-}
-/** One conversation. It can use several databases, on one or more connections. */
-export interface Session {
-  id: string;
-  sources: Source[];
-  title: string;
-  updated: number;
-  messages: Msg[];
-}
-
-/** Databases in one chat; the backend refuses more. */
-export const MAX_SOURCES = 8;
+import { afterWrite } from './catalog.svelte';
+import { type Msg, type Session, type ToolPart } from './chatModel';
+import { UI_ROWS } from './api/generated/constants';
+import { isReadTool, isWriteTool } from './chatTools';
+import { canWrite, connOf, dbOf, defaultDb, sameSource, type Conn, type Source } from './connections.svelte';
+import { autosave, readStored } from './persist.svelte';
+import { ui, flushAi } from './state.svelte';
+import { active, activeTab } from './tabs.svelte';
 
 const KEY = 'sandb.chat.v1';
 const MAX_SESSIONS = 50;
 
+/** Kinds of steps saved before the backend sent them on the wire; a name from a newer build is `other`. */
+const LEGACY_KIND: Record<string, ToolKind> = { list_tables: 'list', describe_table: 'describe', run_read_query: 'read', run_mongo_read: 'read', render_chart: 'chart', render_mongo_chart: 'chart', propose_write: 'write', propose_mongo_write: 'write' };
+
 // A saved session can stop in the middle of a reply (the app closed). Its open steps can never finish.
-function load(): Session[] {
-  try {
-    const list = JSON.parse(localStorage.getItem(KEY) ?? '[]') as (Session & { connId?: string })[];
-    for (const s of list) {
-      // Before a chat had several databases, it belonged to one connection.
-      if (!s.sources) s.sources = s.connId ? [{ connId: s.connId, database: null }] : [];
-      delete s.connId;
-      for (const m of s.messages)
-        for (const p of m.parts) {
-          if (p.kind === 'tool' && (p.status === 'running' || p.status === 'awaiting')) {
-            p.status = 'failed';
-            p.note = 'Stopped: the app closed before this step finished. Nothing ran.';
-          }
-          if (p.kind === 'question' && p.answer === undefined) p.answer = null;
+function normalize(list: (Session & { connId?: string })[]): Session[] {
+  for (const s of list) {
+    // Before a chat had several databases, it belonged to one connection.
+    if (!s.sources) s.sources = s.connId ? [{ connId: s.connId, database: null }] : [];
+    delete s.connId;
+    for (const m of s.messages) {
+      // Chats saved before the demo asked questions in the reply keep only the parts the UI knows.
+      m.parts = m.parts.filter((p) => (p.kind as string) !== 'question');
+      for (const p of m.parts) {
+        if (p.kind === 'tool' && !p.tool) p.tool = LEGACY_KIND[p.name] ?? 'other';
+        if (p.kind === 'tool' && (p.status === 'running' || p.status === 'awaiting')) {
+          p.status = 'failed';
+          p.note = 'Stopped: the app closed before this step finished. Nothing ran.';
         }
+      }
     }
-    return list;
-  } catch (e) {
-    console.warn('Chat history is not readable; starting empty.', e);
-    return [];
   }
+  return list;
 }
 
 export const chat = $state({
-  sessions: load(),
+  sessions: readStored<Session[]>(KEY, [], {
+    migrate: (data) => (Array.isArray(data) ? normalize(data as (Session & { connId?: string })[]) : []),
+  }),
   /** The open session. null: the newest one; '': a new, empty chat. */
   open: null as string | null,
   /** Databases of the new, empty chat. null: the active tab's database, and it follows the tab. */
@@ -97,28 +49,13 @@ export const chat = $state({
   live: null as string | null,
   /** A proposed write that waits for Approve or Deny. */
   pending: null as null | { resolve: (ok: boolean) => void },
-  /** A question to the user that waits for an answer. */
-  question: null as null | { resolve: (answer: string | null) => void },
   /** Stops the running live reply; null when there is nothing to stop. */
   cancel: null as null | (() => void),
   /** A tool the model has started to call; its arguments still stream. null when there is none. */
-  starting: null as string | null,
+  starting: null as null | { kind: ToolKind; name: string },
 });
 
-let saveTimer: ReturnType<typeof setTimeout> | undefined;
-$effect.root(() => {
-  $effect(() => {
-    const json = JSON.stringify(chat.sessions);
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => {
-      try {
-        localStorage.setItem(KEY, json);
-      } catch (e) {
-        console.warn('Chat history was not saved.', e);
-      }
-    }, 300);
-  });
-});
+autosave(KEY, () => chat.sessions, { delay: 300, onError: (e) => console.warn('Chat history was not saved.', e) });
 
 export const sessionsByDate = () => [...chat.sessions].sort((a, b) => b.updated - a.updated);
 
@@ -135,11 +72,6 @@ export function openSession(id: string) {
   chat.draft = null;
 }
 
-export const connOf = (s: Source): Conn | undefined => db.connections.find((c) => c.id === s.connId);
-/** The database name of `s`; the connection's own database when the source has none. */
-export const dbOf = (s: Source, c = connOf(s)) => s.database ?? (c ? defaultDb(c) : '');
-export const sameSource = (a: Source, b: Source) => a.connId === b.connId && dbOf(a) === dbOf(b);
-
 /** The active tab's connection and database; null while there is no connection, or when a MongoDB
  * tab has no database to query (the chat needs one). */
 function tabSource(): Source | null {
@@ -151,7 +83,6 @@ function tabSource(): Source | null {
   return { connId: c.id, database };
 }
 
-/** Databases that `s` uses, or the new chat's databases. */
 export function scopeOf(s: Session | undefined): Source[] {
   if (s) return s.sources;
   if (chat.draft) return chat.draft;
@@ -202,37 +133,15 @@ export function deleteSession(id: string) {
 }
 
 export const decide = (ok: boolean) => chat.pending?.resolve(ok);
-export const answer = (a: string | null) => chat.question?.resolve(a);
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function stream(msg: Msg, text: string) {
-  msg.parts.push({ kind: 'text', text: '' });
-  const part = msg.parts[msg.parts.length - 1] as { kind: 'text'; text: string };
-  for (const w of text.split(/(\s+)/)) {
-    part.text += w;
-    await sleep(18);
-  }
-}
-
-async function tool(msg: Msg, t: ToolPart, ms = 600) {
-  msg.parts.push({ ...t, args: t.args ?? (t.name === 'describe_table' ? { table: t.sql } : { sql: t.sql }), started: Date.now() });
-  const live = msg.parts[msg.parts.length - 1] as ToolPart;
-  await sleep(ms);
-  return live;
-}
 
 function finish(t: ToolPart) {
   t.status = 'done';
   if (t.started) t.ms = Date.now() - t.started;
 }
 
-/** Rows of a read that the chat keeps; the backend sends the same number (`UI_ROWS`). */
-const CHAT_ROWS = 50;
-
 /** Runs the text of a finished read step again on the AI read path and replaces its rows. */
 export async function rerun(t: ToolPart) {
-  if ((t.name !== 'run_read_query' && t.name !== 'run_mongo_read') || !t.sql || t.status === 'running') return;
+  if (!isReadTool(t) || !t.sql || t.status === 'running') return;
   // Steps saved before they kept their database run on the active tab, as they did then.
   const conn = t.source ? connOf(t.source) : active();
   const tab = activeTab();
@@ -246,10 +155,10 @@ export async function rerun(t: ToolPart) {
   t.started = Date.now();
   t.error = undefined;
   try {
-    const r = await api.runAiRead(conn.id, database, t.sql);
+    const r = await api.runAiRead({ connId: conn.id, database, sql: t.sql });
     const cols = r.columns.map((c) => c.name);
-    t.rows = r.rows.slice(0, CHAT_ROWS).map((x) => Object.fromEntries(cols.map((c, i) => [c, x[i] as Cell])));
-    t.truncated = r.truncated || r.rows.length > CHAT_ROWS;
+    t.rows = r.rows.slice(0, UI_ROWS).map((x) => Object.fromEntries(cols.map((c, i) => [c, x[i] as Cell])));
+    t.truncated = r.truncated || r.rows.length > UI_ROWS;
     t.note = `${r.rows.length}${r.truncated ? ' (row limit reached)' : ''} row${r.rows.length === 1 ? '' : 's'} · ${r.elapsedMs} ms`;
     finish(t);
     logQuery({ conn, kind: 'READ', source: 'AI', sql: t.sql, result: { status: 'ok', rows: r.rows.length }, ms: t.ms ?? 0 });
@@ -261,18 +170,6 @@ export async function rerun(t: ToolPart) {
     t.ms = Date.now() - t.started;
     logQuery({ conn, kind: 'READ', source: 'AI', sql: t.sql, result: BLOCKED[err.code] ? { status: 'blocked' } : { status: 'error', message: err.message }, ms: 0 });
   }
-}
-
-async function ask(msg: Msg, text: string, options: string[]) {
-  msg.parts.push({ kind: 'question', text, options });
-  const part = msg.parts[msg.parts.length - 1] as QuestionPart;
-  ui.chatOpen = true;
-  const a = await new Promise<string | null>((resolve) => {
-    chat.question = { resolve };
-  });
-  chat.question = null;
-  part.answer = a;
-  return a;
 }
 
 export async function send(text: string) {
@@ -297,13 +194,10 @@ export async function send(text: string) {
   s.messages.push({ role: 'assistant', parts: [], started: Date.now() });
   const msg = s.messages[s.messages.length - 1];
   try {
-    // Mock mode scripts SQL flows only; a Mongo source anywhere gives a plain answer instead of fake steps.
-    const mongoConn = sources.map((x) => connOf(x)).find((c) => c?.engine === 'mongo');
-    if (api.kind === 'mock') await reply(msg, text, mongoConn ?? connOf(sources[0])!, !!mongoConn);
-    else await liveReply(msg, text, sources, history);
+    await liveReply(msg, text, sources, history);
   } finally {
     msg.ended = Date.now();
-    chat.live = chat.pending = chat.question = chat.cancel = chat.starting = null;
+    chat.live = chat.pending = chat.cancel = chat.starting = null;
   }
 }
 
@@ -321,9 +215,6 @@ function historyOf(messages: Msg[]): ChatRequest['history'] {
 /** Codes of a step the guard or the write policy refused: `BLOCKED`, never `FAILED`. */
 const BLOCKED: Partial<Record<ErrorCode, true>> = { guard_rejected: true, write_blocked: true, read_only_violation: true, connection_read_only: true };
 
-/** First number of a summary such as "5 rows · 42 ms". */
-const countIn = (summary: string) => Number(/^([\d,]+)/.exec(summary)?.[1].replace(/,/g, '') ?? NaN);
-
 // Real backends: the Rust tool loop streams its steps; this maps each event onto the reply's parts.
 async function liveReply(msg: Msg, text: string, sources: Source[], history: ChatRequest['history']) {
   const chatId = crypto.randomUUID();
@@ -331,7 +222,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
   let ended = false;
   chat.cancel = () => {
     stopped = true;
-    api.chatCancel(chatId).catch((e) => console.warn('The reply was not stopped.', ApiError.from(e).message));
+    api.chatCancel({ chatId }).catch((e) => console.warn('The reply was not stopped.', ApiError.from(e).message));
   };
   const fail = (code: string, message: string) => {
     msg.parts.push({ kind: 'error', text: code === 'cancelled' ? 'Stopped.' : message });
@@ -371,15 +262,15 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
         break;
       }
       case 'tool_starting':
-        chat.starting = e.name;
+        chat.starting = { kind: e.kind, name: e.name };
         break;
       case 'tool_call': {
-        if (chat.starting === e.name) chat.starting = null;
+        if (chat.starting?.name === e.name) chat.starting = null;
         const sql = typeof e.args.sql === 'string' ? e.args.sql : typeof e.args.query === 'string' ? e.args.query : typeof e.args.table === 'string' ? e.args.table : undefined;
         const started = Date.now();
         const i = sourceIn(e.args);
         const source = i < 0 ? undefined : { ...sources[i] };
-        msg.parts.push({ kind: 'tool', id: e.id, name: e.name, args: e.args, sql, status: 'running', started, source });
+        msg.parts.push({ kind: 'tool', tool: e.kind, id: e.id, name: e.name, args: e.args, sql, status: 'running', started, source });
         // A call that names no valid source fails in the backend; its audit entry goes to the first database.
         steps.set(e.id, { part: msg.parts[msg.parts.length - 1] as ToolPart, started, conn: conns[Math.max(i, 0)] });
         break;
@@ -398,7 +289,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
             chat.pending = null;
             part.status = 'running';
             if (ok) part.note = 'Running the write…';
-            (ok ? api.approveWrite : api.denyWrite)(chatId, e.id).catch((err) => {
+            (ok ? api.approveWrite({ chatId, id: e.id }) : api.denyWrite({ chatId, id: e.id })).catch((err) => {
               part.note = ApiError.from(err).message;
             });
           },
@@ -414,7 +305,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
         const { part, started, conn } = step;
         const blocked = !e.ok && !!e.error && !!BLOCKED[e.error.code];
         const denied = !e.ok && e.error?.code === 'write_denied';
-        const write = isWriteTool(part.name);
+        const write = isWriteTool(part);
         part.status = e.ok ? (write ? 'approved' : 'done') : denied ? 'denied' : blocked ? 'blocked' : 'failed';
         part.note = e.ok ? e.summary : (e.error?.message ?? e.summary);
         part.ms = Date.now() - started;
@@ -422,16 +313,18 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
         const columns = e.columns;
         if (e.ok && columns && e.rows?.length) part.rows = e.rows.map((r) => Object.fromEntries(columns.map((c, i) => [c, r[i] as Cell])));
         if (e.truncated) part.truncated = true;
-        if ((part.name === 'run_read_query' || part.name === 'run_mongo_read') && part.sql) {
-          const n = countIn(e.summary);
-          const result: AuditResult = e.ok ? { status: 'ok', rows: Number.isFinite(n) ? n : (e.rows?.length ?? 0) } : blocked ? { status: 'blocked' } : { status: 'error', message: e.error?.message ?? e.summary };
+        if (isReadTool(part) && part.sql) {
+          const rows = e.result?.rows ?? e.rows?.length ?? 0;
+          const result: AuditResult = e.ok ? { status: 'ok', rows } : blocked ? { status: 'blocked' } : { status: 'error', message: e.error?.message ?? e.summary };
           logQuery({ conn, kind: 'READ', source: 'AI', sql: part.sql, result, ms: e.ok ? Date.now() - started : 0 });
         }
         if (write && part.sql) {
-          const n = countIn(e.summary);
-          const ms = Number(/(\d+) ms$/.exec(e.summary)?.[1] ?? 0);
-          const result: AuditResult = e.ok ? { status: 'ok', rows: Number.isFinite(n) ? n : 0 } : e.error?.code === 'write_denied' ? { status: 'denied' } : blocked ? { status: 'blocked' } : { status: 'error', message: e.error?.message ?? e.summary };
+          const rows = e.result?.rows ?? 0;
+          const ms = e.result?.ms ?? 0;
+          const result: AuditResult = e.ok ? { status: 'ok', rows } : e.error?.code === 'write_denied' ? { status: 'denied' } : blocked ? { status: 'blocked' } : { status: 'error', message: e.error?.message ?? e.summary };
           logQuery({ conn, kind: 'WRITE', source: 'AI', sql: part.sql, result, ms: e.ok ? ms : 0 });
+          // An approved write can change the schema or create a collection the tree does not list.
+          if (e.ok) void afterWrite(conn, part.sql, part.source, part.info);
         }
         break;
       }
@@ -459,149 +352,11 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
       if (part.status === 'running') {
         part.status = 'failed';
         part.note = 'Stopped before this step finished.';
-      } else if (part.status === 'awaiting' && isWriteTool(part.name) && part.sql) {
+      } else if (part.status === 'awaiting' && isWriteTool(part) && part.sql) {
         part.status = 'failed';
         part.note = 'Stopped: the write was not approved, nothing ran.';
         logQuery({ conn, kind: 'WRITE', source: 'AI', sql: part.sql, result: { status: 'denied' }, ms: 0 });
       }
     }
   }
-}
-
-const WRITE = /\b(delete|remove|update|insert|drop|truncate|alter|mark)\b/i;
-
-/** The propose_* tools: their result is a write that needs (or got) approval. */
-const isWriteTool = (name: string) => name === 'propose_write' || name === 'propose_mongo_write';
-const find = (tables: string[], name: string) => tables.find((t) => t.toLowerCase() === name.toLowerCase());
-
-// Prototype only: scripted agent that mimics the real tool-calling loop.
-async function reply(msg: Msg, text: string, conn: Conn, mongo = false) {
-  // Mock mode has no scripted Mongo flow: a Mongo source gets a plain answer, not fake tool steps.
-  if (mongo || conn.engine === 'mongo') {
-    await stream(msg, `I can read MongoDB collections on **${conn.name}**, but the demo build has no scripted Mongo answers. Ask a question about a collection and the live assistant will query it.`);
-    return;
-  }
-  const schema = schemas[conn.schema];
-  const tables = Object.keys(schema);
-  const wantsSqlBlock = /\bsql\s+(?:block|code|snippet)\b/i.test(text);
-
-  if (WRITE.test(text) && !wantsSqlBlock) {
-    const t1 = await tool(msg, { kind: 'tool', name: 'describe_table', sql: tables[0], status: 'running' }, 500);
-    finish(t1);
-    t1.note = `${schema[tables[0]].length} columns · 48,210 rows`;
-    const sql = "DELETE FROM public.orders\nWHERE status = 'cancelled'\n  AND created_at < now() - interval '90 days';";
-    const c = await tool(msg, { kind: 'tool', name: 'run_read_query', sql: "SELECT count(*) FROM public.orders\nWHERE status = 'cancelled' AND created_at < now() - interval '90 days';", status: 'running' });
-    finish(c);
-    c.rows = [{ count: 214 }];
-    logQuery({ conn, kind: 'READ', source: 'AI', sql: c.sql!, result: { status: 'ok', rows: 1 }, ms: 58 });
-    const w = await tool(msg, { kind: 'tool', name: 'propose_write', sql, status: conn.aiWrite ? 'awaiting' : 'blocked' }, 300);
-
-    if (!conn.aiWrite) {
-      w.note = `Blocked: the assistant is read-only on ${conn.name}.`;
-      logQuery({ conn, kind: 'WRITE', source: 'AI', sql, result: { status: 'blocked' }, ms: 0 });
-      await stream(msg, "This would delete **214** cancelled orders older than 90 days. I can't run it because the assistant is read-only. Turn on write mode with the shield button, or copy the SQL into the editor and run it yourself.");
-    } else {
-      ui.chatOpen = true;
-      const ok = await new Promise<boolean>((resolve) => {
-        chat.pending = { resolve };
-      });
-      chat.pending = null;
-      w.status = ok ? 'approved' : 'denied';
-      w.note = ok ? '214 rows affected · committed' : 'You denied this statement. Nothing changed.';
-      logQuery({ conn, kind: 'WRITE', source: 'AI', sql, result: ok ? { status: 'ok', rows: 214 } : { status: 'denied' }, ms: ok ? 296 : 0 });
-      await stream(msg, ok ? 'Done. I deleted 214 cancelled orders inside one transaction. The change is in the audit log.' : 'OK, I did not run it. The data is unchanged.');
-    }
-    return;
-  }
-
-  // Mock only: an answer with a SQL code block, to exercise the Run menu in the chat.
-  if (/\bjson\s+(?:block|code)\b/i.test(text)) {
-    await stream(msg, 'Here is the payload:\n\n```json\n{"status":"paid","orders":3}\n```\n\nCopy it or use it as a reference.');
-    return;
-  }
-  if (wantsSqlBlock) {
-    const write = /\b(?:update|delete|insert|drop|write)\b/i.test(text);
-    const sql = write
-      ? "UPDATE public.orders\nSET status = 'paid'\nWHERE id = 1;"
-      : 'SELECT *\nFROM public.orders\nLIMIT 10;';
-    const tail = write ? 'Use Insert into editor to review it before running.' : 'Pick Run to execute it.';
-    await stream(msg, `Here is the query:\n\n\`\`\`sql\n${sql}\n\`\`\`\n\n${tail}`);
-    return;
-  }
-
-  // A table named in the message ("table notes", "from notes", "from table notes"), else any table name in the text.
-  const named = /\b(?:from|table)\s+(?:table\s+)?[`"']?(\w+)/i.exec(text)?.[1];
-  let target = named ? find(tables, named) : tables.find((t) => new RegExp(`\\b${t}\\b`, 'i').test(text));
-
-  if (!named && schema.orders && /\b(chart|graph|plot|report)\b/i.test(text)) {
-    const q = await tool(msg, { kind: 'tool', name: 'render_chart', sql: 'SELECT status, sum(total) AS revenue\nFROM public.orders\nGROUP BY status\nORDER BY revenue DESC;', status: 'running' }, 800);
-    finish(q);
-    q.note = 'Bar chart · 5 rows · 84 ms';
-    msg.parts.push({
-      kind: 'chart',
-      spec: { type: 'bar', title: 'Revenue by order status', x: 'status', y: ['revenue'], stacked: false },
-      columns: ['status', 'revenue'],
-      rows: [['paid', 1843210.5], ['shipped', 1290442.1], ['pending', 402118.0], ['cancelled', 0], ['refunded', -98220.4]],
-      truncated: false,
-    });
-    const m = await tool(msg, { kind: 'tool', name: 'render_chart', sql: "SELECT date_trunc('month', created_at) AS month, sum(total) AS revenue, count(*) AS orders\nFROM public.orders\nGROUP BY 1\nORDER BY 1;", status: 'running' }, 800);
-    finish(m);
-    m.note = 'Line chart · 6 rows · 61 ms';
-    msg.parts.push({
-      kind: 'chart',
-      spec: { type: 'line', title: 'Monthly revenue', x: 'month', y: ['revenue'], stacked: false },
-      columns: ['month', 'revenue'],
-      rows: [['2026-05', 512300], ['2026-06', 548120], ['2026-07', 601880], ['2026-08', 587400], ['2026-09', 642950], ['2026-10', 695210]],
-      truncated: false,
-    });
-    await stream(
-      msg,
-      '# Orders revenue report\n\nRevenue grew in five of the last six months. **Paid** orders bring most of the revenue.\n\n## Revenue by status\n\n| Status | Revenue |\n|---|---:|\n| paid | $1,843,210 |\n| shipped | $1,290,442 |\n| pending | $402,118 |\n| refunded | −$98,220 |\n\n## Findings\n\n- October is the best month so far ($695K).\n- Refunds remove about 2.5% of gross revenue.\n- About 8% of orders are cancelled.',
-    );
-    return;
-  }
-
-  if (!target && !named && schema.orders && /\b(orders?|revenue)\b/i.test(text)) {
-    const t1 = await tool(msg, { kind: 'tool', name: 'describe_table', sql: 'orders', status: 'running' }, 500);
-    finish(t1);
-    t1.note = `${schema.orders.length} columns · 48,210 rows`;
-    const q = await tool(msg, { kind: 'tool', name: 'run_read_query', sql: 'SELECT status, count(*) AS orders, sum(total) AS revenue\nFROM public.orders\nGROUP BY status\nORDER BY revenue DESC;', status: 'running' }, 800);
-    finish(q);
-    logQuery({ conn, kind: 'READ', source: 'AI', sql: q.sql!, result: { status: 'ok', rows: 5 }, ms: 84 });
-    q.rows = [
-      { status: 'paid', orders: 21480, revenue: 1843210.5 },
-      { status: 'shipped', orders: 15120, revenue: 1290442.1 },
-      { status: 'pending', orders: 6230, revenue: 402118.0 },
-      { status: 'cancelled', orders: 3910, revenue: 0 },
-      { status: 'refunded', orders: 1470, revenue: -98220.4 },
-    ];
-    await stream(msg, '**Paid** orders bring the most revenue ($1.84M from 21,480 orders), then **shipped** ($1.29M). About 8% of orders are cancelled, and refunds remove about $98K.');
-    return;
-  }
-
-  if (!target) {
-    await sleep(400);
-    const question = named ? `I can't find a table named **${named}** on ${conn.name}. Which table do you mean?` : `Which table on ${conn.name} should I look at?`;
-    const a = await ask(msg, question, tables);
-    if (a === null) {
-      await stream(msg, 'OK. Tell me which table to use when you are ready.');
-      return;
-    }
-    target = find(tables, a.trim()) ?? tables.find((t) => new RegExp(`\\b${t}\\b`, 'i').test(a));
-    if (!target) {
-      await stream(msg, `I can't find **${a.trim()}** either. The tables on ${conn.name} are: ${tables.join(', ')}.`);
-      return;
-    }
-  }
-
-  const data = tableData(schema, target);
-  const total = data.base.length + data.added.length;
-  const t1 = await tool(msg, { kind: 'tool', name: 'describe_table', sql: target, status: 'running' }, 500);
-  finish(t1);
-  t1.note = `${schema[target].length} columns · ${total.toLocaleString()} rows`;
-  const q = await tool(msg, { kind: 'tool', name: 'run_read_query', sql: `SELECT *\nFROM ${nsOf(conn.engine, target)}.${target}\nLIMIT 5;`, status: 'running' }, 700);
-  finish(q);
-  q.rows = data.base.slice(0, 5);
-  logQuery({ conn, kind: 'READ', source: 'AI', sql: q.sql!, result: { status: 'ok', rows: q.rows.length }, ms: 41 });
-  await stream(msg, `Here are the first ${q.rows.length} rows of **${target}** (${total.toLocaleString()} rows in total). Ask me to filter or summarize them.`);
 }

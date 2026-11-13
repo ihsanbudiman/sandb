@@ -1,13 +1,13 @@
 import { getCurrentWindow, Effect } from '@tauri-apps/api/window';
 import { api } from './api';
+import { readStored, writeStored } from './persist.svelte';
 import { ui } from './state.svelte';
 
 export type Theme = 'light' | 'dark' | 'system';
-/** What shows behind the app: the plain canvas, a picked image, or the desktop (see-through window). */
 export type Backdrop = 'none' | 'image' | 'desktop';
 
 /** Only the desktop app has a transparent window. In a browser tab there is nothing behind the page. */
-export const canSeeThrough = api.kind === 'tauri';
+export const canSeeThrough = api.capabilities.windowEffects;
 
 const KEY = 'sandb.appearance';
 // The image is large, so it has its own key: a slider move does not write it again.
@@ -34,16 +34,11 @@ const defaults = {
 
 export const look = $state({ ...defaults, image: '' });
 
-/** True when a backdrop shows: an image is set, or the window is see-through. */
 export const backdropOn = () => (look.backdrop === 'image' ? !!look.image : look.backdrop === 'desktop' && canSeeThrough);
 
 function save() {
   const { backdrop, tint, panels, imageBlur, panelBlur, vibrancy } = look;
-  try {
-    localStorage.setItem(KEY, JSON.stringify({ theme: ui.theme, backdrop, tint, panels, imageBlur, panelBlur, vibrancy }));
-  } catch (e) {
-    console.warn('Appearance was not saved.', e);
-  }
+  writeStored(KEY, { theme: ui.theme, backdrop, tint, panels, imageBlur, panelBlur, vibrancy }, { delay: 200, onError: (e) => console.warn('Appearance was not saved.', e) });
 }
 
 // The window starts with no native effect, so the first sync only calls the API when the effect is wanted.
@@ -94,12 +89,7 @@ export function toggleTheme() {
 
 /** Reads the stored appearance and applies it. Call once, before the app mounts. */
 export function loadAppearance() {
-  let stored: Partial<typeof defaults & { theme: Theme }> = {};
-  try {
-    stored = JSON.parse(localStorage.getItem(KEY) ?? '{}') ?? {};
-  } catch (e) {
-    console.warn('Stored appearance is not readable; using the defaults.', e);
-  }
+  const stored = readStored<Partial<typeof defaults & { theme: Theme }>>(KEY, {}, { migrate: (data) => (data && typeof data === 'object' ? (data as Partial<typeof defaults & { theme: Theme }>) : {}) });
   for (const k of Object.keys(defaults) as (keyof typeof defaults)[]) {
     if (typeof stored[k] === typeof defaults[k]) (look as Record<string, unknown>)[k] = stored[k];
   }

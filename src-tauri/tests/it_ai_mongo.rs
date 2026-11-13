@@ -6,60 +6,29 @@
 //! dropped before the asserts.
 #![cfg(feature = "it")]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+mod common;
 
 use mongodb::bson::{Document, doc};
-use serde_json::Value;
-
-use sandb_lib::core::ai::session::{self, ChatEvent, ChatRequest, ChatRole, ChatSource, ChatTurn};
+use common::{
+    Cleanup, Ctx, assert_done, offered_tools, recorded_with, text, tool, tool_contents, tools,
+};
+use sandb_lib::core::ai::event::ChatEvent;
+use sandb_lib::core::ai::session::{self, ChatRequest, ChatRole, ChatSource, ChatTurn};
 use sandb_lib::core::ai::settings::{self, AiSettings, Privacy};
-use sandb_lib::core::connections::{self, Connection, ConnectionInput, Engine, Env, SslMode};
-use sandb_lib::core::db::readonly::ReadLimits;
-use sandb_lib::core::error::{AppError, ErrorCode};
+use sandb_lib::core::connections::{Connection, ConnectionInput};
+use sandb_lib::core::result::ReadLimits;
+use sandb_lib::core::engine::Engine;
+use sandb_lib::core::error::ErrorCode;
 use sandb_lib::core::mongo;
-use sandb_lib::core::secrets::MemoryStore;
-use sandb_lib::core::state::AppState;
-
-const MONGO_RS: u16 = 57017;
-const MONGO_STANDALONE: u16 = 57018;
-const PG16: u16 = 55416;
-const MONGO_DB: &str = "shop_staging";
 
 /// Every chat builds the prompt's schema snapshot of `shop_staging`, which samples `big_docs`
 /// (about 200 MB). Parallel samples run the small test Mongo out of memory, so the tests take
 /// turns.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn mock_url() -> String {
-    std::env::var("SANDB_MOCK_LLM_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:58080/v1".into())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn env_test() -> HashMap<String, String> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdb/.env.test");
-    let raw =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
-}
-
-struct Ctx {
-    _dir: tempfile::TempDir,
-    st: AppState,
-    /// The Mongo connection (`shop_staging`).
-    mongo: Connection,
-}
-
 fn ai_settings(privacy: Privacy) -> AiSettings {
     AiSettings {
-        provider: "mock".into(),
-        base_url: mock_url(),
+        base_url: common::mock_url(),
         model: "mock-gpt".into(),
         privacy,
         ..Default::default()
@@ -67,69 +36,40 @@ fn ai_settings(privacy: Privacy) -> AiSettings {
 }
 
 fn input(name: &str, engine: Engine, port: u16, database: &str) -> ConnectionInput {
-    let e = env_test();
-    let mongo = engine == Engine::Mongo;
-    ConnectionInput {
-        name: name.into(),
-        engine,
-        env: Env::Local,
-        host: "127.0.0.1".into(),
-        port,
-        database: database.into(),
-        user: e.get("SANDB_RW_USER").cloned().unwrap_or("sandb_rw".into()),
-        ssl: if mongo {
-            SslMode::Disable
-        } else {
-            SslMode::Prefer
-        },
-        file: String::new(),
-        ai_write: false,
-        read_only: false,
-        version: None,
-        uri: String::new(),
-        auth_source: if mongo { "admin".into() } else { String::new() },
-        topology: None,
-    }
-}
-
-fn password() -> String {
-    env_test()
-        .get("SANDB_RW_PASSWORD")
-        .cloned()
-        .expect("SANDB_RW_PASSWORD in testdb/.env.test")
+    let mut i = if engine == Engine::Mongo {
+        common::mongo_input(name, port, &common::rw_user(), database, false)
+    } else {
+        common::sql_input(name, engine, port, false)
+    };
+    i.name = name.into();
+    i.database = database.into();
+    // AI writes on: each chat sends its own `allowWrites`, which the tests vary.
+    i.ai_write = true;
+    i
 }
 
 /// The stack's root user at `port`, whose roles reach every command: `sandb_rw` cannot run
 /// `serverStatus`, so the read-command sweep needs root.
 fn root(port: u16) -> ConnectionInput {
-    let mut input = input("it-ai-mongo-root", Engine::Mongo, port, MONGO_DB);
+    let mut input = common::mongo_input(
+        "ai-mongo-root",
+        port,
+        "root",
+        common::seed::STAGING,
+        false,
+    );
     input.name = format!("it-ai-mongo-root-{}", uuid::Uuid::new_v4().simple());
-    input.user = "root".into();
     input
 }
 
-fn root_password() -> String {
-    env_test()
-        .get("MONGO_INITDB_ROOT_PASSWORD")
-        .cloned()
-        .expect("MONGO_INITDB_ROOT_PASSWORD in testdb/.env.test")
-}
-
 fn setup(privacy: Privacy) -> Ctx {
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
-    let mongo = connections::create(
-        &st,
-        input("it-ai-mongo", Engine::Mongo, MONGO_RS, MONGO_DB),
-        Some(password()),
-    )
-    .unwrap();
-    settings::save(&st, ai_settings(privacy)).unwrap();
-    Ctx {
-        _dir: dir,
-        st,
-        mongo,
-    }
+    let ctx = common::ctx(
+        "ai-mongo",
+        input("it-ai-mongo", Engine::Mongo, common::mongo_rs(), common::seed::STAGING),
+        Some(common::rw_password()),
+    );
+    settings::save(&ctx.st, ai_settings(privacy)).unwrap();
+    ctx
 }
 
 fn source(conn: &Connection, allow_writes: bool) -> ChatSource {
@@ -163,14 +103,14 @@ async fn chat_on(
         },
         |e| {
             if let ChatEvent::WritePreview { id, .. } = &e {
-                ctx.st.approvals.decide(&chat_id, id, approve).unwrap();
+                session::decide(&ctx.st, &chat_id, id, approve).unwrap();
             }
             events.push(e);
             true
         },
     )
     .await;
-    assert!(!ctx.st.chats.is_running(&chat_id), "registry entry left");
+    assert!(!ctx.st.chats().is_running(&chat_id), "registry entry left");
     events
 }
 
@@ -178,70 +118,22 @@ async fn chat_on(
 async fn chat(ctx: &Ctx, message: &str, allow_writes: bool, approve: bool) -> Vec<ChatEvent> {
     chat_on(
         ctx,
-        vec![source(&ctx.mongo, allow_writes)],
+        vec![source(&ctx.conn, allow_writes)],
         message,
         approve,
     )
     .await
 }
 
-/// Exactly one terminal event, it is the last one, and it is `Done`.
-fn assert_done(events: &[ChatEvent]) {
-    let terminal = events
-        .iter()
-        .filter(|e| matches!(e, ChatEvent::Done | ChatEvent::Error { .. }))
-        .count();
-    assert_eq!(terminal, 1, "{events:#?}");
-    assert_eq!(events.last(), Some(&ChatEvent::Done), "{events:#?}");
-}
-
-fn text(events: &[ChatEvent]) -> String {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            ChatEvent::Text { delta } => Some(delta.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Each tool call with its result, in call order.
-fn tools(events: &[ChatEvent]) -> Vec<(&str, &Value, &ChatEvent)> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            ChatEvent::ToolCall { id, name, args } => Some((id, name, args)),
-            _ => None,
-        })
-        .map(|(id, name, args)| {
-            let result = events
-                .iter()
-                .find(|e| matches!(e, ChatEvent::ToolResult { id: rid, .. } if rid == id))
-                .unwrap_or_else(|| panic!("no tool_result for {id}: {events:#?}"));
-            (name.as_str(), args, result)
-        })
-        .collect()
-}
-
-/// The single tool call and its result.
-fn tool(events: &[ChatEvent]) -> (&str, &Value, &ChatEvent) {
-    let all = tools(events);
-    assert_eq!(all.len(), 1, "{events:#?}");
-    all[0]
-}
-
-/// A fresh scratch collection name, `ai_it_` + 32 lowercase hex characters.
-fn scratch() -> String {
-    format!("ai_it_{}", uuid::Uuid::new_v4().simple())
-}
-
 async fn client(ctx: &Ctx) -> mongodb::Client {
-    mongo::client::client(&ctx.st, &ctx.mongo.id).await.unwrap()
+    mongo::client::client(ctx.st.as_ref(), &ctx.conn.id)
+        .await
+        .unwrap()
 }
 
 async fn exists(client: &mongodb::Client, coll: &str) -> bool {
     client
-        .database(MONGO_DB)
+        .database(common::seed::STAGING)
         .list_collection_names()
         .filter(doc! { "name": coll })
         .await
@@ -251,138 +143,11 @@ async fn exists(client: &mongodb::Client, coll: &str) -> bool {
 
 async fn count(client: &mongodb::Client, coll: &str) -> u64 {
     client
-        .database(MONGO_DB)
+        .database(common::seed::STAGING)
         .collection::<Document>(coll)
         .count_documents(doc! {})
         .await
         .unwrap()
-}
-
-/// Drops the scratch names a test made when the test ends, also while a failed test unwinds.
-/// `Drop` cannot use the test's client or runtime (both are being torn down after a panic), so it
-/// opens its own root client on its own thread.
-struct Cleanup {
-    uri: String,
-    collections: Vec<String>,
-}
-
-impl Cleanup {
-    /// A guard for scratch collections on the server at `port`.
-    fn new(port: u16) -> Self {
-        let password = env_test()
-            .get("MONGO_INITDB_ROOT_PASSWORD")
-            .cloned()
-            .expect("MONGO_INITDB_ROOT_PASSWORD in testdb/.env.test");
-        Self {
-            uri: format!("mongodb://root:{password}@127.0.0.1:{port}/admin"),
-            collections: Vec::new(),
-        }
-    }
-
-    /// Tracks `coll` and returns it.
-    fn collection(&mut self, coll: impl Into<String>) -> String {
-        let coll = coll.into();
-        self.collections.push(coll.clone());
-        coll
-    }
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        if self.collections.is_empty() {
-            return;
-        }
-        let uri = self.uri.clone();
-        let collections = std::mem::take(&mut self.collections);
-        let joined = std::thread::Builder::new()
-            .name("it-mongo-cleanup".into())
-            .spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                rt.block_on(async move {
-                    let Ok(client) = mongodb::Client::with_uri_str(uri).await else {
-                        return;
-                    };
-                    for coll in collections {
-                        let _ = client
-                            .database(MONGO_DB)
-                            .collection::<Document>(&coll)
-                            .drop()
-                            .await;
-                    }
-                });
-            })
-            .map(|h| h.join());
-        let _ = joined;
-    }
-}
-
-/// Drops a scratch collection; one that was never created is fine.
-async fn drop_scratch(client: &mongodb::Client, coll: &str) {
-    if let Err(e) = client
-        .database(MONGO_DB)
-        .collection::<Document>(coll)
-        .drop()
-        .await
-    {
-        let e = AppError::from(e);
-        assert_eq!(
-            e.server_code.as_deref(),
-            Some("MongoDB error 26"), // NamespaceNotFound
-            "drop {coll}: {e:?}"
-        );
-    }
-}
-
-/// Request bodies the mock recorded whose user messages contain `marker`.
-async fn recorded_with(marker: &str) -> Vec<Value> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let root = mock_url();
-    let root = root.strip_suffix("/v1").unwrap_or(&root);
-    let bytes = reqwest::get(format!("{root}/_requests"))
-        .await
-        .expect("mock /_requests")
-        .error_for_status()
-        .expect("mock /_requests status (is the mock up to date?)")
-        .bytes()
-        .await
-        .unwrap();
-    let all: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
-    all.into_iter()
-        .filter(|b| {
-            b["messages"].as_array().is_some_and(|m| {
-                m.iter().any(|m| {
-                    m["role"] == "user" && m["content"].as_str().is_some_and(|c| c.contains(marker))
-                })
-            })
-        })
-        .collect()
-}
-
-/// The `tool` message contents of the last recorded request.
-fn tool_contents(bodies: &[Value]) -> Vec<Value> {
-    bodies
-        .last()
-        .and_then(|b| b["messages"].as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|m| m["role"] == "tool")
-        .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
-        .collect()
-}
-
-/// The tool names offered in the first recorded request.
-fn offered_tools(bodies: &[Value]) -> Vec<String> {
-    bodies[0]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|t| t["function"]["name"].as_str().unwrap().to_string())
-        .collect()
 }
 
 #[tokio::test]
@@ -400,7 +165,7 @@ async fn mongo_read_runs_and_sends_documents() {
                 .as_str()
                 .unwrap()
                 .starts_with("db.orders.find("),
-            "{args}"
+            "{args:?}"
         );
         let ChatEvent::ToolResult {
             ok,
@@ -547,11 +312,11 @@ async fn an_approved_mongo_write_commits() {
     let _serial = SERIAL.lock().await;
     let ctx = setup(Privacy::Results);
     let client = client(&ctx).await;
-    let mut clean = Cleanup::new(MONGO_RS);
-    let coll = clean.collection(scratch());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
     let events = chat(&ctx, &format!("mongo write {coll}"), true, true).await;
     let docs = count(&client, &coll).await;
-    drop_scratch(&client, &coll).await;
+    common::drop_scratch(&client, common::seed::STAGING, &coll).await;
     match preview_then_result(&events, &coll) {
         ChatEvent::ToolResult { ok, summary, .. } => {
             assert!(ok, "{summary}");
@@ -571,11 +336,11 @@ async fn a_denied_mongo_write_runs_nothing() {
     let _serial = SERIAL.lock().await;
     let ctx = setup(Privacy::Results);
     let client = client(&ctx).await;
-    let mut clean = Cleanup::new(MONGO_RS);
-    let coll = clean.collection(scratch());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
     let events = chat(&ctx, &format!("mongo write {coll}"), true, false).await;
     let created = exists(&client, &coll).await;
-    drop_scratch(&client, &coll).await;
+    common::drop_scratch(&client, common::seed::STAGING, &coll).await;
     match preview_then_result(&events, &coll) {
         ChatEvent::ToolResult { ok, error, .. } => {
             assert!(!ok);
@@ -591,11 +356,11 @@ async fn a_mongo_write_with_write_mode_off_is_blocked() {
     let _serial = SERIAL.lock().await;
     let ctx = setup(Privacy::Results);
     let client = client(&ctx).await;
-    let mut clean = Cleanup::new(MONGO_RS);
-    let coll = clean.collection(scratch());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
     let events = chat(&ctx, &format!("mongo write {coll}"), false, true).await;
     let created = exists(&client, &coll).await;
-    drop_scratch(&client, &coll).await;
+    common::drop_scratch(&client, common::seed::STAGING, &coll).await;
     assert_done(&events);
     assert!(
         !events
@@ -620,15 +385,15 @@ async fn out_stage_is_refused_by_the_guard() {
     let _serial = SERIAL.lock().await;
     let ctx = setup(Privacy::Results);
     let client = client(&ctx).await;
-    let mut clean = Cleanup::new(MONGO_RS);
-    let coll = clean.collection(scratch());
+    let mut clean = Cleanup::new(common::mongo_rs());
+    let coll = clean.collection(common::scratch());
     let events = chat(&ctx, &format!("mongo out {coll}"), true, true).await;
     let created = exists(&client, &coll).await;
-    drop_scratch(&client, &coll).await;
+    common::drop_scratch(&client, common::seed::STAGING, &coll).await;
     assert_done(&events);
     let (name, args, result) = tool(&events);
     assert_eq!(name, "run_mongo_read");
-    assert!(args["query"].as_str().unwrap().contains("$out"), "{args}");
+    assert!(args["query"].as_str().unwrap().contains("$out"), "{args:?}");
     match result {
         ChatEvent::ToolResult {
             ok, error, summary, ..
@@ -648,16 +413,22 @@ async fn out_stage_is_refused_by_the_guard() {
 async fn mixed_chat_runs_each_call_on_its_own_source() {
     let _serial = SERIAL.lock().await;
     let ctx = setup(Privacy::Results);
-    let pg = connections::create(
-        &ctx.st,
-        input("it-ai-mixed-pg16", Engine::Pg, PG16, "shop"),
-        Some(password()),
-    )
-    .unwrap();
+    let pg = ctx
+        .st
+        .create_connection(
+            input(
+                "it-ai-mixed-pg16",
+                Engine::Pg,
+                common::pg16(),
+                common::seed::SHOP,
+            ),
+            Some(common::rw_password()),
+        )
+        .unwrap();
     let marker = format!("marker-{}", uuid::Uuid::new_v4().simple());
     let events = chat_on(
         &ctx,
-        vec![source(&pg, false), source(&ctx.mongo, false)],
+        vec![source(&pg, false), source(&ctx.conn, false)],
         &format!("mixed {marker}"),
         false,
     )
@@ -740,18 +511,25 @@ async fn read_run_commands_accept_the_ai_max_time() {
         "db.runCommand({ whatsmyuri: 1 })",
         "db.runCommand({ explain: { find: 'orders' } })",
     ];
-    let mut failures = Vec::new();
-    for port in [MONGO_RS, MONGO_STANDALONE] {
-        let conn = connections::create(&ctx.st, root(port), Some(root_password())).unwrap();
+    for port in [common::mongo_rs(), common::mongo_standalone()] {
+        let conn = ctx
+            .st
+            .create_connection(root(port), Some(common::root_password()))
+            .unwrap();
         for text in commands {
-            let r =
-                mongo::ai::read(&ctx.st, &conn, Some(MONGO_DB), text, ReadLimits::default()).await;
-            match r {
+            match mongo::ai::read(
+                ctx.st.as_ref(),
+                &conn,
+                Some(common::seed::STAGING),
+                text,
+                ReadLimits::default(),
+            )
+            .await
+            {
                 Ok(r) if !r.rows.is_empty() => {}
-                Ok(r) => failures.push(format!("{port} {text}: no rows ({r:?})")),
-                Err(e) => failures.push(format!("{port} {text}: {e:?}")),
+                Ok(r) => panic!("{port} {text}: no rows ({r:?})"),
+                Err(e) => panic!("{port} {text}: {e:?}"),
             }
         }
     }
-    assert!(failures.is_empty(), "{failures:#?}");
 }

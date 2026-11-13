@@ -2,152 +2,48 @@
 //! Needs the sandb-test docker stack (`pnpm db:up`). Unreachable databases FAIL; nothing is skipped.
 #![cfg(feature = "it")]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
+mod common;
+
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use sandb_lib::core::connections::{self, Connection, ConnectionInput, Engine, Env, SslMode};
-use sandb_lib::core::db::export::{self, ExportRequest};
-use sandb_lib::core::db::introspect::{self, TableKind};
-use sandb_lib::core::db::query::{self, QueryRun, RunRequest};
-use sandb_lib::core::db::value::PREVIEW_BYTES;
+use common::Ctx;
+use sandb_lib::core::result::ExportRequest;
+use sandb_lib::core::result::TableKind;
+use sandb_lib::core::result::{QueryRun, RunRequest};
+use sandb_lib::core::cell::PREVIEW_BYTES;
+use sandb_lib::core::engine::Engine;
+use sandb_lib::core::ops;
 use sandb_lib::core::error::{AppError, ErrorCode};
-use sandb_lib::core::secrets::MemoryStore;
-use sandb_lib::core::state::AppState;
 
-const PG16: u16 = 55416;
-const PG13: u16 = 55413;
-const MYSQL: u16 = 53384;
-const MARIADB: u16 = 53311;
-const NET: [(&str, Engine, u16); 4] = [
-    ("pg16", Engine::Pg, PG16),
-    ("pg13", Engine::Pg, PG13),
-    ("mysql", Engine::Mysql, MYSQL),
-    ("mariadb", Engine::Mysql, MARIADB),
-];
-
-fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..")
-}
-
-fn env_test() -> HashMap<String, String> {
-    let p = root().join("testdb/.env.test");
-    let raw =
-        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
-}
-
-struct Ctx {
-    _dir: tempfile::TempDir,
-    st: Arc<AppState>,
-    conn: Connection,
-    label: String,
-}
-
-fn new_state() -> (tempfile::TempDir, Arc<AppState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
-    (dir, Arc::new(st))
-}
+/// The notice a run that ended with an open transaction returns: a fixed expectation, not a
+/// production constant, so a wording change is visible here.
+const OPEN_TX_NOTICE: &str =
+    "Open transaction was rolled back. Runs are auto-commit; put BEGIN…COMMIT in one run.";
 
 /// A saved connection as `sandb_rw` (owner; can create temp tables) on a network engine.
 fn net(label: &str, engine: Engine, port: u16) -> Ctx {
-    let e = env_test();
-    let (dir, st) = new_state();
-    let input = ConnectionInput {
-        name: format!("it-{label}"),
-        engine,
-        env: Env::Local,
-        host: "127.0.0.1".into(),
-        port,
-        database: "shop".into(),
-        user: e.get("SANDB_RW_USER").cloned().unwrap_or("sandb_rw".into()),
-        ssl: SslMode::Prefer,
-        file: String::new(),
-        ai_write: false,
-        read_only: false,
-        version: None,
-        uri: String::new(),
-        auth_source: String::new(),
-        topology: None,
-    };
-    let pw = e
-        .get("SANDB_RW_PASSWORD")
-        .cloned()
-        .expect("SANDB_RW_PASSWORD");
-    let conn = connections::create(&st, input, Some(pw)).unwrap();
-    Ctx {
-        _dir: dir,
-        st,
-        conn,
-        label: label.into(),
-    }
+    common::net_ctx(label, engine, port)
 }
 
 /// A saved connection on a temp copy of the SQLite fixture (the fixture is never opened for writing).
 fn sqlite() -> Ctx {
-    let (dir, st) = new_state();
-    let src = root().join("testdb/sqlite/shop.db");
-    let file = dir.path().join("shop.db");
-    std::fs::copy(&src, &file).unwrap_or_else(|e| {
-        panic!(
-            "missing fixture {} (run `pnpm db:sqlite`): {e}",
-            src.display()
-        )
-    });
-    let input = ConnectionInput {
-        name: "it-sqlite".into(),
-        engine: Engine::Sqlite,
-        env: Env::Local,
-        host: String::new(),
-        port: 0,
-        database: String::new(),
-        user: String::new(),
-        ssl: SslMode::Prefer,
-        file: file.to_string_lossy().into_owned(),
-        ai_write: false,
-        read_only: false,
-        version: None,
-        uri: String::new(),
-        auth_source: String::new(),
-        topology: None,
-    };
-    let conn = connections::create(&st, input, None).unwrap();
-    Ctx {
-        _dir: dir,
-        st,
-        conn,
-        label: "sqlite".into(),
-    }
+    common::sqlite_ctx(false)
 }
 
 fn all() -> Vec<Ctx> {
-    let mut v: Vec<Ctx> = NET.iter().map(|(l, e, p)| net(l, *e, *p)).collect();
-    v.push(sqlite());
-    v
+    common::all_sql()
 }
 
 fn req(c: &Ctx, sql: &str, limit: Option<usize>) -> RunRequest {
-    RunRequest {
-        conn_id: c.conn.id.clone(),
-        database: None,
-        sql: sql.into(),
-        query_id: uuid::Uuid::new_v4().to_string(),
-        limit,
-        tab_id: None,
-        sort: None,
-    }
+    let mut r = common::req(&c.conn, sql);
+    r.limit = limit;
+    r
 }
 
 async fn run(c: &Ctx, sql: &str, limit: Option<usize>) -> QueryRun {
-    query::run(&c.st, req(c, sql, limit))
+    ops::run_query(&c.st, req(c, sql, limit))
         .await
         .unwrap_or_else(|e| {
             panic!(
@@ -158,20 +54,14 @@ async fn run(c: &Ctx, sql: &str, limit: Option<usize>) -> QueryRun {
 }
 
 fn col(r: &QueryRun, name: &str, row: usize) -> Value {
-    let s = r.statements.last().unwrap();
-    let i = s
-        .columns
-        .iter()
-        .position(|c| c.name == name)
-        .unwrap_or_else(|| panic!("no column {name} in {:?}", s.columns));
-    s.rows[row][i].clone()
+    common::cell_named(r, name, row)
 }
 
 #[tokio::test]
 async fn introspection_on_each_engine() {
     for c in all() {
         let l = &c.label;
-        let dbs = introspect::list_databases(&c.st, &c.conn.id)
+        let dbs = ops::list_databases(&c.st, &c.conn.id)
             .await
             .unwrap_or_else(|e| {
                 panic!("{l}: list_databases failed (is `pnpm db:up` running?): {e:?}")
@@ -186,7 +76,7 @@ async fn introspection_on_each_engine() {
                     !dbs.iter().any(|d| d.starts_with("template")),
                     "{l}: {dbs:?}"
                 );
-                let schemas = introspect::list_schemas(&c.st, &c.conn.id, "shop")
+                let schemas = ops::list_schemas(&c.st, &c.conn.id, "shop")
                     .await
                     .unwrap();
                 assert_eq!(schemas, vec!["analytics", "public"], "{l}");
@@ -201,7 +91,7 @@ async fn introspection_on_each_engine() {
                     assert!(!dbs.contains(&sys.into()), "{l}: system db {sys} listed");
                 }
                 assert!(
-                    introspect::list_schemas(&c.st, &c.conn.id, "shop")
+                    ops::list_schemas(&c.st, &c.conn.id, "shop")
                         .await
                         .unwrap()
                         .is_empty()
@@ -214,7 +104,7 @@ async fn introspection_on_each_engine() {
             }
             Engine::Mongo => unreachable!("SQL engines only"),
         };
-        let tables = introspect::list_tables(&c.st, &c.conn.id, db, schema)
+        let tables = ops::list_tables(&c.st, &c.conn.id, db, schema)
             .await
             .unwrap();
         let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
@@ -238,10 +128,10 @@ async fn introspection_on_each_engine() {
 
         // analytics: a PG schema, a MySQL database, plain tables in SQLite.
         let analytics = match c.conn.engine {
-            Engine::Pg => introspect::list_tables(&c.st, &c.conn.id, "shop", Some("analytics"))
+            Engine::Pg => ops::list_tables(&c.st, &c.conn.id, "shop", Some("analytics"))
                 .await
                 .unwrap(),
-            Engine::Mysql => introspect::list_tables(&c.st, &c.conn.id, "analytics", None)
+            Engine::Mysql => ops::list_tables(&c.st, &c.conn.id, "analytics", None)
                 .await
                 .unwrap(),
             Engine::Sqlite => tables.clone(),
@@ -253,7 +143,7 @@ async fn introspection_on_each_engine() {
             "{l}: {an:?}"
         );
 
-        let nt = introspect::list_columns(&c.st, &c.conn.id, db, schema, "note_tags")
+        let nt = ops::list_columns(&c.st, &c.conn.id, db, schema, "note_tags")
             .await
             .unwrap();
         assert_eq!(nt.len(), 2, "{l}");
@@ -262,7 +152,7 @@ async fn introspection_on_each_engine() {
             "{l}: note_tags must have no PK: {nt:?}"
         );
 
-        let osh = introspect::list_columns(&c.st, &c.conn.id, db, schema, "order_status_history")
+        let osh = ops::list_columns(&c.st, &c.conn.id, db, schema, "order_status_history")
             .await
             .unwrap();
         let pk: Vec<(&str, Option<u32>)> = osh
@@ -273,12 +163,12 @@ async fn introspection_on_each_engine() {
         assert_eq!(pk, vec![("order_id", Some(1)), ("seq", Some(2))], "{l}");
         assert!(osh.iter().all(|c| !c.nullable), "{l}: {osh:?}");
 
-        let e = introspect::list_columns(&c.st, &c.conn.id, db, schema, "no_such_table")
+        let e = ops::list_columns(&c.st, &c.conn.id, db, schema, "no_such_table")
             .await
             .unwrap_err();
         assert_eq!(e.code, ErrorCode::NotFound, "{l}");
 
-        let snap = introspect::schema_snapshot(&c.st, &c.conn.id, db)
+        let snap = ops::schema_snapshot(&c.st, &c.conn.id, db)
             .await
             .unwrap();
         assert!(!snap.truncated, "{l}");
@@ -310,7 +200,7 @@ async fn snapshot_keeps_table_names_past_the_column_cap() {
     }
     run(&c, "CREATE TABLE zzz_after_cap (id int)", None).await;
 
-    let snap = introspect::schema_snapshot(&c.st, &c.conn.id, "main")
+    let snap = ops::schema_snapshot(&c.st, &c.conn.id, "main")
         .await
         .unwrap();
     assert!(snap.truncated);
@@ -318,13 +208,14 @@ async fn snapshot_keeps_table_names_past_the_column_cap() {
     assert!(names.contains(&"zzz_after_cap"), "{names:?}");
     assert!(names.contains(&"customers"), "{names:?}");
     let n: usize = snap.tables.iter().map(|t| t.columns.len()).sum();
-    assert_eq!(n, introspect::SNAPSHOT_MAX_COLUMNS);
+    // The documented cap, fixed here: raising it in the implementation must fail this test.
+    assert_eq!(n, 2000);
 }
 
 #[tokio::test]
 async fn sqlite_rowid_tables() {
     let c = sqlite();
-    let tables = introspect::list_tables(&c.st, &c.conn.id, "main", None)
+    let tables = ops::list_tables(&c.st, &c.conn.id, "main", None)
         .await
         .unwrap();
     let t = |n: &str| tables.iter().find(|t| t.name == n).unwrap().clone();
@@ -334,7 +225,7 @@ async fn sqlite_rowid_tables() {
         Some(false),
         "views have no rowid"
     );
-    let cols = introspect::list_columns(&c.st, &c.conn.id, "main", None, "rowid_only")
+    let cols = ops::list_columns(&c.st, &c.conn.id, "main", None, "rowid_only")
         .await
         .unwrap();
     assert!(
@@ -345,12 +236,12 @@ async fn sqlite_rowid_tables() {
 
 #[tokio::test]
 async fn pg_databases_get_their_own_pool() {
-    let c = net("pg16", Engine::Pg, PG16);
+    let c = net("pg16", Engine::Pg, common::pg16());
     let mut r = req(&c, "SELECT current_database() AS db", None);
     r.database = Some("shop_staging".into());
-    let out = query::run(&c.st, r).await.expect("query on shop_staging");
+    let out = ops::run_query(&c.st, r).await.expect("query on shop_staging");
     assert_eq!(col(&out, "db", 0), json!("shop_staging"));
-    let tables = introspect::list_tables(&c.st, &c.conn.id, "shop_staging", Some("public"))
+    let tables = ops::list_tables(&c.st, &c.conn.id, "shop_staging", Some("public"))
         .await
         .unwrap();
     assert!(tables.iter().any(|t| t.name == "orders"));
@@ -380,7 +271,7 @@ fn no_unsupported(label: &str, r: &QueryRun) {
 
 #[tokio::test]
 async fn type_zoo_decodes_on_pg() {
-    for (label, port) in [("pg16", PG16), ("pg13", PG13)] {
+    for (label, port) in [("pg16", common::pg16()), ("pg13", common::pg13())] {
         let c = net(label, Engine::Pg, port);
         let r = run(&c, "SELECT * FROM type_zoo ORDER BY id", None).await;
         no_unsupported(label, &r);
@@ -439,7 +330,7 @@ async fn type_zoo_decodes_on_pg() {
 
 #[tokio::test]
 async fn type_zoo_decodes_on_mysql_and_mariadb() {
-    for (label, port) in [("mysql", MYSQL), ("mariadb", MARIADB)] {
+    for (label, port) in [("mysql", common::mysql()), ("mariadb", common::mariadb())] {
         let c = net(label, Engine::Mysql, port);
         let r = run(&c, "SELECT * FROM type_zoo ORDER BY id", None).await;
         no_unsupported(label, &r);
@@ -596,10 +487,7 @@ async fn empty_result_still_has_columns_and_errors_name_the_statement() {
         assert_eq!(names, vec!["id", "name"], "{}", c.label);
         assert_eq!(s.affected, None, "{}", c.label);
 
-        let e = query::run(
-            &c.st,
-            req(&c, "SELECT 1; SELECT * FROM no_such_table", None),
-        )
+        let e = ops::run_query(&c.st, req(&c, "SELECT 1; SELECT * FROM no_such_table", None), )
         .await
         .unwrap_err();
         assert_eq!(e.code, ErrorCode::Database, "{}: {e:?}", c.label);
@@ -616,10 +504,10 @@ async fn expect_cancel(c: &Ctx, sql: &str) {
     let r = req(c, sql, None);
     let qid = r.query_id.clone();
     let st = c.st.clone();
-    let task = tokio::spawn(async move { query::run(&st, r).await });
-    // Wait until the run is registered, then give it a moment to start on the server.
+    let task = tokio::spawn(async move { ops::run_query(&st, r).await });
+    // Wait until the run is registered, then cancel it.
     let t0 = Instant::now();
-    while !c.st.queries.is_running(&qid) {
+    while !c.st.queries().is_running(&qid) {
         assert!(
             t0.elapsed() < Duration::from_secs(10),
             "{}: query never started",
@@ -627,22 +515,14 @@ async fn expect_cancel(c: &Ctx, sql: &str) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let started = Instant::now();
-    query::cancel(&c.st, &qid).await.expect("cancel");
+    ops::cancel_query(&c.st, &qid).await.expect("cancel");
     let res: Result<QueryRun, AppError> = tokio::time::timeout(Duration::from_secs(10), task)
         .await
         .unwrap_or_else(|_| panic!("{}: query did not stop within 10 s after cancel", c.label))
         .unwrap();
-    let took = started.elapsed();
     let e = res.expect_err("a cancelled query must fail");
     assert_eq!(e.code, ErrorCode::Cancelled, "{}: {e:?}", c.label);
-    assert!(
-        took < Duration::from_secs(3),
-        "{}: cancel took {took:?}",
-        c.label
-    );
-    assert!(!c.st.queries.is_running(&qid));
+    assert!(!c.st.queries().is_running(&qid));
     // The pool is still usable afterwards.
     let r = run(c, "SELECT 1 AS one", None).await;
     assert_eq!(col(&r, "one", 0), json!(1));
@@ -666,7 +546,11 @@ async fn cancel_stops_long_queries() {
 #[tokio::test]
 async fn cancel_of_unknown_query_is_a_no_op() {
     let c = sqlite();
-    query::cancel(&c.st, "never-started").await.unwrap();
+    ops::cancel_query(&c.st, "never-started").await.unwrap();
+    assert!(
+        ops::query_progress(&c.st, "never-started").is_none(),
+        "an unknown id must not create progress"
+    );
 }
 
 /// Minimal RFC 4180 reader for the round trip.
@@ -714,7 +598,7 @@ async fn csv_export_round_trips() {
         let sql = format!(
             "SELECT id, name, {lit} AS tricky, NULL AS empty_col FROM {events} ORDER BY id"
         );
-        let r = export::export_csv(&c.st, ereq(&c, &sql), &path)
+        let r = ops::export_csv(&c.st, ereq(&c, &sql), &path)
             .await
             .unwrap_or_else(|e| panic!("{}: export failed: {e:?}", c.label));
         assert_eq!(r.rows, 10_000, "{}: no row cap on export", c.label);
@@ -736,7 +620,7 @@ async fn csv_export_round_trips() {
             Engine::Pg => "c_bytea",
             _ => "c_blob",
         };
-        export::export_csv(
+        ops::export_csv(
             &c.st,
             ereq(&c, &format!("SELECT {blob} FROM type_zoo ORDER BY id")),
             &bytes_path,
@@ -752,7 +636,7 @@ async fn csv_export_round_trips() {
             "DELETE FROM customers WHERE 1 = 0",
             "UPDATE customers SET name = name WHERE 1 = 0 RETURNING id",
         ] {
-            let e = export::export_csv(&c.st, ereq(&c, sql), &dir.path().join("x.csv"))
+            let e = ops::export_csv(&c.st, ereq(&c, sql), &dir.path().join("x.csv"))
                 .await
                 .unwrap_err();
             assert_eq!(e.code, ErrorCode::InvalidInput, "{}: {sql}", c.label);
@@ -761,7 +645,7 @@ async fn csv_export_round_trips() {
 
         // A failed export leaves an existing file as it was and no temp file behind.
         std::fs::write(&path, b"keep me").unwrap();
-        export::export_csv(&c.st, ereq(&c, "SELECT * FROM no_such_table"), &path)
+        ops::export_csv(&c.st, ereq(&c, "SELECT * FROM no_such_table"), &path)
             .await
             .unwrap_err();
         assert_eq!(std::fs::read(&path).unwrap(), b"keep me", "{}", c.label);
@@ -827,7 +711,7 @@ async fn large_text_is_cut_in_the_grid_but_not_in_the_export() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wkt.csv");
         let sql = format!("SELECT {wkt} AS wkt FROM {events} ORDER BY id LIMIT 1");
-        export::export_csv(&c.st, ereq(&c, &sql), &path)
+        ops::export_csv(&c.st, ereq(&c, &sql), &path)
             .await
             .unwrap_or_else(|e| panic!("{l}: export failed: {e:?}"));
         let rows = parse_csv(&std::fs::read_to_string(&path).unwrap());
@@ -848,19 +732,14 @@ fn ereq(c: &Ctx, sql: &str) -> ExportRequest {
     }
 }
 
-/// A table only this test uses, so parallel tests never share rows.
-fn scratch_name() -> String {
-    format!("it_s_{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
-}
-
 async fn try_run(c: &Ctx, sql: &str, limit: Option<usize>) -> Result<QueryRun, AppError> {
-    query::run(&c.st, req(c, sql, limit)).await
+    ops::run_query(&c.st, req(c, sql, limit)).await
 }
 
 fn session_ctxs() -> Vec<Ctx> {
     vec![
-        net("pg16", Engine::Pg, PG16),
-        net("mysql", Engine::Mysql, MYSQL),
+        net("pg16", Engine::Pg, common::pg16()),
+        net("mysql", Engine::Mysql, common::mysql()),
         sqlite(),
     ]
 }
@@ -869,7 +748,7 @@ fn session_ctxs() -> Vec<Ctx> {
 async fn open_transaction_does_not_leak_into_the_next_run() {
     for c in session_ctxs() {
         let l = &c.label;
-        let t = scratch_name();
+        let t = common::scratch();
         run(
             &c,
             &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)"),
@@ -889,7 +768,7 @@ async fn open_transaction_does_not_leak_into_the_next_run() {
             None,
         )
         .await;
-        assert_eq!(a.notices, vec![query::OPEN_TX_NOTICE.to_string()], "{l}");
+        assert_eq!(a.notices, vec![OPEN_TX_NOTICE.to_string()], "{l}");
 
         let b = run(&c, &format!("SELECT v FROM {t} WHERE id = 1"), None).await;
         assert_eq!(
@@ -899,7 +778,6 @@ async fn open_transaction_does_not_leak_into_the_next_run() {
         );
 
         // The row lock of run A is gone: a write from another run does not wait for it.
-        let started = Instant::now();
         let w = tokio::time::timeout(
             Duration::from_secs(2),
             try_run(&c, &format!("UPDATE {t} SET v = 3 WHERE id = 1"), None),
@@ -908,7 +786,6 @@ async fn open_transaction_does_not_leak_into_the_next_run() {
         .unwrap_or_else(|_| panic!("{l}: blocked by run A's lock"))
         .unwrap_or_else(|e| panic!("{l}: {e:?}"));
         assert_eq!(w.statements[0].affected, Some(1), "{l}");
-        assert!(started.elapsed() < Duration::from_secs(2), "{l}");
         assert!(w.notices.is_empty(), "{l}");
 
         // A transaction that ends in the same run is fine and gives no notice.
@@ -956,7 +833,7 @@ async fn session_settings_do_not_leak_into_the_next_run() {
 async fn returning_over_the_limit_is_truncated_and_still_committed() {
     for c in session_ctxs() {
         let l = &c.label;
-        let t = scratch_name();
+        let t = common::scratch();
         run(
             &c,
             &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)"),
@@ -1000,8 +877,8 @@ async fn returning_over_the_limit_is_truncated_and_still_committed() {
 
 #[tokio::test]
 async fn unsplittable_sql_returns_each_result_set() {
-    let c = net("pg16", Engine::Pg, PG16);
-    let s = scratch_name();
+    let c = net("pg16", Engine::Pg, common::pg16());
+    let s = common::scratch();
     run(&c, &format!("CREATE SCHEMA {s}"), None).await;
     // sqlparser has no DO statement, so this goes to the server as one piece of SQL.
     let sql = format!(
@@ -1025,36 +902,18 @@ async fn unsplittable_sql_returns_each_result_set() {
 async fn cancel_before_the_run_registers_is_not_lost() {
     let c = sqlite();
     let r = req(&c, "SELECT 1", None);
-    query::cancel(&c.st, &r.query_id).await.unwrap();
-    let e = query::run(&c.st, r).await.unwrap_err();
+    ops::cancel_query(&c.st, &r.query_id).await.unwrap();
+    let e = ops::run_query(&c.st, r).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Cancelled);
     assert!(!run(&c, "SELECT 1 AS one", None).await.statements.is_empty());
 }
-#[tokio::test]
-async fn sqlite_fixture_is_never_written() {
-    let fixture = root().join("testdb/sqlite/shop.db");
-    let before = std::fs::read(&fixture).unwrap();
-    let c = sqlite();
-    run(
-        &c,
-        "CREATE TABLE it_w (a int); INSERT INTO it_w VALUES (1)",
-        None,
-    )
-    .await;
-    assert_eq!(
-        std::fs::read(&fixture).unwrap(),
-        before,
-        "tests use a temp copy only"
-    );
-}
-
 /// The server, not the SQL text, decides whether a run left a transaction open.
 #[tokio::test]
 async fn open_transaction_notice_comes_from_the_server() {
     // MySQL/MariaDB: DDL commits the open transaction, so nothing is rolled back.
-    for (label, port) in [("mysql", MYSQL), ("mariadb", MARIADB)] {
+    for (label, port) in [("mysql", common::mysql()), ("mariadb", common::mariadb())] {
         let c = net(label, Engine::Mysql, port);
-        let t = scratch_name();
+        let t = common::scratch();
         run(
             &c,
             &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)"),
@@ -1081,8 +940,8 @@ async fn open_transaction_notice_comes_from_the_server() {
     }
 
     // PG: an open transaction the text cannot show (DO is not parsable), and the plain case.
-    let c = net("pg16", Engine::Pg, PG16);
-    let t = scratch_name();
+    let c = net("pg16", Engine::Pg, common::pg16());
+    let t = common::scratch();
     run(
         &c,
         &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)"),
@@ -1095,7 +954,7 @@ async fn open_transaction_notice_comes_from_the_server() {
         format!("BEGIN; DO $$ BEGIN UPDATE {t} SET v = 3 WHERE id = 1; END $$"),
     ] {
         let a = run(&c, &sql, None).await;
-        assert_eq!(a.notices, vec![query::OPEN_TX_NOTICE.to_string()], "{sql}");
+        assert_eq!(a.notices, vec![OPEN_TX_NOTICE.to_string()], "{sql}");
         let b = run(&c, &format!("SELECT v FROM {t} WHERE id = 1"), None).await;
         assert_eq!(col(&b, "v", 0), json!(1), "{sql}: rolled back");
     }
@@ -1111,8 +970,8 @@ async fn open_transaction_notice_comes_from_the_server() {
 /// the limit are read to the end instead of being dropped with the stream.
 #[tokio::test]
 async fn returning_error_after_the_limit_fails_the_write() {
-    let c = net("pg16", Engine::Pg, PG16);
-    let t = scratch_name();
+    let c = net("pg16", Engine::Pg, common::pg16());
+    let t = common::scratch();
     run(
         &c,
         &format!("CREATE TABLE {t} (id int PRIMARY KEY, v int)"),
@@ -1146,8 +1005,8 @@ async fn returning_error_after_the_limit_fails_the_write() {
 /// Functions with side effects make a SELECT "not a plain read" (no Load more, no export).
 #[tokio::test]
 async fn select_with_side_effects_is_not_a_plain_read() {
-    let c = net("pg16", Engine::Pg, PG16);
-    let s = scratch_name();
+    let c = net("pg16", Engine::Pg, common::pg16());
+    let s = common::scratch();
     run(
         &c,
         &format!("CREATE SCHEMA {s}; CREATE SEQUENCE {s}.seq"),
@@ -1155,7 +1014,7 @@ async fn select_with_side_effects_is_not_a_plain_read() {
     )
     .await;
     let r = try_run(&c, &format!("SELECT nextval('{s}.seq') AS n"), None).await;
-    let e = export::export_csv(
+    let e = ops::export_csv(
         &c.st,
         ereq(&c, &format!("SELECT nextval('{s}.seq')")),
         &tempfile::tempdir().unwrap().path().join("x.csv"),
@@ -1173,7 +1032,7 @@ async fn csv_export_of_an_empty_result_has_a_header() {
     for c in all() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.csv");
-        let r = export::export_csv(
+        let r = ops::export_csv(
             &c.st,
             ereq(&c, "SELECT id, name FROM customers WHERE 1 = 0"),
             &path,

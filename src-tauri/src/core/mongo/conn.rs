@@ -1,18 +1,23 @@
 //! MongoDB connections: the connection string without its password, client options and the
 //! probe used by "Test connection".
 
-use mongodb::bson::{Document, doc};
+use mongodb::bson::{Bson, Document, doc};
 use mongodb::error::{Error as MongoError, ErrorKind, WriteFailure};
 use mongodb::options::{
     ClientOptions, ConnectionString, Credential, HostInfo, ServerAddress, Tls, TlsOptions,
 };
 
 use crate::core::connections::{Connection, SslMode, Topology};
-use crate::core::db::pool::{CONNECT_TIMEOUT, MAX_CONNECTIONS};
-use crate::core::error::{AppError, ErrorCode};
+use crate::core::engine::{CONNECT_TIMEOUT, Engine, MAX_CONNECTIONS};
+use crate::core::error::{AppError, ErrorCode, ServerCode};
+use crate::core::mongo::options::whole_number;
 
 /// MongoDB `AuthenticationFailed`.
 const AUTH_FAILED: i32 = 18;
+/// MongoDB `MaxTimeMSExpired`: a read that hit its server time limit.
+pub(crate) const MAX_TIME_MS_EXPIRED: i32 = 50;
+/// The port a connection string without one uses.
+const DEFAULT_PORT: u16 = 27017;
 
 /// A connection string split into the part that may be saved and the password.
 #[derive(Debug, PartialEq)]
@@ -22,7 +27,8 @@ pub struct ParsedUri {
     pub password: Option<String>,
     /// For display only: comma-joined host list, or the SRV host.
     pub host: String,
-    /// The port of the first host; 0 when the string has none (SRV, or the default port).
+    /// The port of the first host; the default when the string has none (an SRV record, or a
+    /// plain `mongodb://`).
     pub port: u16,
     pub user: String,
     pub database: String,
@@ -34,7 +40,6 @@ fn invalid_uri(e: MongoError) -> AppError {
     AppError::invalid("Invalid connection string").with_detail(e.kind.to_string())
 }
 
-/// Validates `uri` with the driver's parser and removes the password from it.
 pub fn parse_uri(uri: &str) -> Result<ParsedUri, AppError> {
     let cs = ConnectionString::parse(uri).map_err(invalid_uri)?;
     let srv = matches!(cs.host_info, HostInfo::DnsRecord(_));
@@ -48,13 +53,13 @@ pub fn parse_uri(uri: &str) -> Result<ParsedUri, AppError> {
                 })
                 .collect();
             let port = match hosts.first() {
-                Some(ServerAddress::Tcp { port, .. }) => port.unwrap_or(0),
-                _ => 0,
+                Some(ServerAddress::Tcp { port, .. }) => port.unwrap_or(DEFAULT_PORT),
+                _ => DEFAULT_PORT,
             };
             (names.join(","), port)
         }
-        HostInfo::DnsRecord(h) => (h.clone(), 0),
-        _ => (String::new(), 0),
+        HostInfo::DnsRecord(h) => (h.clone(), DEFAULT_PORT),
+        _ => (String::new(), DEFAULT_PORT),
     };
     let credential = cs.credential.as_ref();
     // `mongodb+srv://` turns TLS on unless the string turns it off.
@@ -107,7 +112,7 @@ fn without_password(uri: &str) -> String {
     out
 }
 
-/// Driver options for a saved connection. The password comes from the secret store only.
+/// The password comes from the secret store only.
 pub async fn client_options(
     c: &Connection,
     password: Option<&str>,
@@ -148,7 +153,6 @@ pub async fn client_options(
     Ok(o)
 }
 
-/// Opens a client, reads the version and the topology, and shuts the client down.
 pub async fn probe(c: &Connection, password: Option<&str>) -> Result<(String, Topology), AppError> {
     let client = mongodb::Client::with_options(client_options(c, password).await?)?;
     let admin = client.database("admin");
@@ -206,15 +210,17 @@ fn mongo_error(kind: &ErrorKind, detail: String) -> AppError {
         ),
         ErrorKind::Command(c) => (server_error(c.code, &c.message), true),
         // A refused write (duplicate key, validation, ...) carries the server's own message.
-        ErrorKind::Write(WriteFailure::WriteError(w)) => (server_error(w.code, &w.message), true),
+        ErrorKind::Write(WriteFailure::WriteError(w)) => {
+            (write_error(Some(w.code), &w.message), true)
+        }
         ErrorKind::Write(WriteFailure::WriteConcernError(w)) => {
-            (server_error(w.code, &w.message), true)
+            (write_error(Some(w.code), &w.message), true)
         }
         ErrorKind::InsertMany(m) => match (&m.write_errors, &m.write_concern_error) {
             (Some(errs), _) if !errs.is_empty() => {
-                (server_error(errs[0].code, &errs[0].message), true)
+                (write_error(Some(errs[0].code), &errs[0].message), true)
             }
-            (_, Some(w)) => (server_error(w.code, &w.message), true),
+            (_, Some(w)) => (write_error(Some(w.code), &w.message), true),
             _ => (AppError::internal("Unexpected database error"), false),
         },
         ErrorKind::ServerSelection { .. }
@@ -243,13 +249,55 @@ fn mongo_error(kind: &ErrorKind, detail: String) -> AppError {
     }
 }
 
-/// A server error: the server's own message, with its code as the label (`server_code`, and the
-/// detail the UI appends to the message).
+/// A server error: the server's own message, with its code as the label the UI appends
+/// (`detail`) and as the machine-readable `server_code`.
 pub(crate) fn server_error(code: i32, message: &str) -> AppError {
-    let label = format!("MongoDB error {code}");
-    let mut a = AppError::new(ErrorCode::Database, message).with_detail(label.clone());
-    a.server_code = Some(label);
+    let code = ServerCode::new(Engine::Mongo, code.to_string());
+    let mut a = AppError::new(ErrorCode::Database, message).with_detail(code.label());
+    a.server_code = Some(code);
     a
+}
+
+/// A write error of a reply: a server error with its code, or the bare message when the server
+/// sent no code. A fabricated `MongoDB error 0` would name an error that never happened.
+fn write_error(code: Option<i32>, message: &str) -> AppError {
+    match code {
+        Some(code) => server_error(code, message),
+        None => AppError::new(ErrorCode::Database, message),
+    }
+}
+
+/// The write error of a command reply: the first `writeErrors` entry, else `writeConcernError`.
+/// A write command replies `ok: 1` even when it wrote nothing, so the reply must be checked the
+/// same way a driver error is.
+pub(crate) fn reply_write_error(reply: &Document) -> Option<AppError> {
+    let first_error = reply
+        .get_array("writeErrors")
+        .ok()
+        .and_then(|errors| errors.first());
+    if let Some(Bson::Document(error)) = first_error {
+        return Some(reply_error(error, "Write error"));
+    }
+    if let Ok(error) = reply.get_document("writeConcernError") {
+        return Some(reply_error(error, "Write error"));
+    }
+    None
+}
+
+fn reply_error(error: &Document, fallback: &str) -> AppError {
+    let code = error
+        .get("code")
+        .and_then(|code| whole_number(code, i64::from(i32::MIN), i64::from(i32::MAX)))
+        .map(|code| code as i32);
+    write_error(code, error.get_str("errmsg").unwrap_or(fallback))
+}
+
+pub(crate) fn server_code(error: &AppError) -> Option<i32> {
+    let code = error
+        .server_code
+        .as_ref()
+        .filter(|c| c.engine == Engine::Mongo)?;
+    code.code.parse().ok()
 }
 
 #[cfg(test)]
@@ -281,7 +329,7 @@ mod tests {
         );
         assert_eq!(e.code, ErrorCode::Database);
         assert_eq!(e.message, "TTL indexes are single-field indexes");
-        assert_eq!(e.server_code.as_deref(), Some("MongoDB error 67"));
+        assert_eq!(server_code(&e), Some(67));
         // The dialog appends the detail, so it must not be the driver's dump.
         assert_eq!(e.detail.as_deref(), Some("MongoDB error 67"));
         let shown = format!("{}: {}", e.message, e.detail.unwrap_or_default());
@@ -343,7 +391,7 @@ mod tests {
     fn srv_turns_tls_on_unless_the_string_turns_it_off() {
         let p = parse_uri("mongodb+srv://u:p@cluster0.example.net/app").unwrap();
         assert_eq!(p.redacted, "mongodb+srv://u@cluster0.example.net/app");
-        assert_eq!((p.host.as_str(), p.port), ("cluster0.example.net", 0));
+        assert_eq!((p.host.as_str(), p.port), ("cluster0.example.net", 27017));
         assert_eq!(p.ssl, SslMode::Require);
         let off = parse_uri("mongodb+srv://cluster0.example.net/?tls=false").unwrap();
         assert_eq!(off.ssl, SslMode::Disable);

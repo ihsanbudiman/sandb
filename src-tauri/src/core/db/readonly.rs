@@ -10,27 +10,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
-use serde::Serialize;
 use serde_json::Value;
-use sqlx::mysql::{MySql, MySqlDatabaseError, MySqlPool};
-use sqlx::postgres::{PgPool, Postgres};
-use sqlx::sqlite::{Sqlite, SqliteConnection};
-use sqlx::{Connection as _, Database, Either, Executor, Row};
+use sqlx::mysql::{MySql, MySqlConnection, MySqlDatabaseError};
+use sqlx::postgres::{PgConnection, Postgres};
+use sqlx::sqlite::Sqlite;
+use sqlx::{Database, Either, Executor, Row};
 
-use crate::core::connections::{self, Connection, Engine};
-use crate::core::db::pool::{self, DbPool, OneConnection};
-use crate::core::db::query::{self, CLOSE_TIMEOUT, ColumnMeta, Kill, SqliteHandle};
-use crate::core::db::value::PREVIEW_BYTES;
+use crate::core::connections::{Connection, target_database};
+use crate::core::db::conn::{self as sql_conn, CLOSE_TIMEOUT, Conn};
+use crate::core::db::ctx::Ctx;
+use crate::core::db::reader::{self, CellFn};
+use crate::core::db::value::Preview;
+use crate::core::engine::SqlEngine;
 use crate::core::error::{AppError, ErrorCode};
 use crate::core::guard;
-use crate::core::secrets::password_account;
-use crate::core::state::AppState;
+use crate::core::query_registry::{Session, SqliteHandle};
+use crate::core::result::{AiReadResult, ColumnMeta, GRACE, ReadLimits, timeout_error};
 
-pub const DEFAULT_MAX_ROWS: usize = 500;
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
-/// The outer safety net fires this long after the database's own limit should have.
-pub(crate) const GRACE: Duration = Duration::from_secs(1);
-/// Bound for the server-side cancel sent by the safety net.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// PG `lock_timeout`: an AI read never queues long behind another session's lock.
 const PG_LOCK_TIMEOUT_MS: u64 = 2_000;
@@ -50,78 +46,39 @@ const LEXING_MODES: &[&str] = &[
     "MAXDB",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReadLimits {
-    pub max_rows: usize,
-    pub timeout: Duration,
-}
-
-impl Default for ReadLimits {
-    fn default() -> Self {
-        Self {
-            max_rows: DEFAULT_MAX_ROWS,
-            timeout: DEFAULT_TIMEOUT,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AiReadResult {
-    pub columns: Vec<ColumnMeta>,
-    pub rows: Vec<Vec<Value>>,
-    /// More rows exist than `max_rows`; they were not fetched.
-    pub truncated: bool,
-    pub elapsed_ms: u64,
-    /// MongoDB only: each document of the page as relaxed Extended JSON, one per row.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documents: Option<Vec<Value>>,
-}
-
 /// Runs AI-written `sql` read-only: the layer 1 guard, then the database-enforced read-only
-/// session with `limits`. `database`: the connection's own when absent. On MongoDB `sql` is one
-/// mongosh read statement.
+/// session with `limits`. `database`: the connection's own when absent.
 pub async fn run_ai_read(
-    state: &AppState,
-    conn_id: &str,
+    ctx: &Ctx<'_>,
+    conn: &Connection,
+    engine: SqlEngine,
     database: Option<&str>,
     sql: &str,
     limits: ReadLimits,
 ) -> Result<AiReadResult, AppError> {
-    let conn = connections::get(state, conn_id)?;
-    if conn.engine == Engine::Mongo {
-        return crate::core::mongo::ai::read(state, &conn, database, sql, limits).await;
-    }
-    guard::check_ai_read(sql, conn.engine)?;
-    execute(state, &conn, database, sql, limits).await
+    guard::classify::check_ai_read(sql, engine)?;
+    execute(ctx, conn, engine, database, sql, limits).await
 }
 
 /// Layers 2 and 3 only, so integration tests can prove that the database itself refuses a write
 /// that got past layer 1. Never compiled into a normal build.
-#[cfg(any(test, feature = "it"))]
+#[cfg(feature = "it")]
 pub async fn run_read_only_unchecked(
-    state: &AppState,
-    conn_id: &str,
+    ctx: &Ctx<'_>,
+    conn: &Connection,
+    engine: SqlEngine,
     database: Option<&str>,
     sql: &str,
     limits: ReadLimits,
 ) -> Result<AiReadResult, AppError> {
-    let conn = connections::get(state, conn_id)?;
-    execute(state, &conn, database, sql, limits).await
+    execute(ctx, conn, engine, database, sql, limits).await
 }
 
 /// The server session running the read, so the safety net can stop it.
-#[derive(Clone, Copy)]
-enum Target {
-    Pg(i32),
-    MySql(i64),
-    Sqlite(SqliteHandle),
-}
+type Slot = Arc<Mutex<Option<Session>>>;
 
-type Slot = Arc<Mutex<Option<Target>>>;
-
-fn put(slot: &Slot, t: Option<Target>) {
-    *slot.lock().unwrap_or_else(|e| e.into_inner()) = t;
+fn put(slot: &Slot, s: Option<Session>) {
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = s;
 }
 
 #[derive(Default)]
@@ -129,33 +86,29 @@ struct Fetched {
     columns: Option<Vec<ColumnMeta>>,
     rows: Vec<Vec<Value>>,
     truncated: bool,
-    /// Row data exceeded `ROW_BYTES_LIMIT`; the read must abort.
     over_budget: bool,
 }
 
 async fn execute(
-    state: &AppState,
+    ctx: &Ctx<'_>,
     conn: &Connection,
+    engine: SqlEngine,
     database: Option<&str>,
     sql: &str,
     limits: ReadLimits,
 ) -> Result<AiReadResult, AppError> {
-    // A zero timeout means "no limit" to PG and MySQL, so never send one.
-    let limits = ReadLimits {
-        max_rows: limits.max_rows.max(1),
-        timeout: limits.timeout.max(Duration::from_millis(1)),
-    };
-    let database = connections::target_database(conn, database);
+    let limits = limits.sanitized();
+    let database = target_database(conn, database);
     let started = Instant::now();
     let slot: Slot = Arc::default();
-    let work = run_engine(state, conn, &database, sql, limits, slot.clone());
+    let work = run_engine(ctx, conn, engine, &database, sql, limits, slot.clone());
     tokio::pin!(work);
     let fetched = tokio::select! {
         r = &mut work => r?,
         _ = tokio::time::sleep(limits.timeout + GRACE) => {
             // `work` (and its connection) stays alive until this returns, so the SQLite handle
             // in the slot is still valid while it is interrupted.
-            stop(state, conn, &database, &slot).await;
+            stop(ctx, conn, &database, &slot).await;
             return Err(timeout_error(limits.timeout));
         }
     };
@@ -169,105 +122,79 @@ async fn execute(
 }
 
 async fn run_engine(
-    state: &AppState,
+    ctx: &Ctx<'_>,
     conn: &Connection,
+    engine: SqlEngine,
     database: &str,
     sql: &str,
     limits: ReadLimits,
     slot: Slot,
 ) -> Result<Fetched, AppError> {
-    if conn.engine == Engine::Sqlite {
+    if engine == SqlEngine::Sqlite {
         // Never the user's read-write pool.
         return sqlite_read(conn, sql, limits, &slot).await;
     }
-    match connections::pool_for(state, &conn.id, Some(database))? {
-        DbPool::Pg(p) => pg_read(p, sql, limits, &slot).await,
-        DbPool::MySql(p) => mysql_read(p, sql, limits, &slot).await,
-        DbPool::Sqlite(_) => Err(AppError::internal("SQLite reads never use the pool")),
-    }
+    let pool = ctx.pool_for(conn, Some(database))?;
+    let mut c = Conn::acquire(&pool).await?;
+    // Also on an early return or when the safety net drops this future.
+    c.close_on_drop();
+    put(&slot, Some(c.session().await?));
+    let result = match engine {
+        SqlEngine::Pg => {
+            let cc = c.as_pg().expect("a PostgreSQL pool yields a PostgreSQL connection");
+            async {
+                pg_setup(cc, sql, limits).await?;
+                finish_read::<Postgres>(
+                    cc,
+                    engine,
+                    sql,
+                    limits,
+                    false,
+                    reader::pg_cell::<Preview>,
+                )
+                .await
+            }
+            .await
+        }
+        SqlEngine::Mysql => {
+            let cc = c.as_mysql().expect("a MySQL pool yields a MySQL connection");
+            async {
+                mysql_setup(cc, limits).await?;
+                finish_read::<MySql>(
+                    cc,
+                    engine,
+                    sql,
+                    limits,
+                    true,
+                    reader::mysql_cell_binary::<Preview>,
+                )
+                .await
+            }
+            .await
+        }
+        SqlEngine::Sqlite => unreachable!("handled above"),
+    };
+    // Cleared before the connection closes, so the safety net never interrupts a freed handle.
+    put(&slot, None);
+    c.close().await;
+    result
 }
 
 /// Safety net: the database did not stop the read in time. Cancels it on the server through a
 /// fresh, separate connection: borrowing the user's pool could queue behind a saturated pool,
 /// and the read's own settings must never touch it.
-async fn stop(state: &AppState, conn: &Connection, database: &str, slot: &Slot) {
-    let kill = {
-        let guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-        match *guard {
-            Some(Target::Sqlite(h)) => {
-                // SAFETY: the connection that owns the handle is alive (see `execute`), and
-                // `sqlite3_interrupt` may be called from any thread.
-                unsafe { libsqlite3_sys::sqlite3_interrupt(h.0) };
-                None
-            }
-            Some(Target::Pg(pid)) => Some(Kill::Pg(pid)),
-            Some(Target::MySql(id)) => Some(Kill::MySql(id)),
-            None => None,
-        }
+async fn stop(ctx: &Ctx<'_>, conn: &Connection, database: &str, slot: &Slot) {
+    let session = *slot.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(session) = session else {
+        return;
     };
-    if let Some(k) = kill {
-        let _ = tokio::time::timeout(STOP_TIMEOUT, server_kill(state, conn, database, k)).await;
-    }
-}
-
-/// `pg_cancel_backend` / `KILL QUERY` on a one-off connection that is closed right after.
-/// Public under `it` so the integration test can drive the kill directly: the safety net only
-/// fires when a server-side limit fails first, which a test cannot arrange on its own.
-#[cfg(feature = "it")]
-pub async fn server_kill(
-    state: &AppState,
-    conn: &Connection,
-    database: &str,
-    kill: Kill,
-) -> Result<(), AppError> {
-    server_kill_inner(state, conn, database, kill).await
-}
-
-#[cfg(not(feature = "it"))]
-async fn server_kill(
-    state: &AppState,
-    conn: &Connection,
-    database: &str,
-    kill: Kill,
-) -> Result<(), AppError> {
-    server_kill_inner(state, conn, database, kill).await
-}
-
-async fn server_kill_inner(
-    state: &AppState,
-    conn: &Connection,
-    database: &str,
-    kill: Kill,
-) -> Result<(), AppError> {
-    let password = state.secrets.get(&password_account(&conn.id))?;
-    let one = pool::connect_one(conn, database, password.as_deref()).await?;
-    match (one, kill) {
-        (OneConnection::Pg(mut c), Kill::Pg(pid)) => {
-            sqlx::query("SELECT pg_cancel_backend($1)")
-                .bind(pid)
-                .execute(&mut c)
-                .await?;
-            let _ = c.close().await;
-        }
-        (OneConnection::MySql(mut c), Kill::MySql(id)) => {
-            c.execute(sqlx::query(&format!("KILL QUERY {id}"))).await?;
-            let _ = c.close().await;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-pub(crate) fn timeout_error(limit: Duration) -> AppError {
-    let shown = if limit < Duration::from_secs(1) {
-        format!("{} ms", limit.as_millis())
-    } else {
-        format!("{} s", limit.as_secs_f64())
+    // SQLite's interrupt is in-process; the SQL engines need the pool their session belongs to.
+    let pool = match session {
+        Session::Sqlite(_) => None,
+        _ => ctx.pool_for(conn, Some(database)).ok(),
     };
-    AppError::new(
-        ErrorCode::Timeout,
-        format!("The AI query did not finish within {shown} and was stopped"),
-    )
+    // Best effort by design: the read already timed out, and the caller reports that.
+    let _ = tokio::time::timeout(STOP_TIMEOUT, sql_conn::kill(pool.as_ref(), session)).await;
 }
 
 enum Refusal {
@@ -277,21 +204,16 @@ enum Refusal {
     Timeout,
 }
 
-/// True when `sql` holds more than one statement, counted with the same tokenizer the splitter
-/// uses. A `;` inside a string literal does not count.
-fn has_multiple_statements(engine: Engine, sql: &str) -> bool {
-    crate::core::sql::split::split(engine, sql).len() >= 2
-}
-
 /// The server's answer to the read, with read-only violations and the read's own limits
 /// recognised; everything else keeps the normal mapping.
-fn map_read_error(engine: Engine, e: sqlx::Error, sql: &str, limit: Duration) -> AppError {
-    let stacked = has_multiple_statements(engine, sql);
+fn map_read_error(engine: SqlEngine, e: sqlx::Error, sql: &str, limit: Duration) -> AppError {
+    // A `;` inside a string literal does not count: the splitter uses the same tokenizer.
+    let stacked = crate::core::sql::split::split(engine, sql).len() >= 2;
     let refusal = match &e {
         sqlx::Error::Database(db) => match engine {
             // 25006 read_only_sql_transaction; 57014 query_canceled (statement_timeout);
             // 55P03 lock_not_available (lock_timeout).
-            Engine::Pg => match db.code().as_deref() {
+            SqlEngine::Pg => match db.code().as_deref() {
                 Some("25006") => Some(Refusal::ReadOnly),
                 // 42601 "cannot insert multiple commands into a prepared statement": a stacked
                 // statement tried to escape the one-read rule.
@@ -303,7 +225,7 @@ fn map_read_error(engine: Engine, e: sqlx::Error, sql: &str, limit: Duration) ->
             },
             // 1792 read-only transaction; 3024 max_execution_time (MySQL); 1969
             // max_statement_time (MariaDB); 1205 lock wait timeout.
-            Engine::Mysql => match db
+            SqlEngine::Mysql => match db
                 .try_downcast_ref::<MySqlDatabaseError>()
                 .map(|m| m.number())
             {
@@ -317,7 +239,7 @@ fn map_read_error(engine: Engine, e: sqlx::Error, sql: &str, limit: Duration) ->
             // Extended result codes: the primary code is the low byte. 8 SQLITE_READONLY
             // (mode=ro, query_only); 23 SQLITE_AUTH (the authorizer); 9 SQLITE_INTERRUPT (the
             // deadline's progress handler).
-            Engine::Sqlite => match db
+            SqlEngine::Sqlite => match db
                 .code()
                 .and_then(|c| c.parse::<i32>().ok())
                 .map(|c| c & 0xff)
@@ -326,7 +248,6 @@ fn map_read_error(engine: Engine, e: sqlx::Error, sql: &str, limit: Duration) ->
                 Some(9) => Some(Refusal::Timeout),
                 _ => None,
             },
-            Engine::Mongo => None,
         },
         _ => None,
     };
@@ -345,8 +266,6 @@ fn map_read_error(engine: Engine, e: sqlx::Error, sql: &str, limit: Duration) ->
         None => AppError::from(e),
     }
 }
-
-type CellFn<DB> = fn(&<DB as Database>::Row, usize, Option<usize>) -> Value;
 
 /// Approximate decoded size of a mapped cell, so `repeat`-style amplification counts against
 /// `ROW_BYTES_LIMIT` even though the preview caps what is kept.
@@ -389,14 +308,14 @@ where
         while let Some(item) = stream.try_next().await? {
             let Either::Right(row) = item else { continue };
             if out.columns.is_none() {
-                out.columns = Some(row.columns().iter().map(query::meta).collect());
+                out.columns = Some(row.columns().iter().map(reader::meta).collect());
             }
             if out.rows.len() >= max_rows {
                 out.truncated = true;
                 break;
             }
             let values: Vec<Value> = (0..row.len())
-                .map(|i| cell(&row, i, Some(PREVIEW_BYTES)))
+                .map(|i| cell(&row, i))
                 .collect();
             bytes += values.iter().map(cell_bytes).sum::<usize>();
             out.rows.push(values);
@@ -409,9 +328,9 @@ where
     // No row described the columns (and the stream ran to its end); ask the server.
     if out.columns.is_none()
         && !out.over_budget
-        && let Ok(d) = (&mut *conn).describe(sql).await
+        && let Some(columns) = sql_conn::describe_columns(conn, sql).await
     {
-        out.columns = Some(d.columns().iter().map(query::meta).collect());
+        out.columns = Some(columns);
     }
     Ok(out)
 }
@@ -426,19 +345,40 @@ fn over_budget_error() -> AppError {
     )
 }
 
-async fn pg_read(
-    p: PgPool,
+/// The shared lifecycle tail: fetch, map the error, roll a finished transaction back (closing
+/// the connection ends an unfinished one), and turn the byte budget into the error.
+async fn finish_read<DB>(
+    c: &mut DB::Connection,
+    engine: SqlEngine,
     sql: &str,
     limits: ReadLimits,
-    slot: &Slot,
-) -> Result<Fetched, AppError> {
-    let mut c = p.acquire().await?;
-    // Also on an early return or when the safety net drops this future.
-    c.close_on_drop();
-    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *c)
-        .await?;
-    put(slot, Some(Target::Pg(pid)));
+    prepared: bool,
+    cell: CellFn<DB>,
+) -> Result<Fetched, AppError>
+where
+    DB: Database,
+    for<'x> &'x mut DB::Connection: Executor<'x, Database = DB>,
+    for<'q> <DB as Database>::Arguments<'q>: sqlx::IntoArguments<'q, DB>,
+{
+    let r = fetch::<DB>(c, sql, limits.max_rows, prepared, cell)
+        .await
+        .map_err(|e| map_read_error(engine, e, sql, limits.timeout));
+    // After a cut-off read the server is still sending rows; closing the connection ends the
+    // transaction without reading them.
+    if engine != SqlEngine::Sqlite && r.as_ref().is_ok_and(|f| !f.truncated && !f.over_budget) {
+        // The rows are already in hand; a failed ROLLBACK only leaves the close below to end
+        // the transaction.
+        let _ =
+            tokio::time::timeout(CLOSE_TIMEOUT, c.execute(sqlx::raw_sql("ROLLBACK"))).await;
+    }
+    r.and_then(|f| if f.over_budget { Err(over_budget_error()) } else { Ok(f) })
+}
+
+async fn pg_setup(
+    c: &mut PgConnection,
+    sql: &str,
+    limits: ReadLimits,
+) -> Result<(), AppError> {
     let ms = limits.timeout.as_millis().max(1);
     // The session default also makes any transaction a stacked COMMIT could start read-only.
     // standard_conforming_strings: the guard's parser reads 'a\' as a complete string.
@@ -453,38 +393,12 @@ async fn pg_read(
         (&mut *c).execute(sqlx::raw_sql(&s)).await?;
     }
     // The extended-protocol Parse step refuses a second statement with 42601; run the same
-    // text with raw_sql afterwards so results come back in text format through pg_cell.
+    // text with raw_sql afterwards so results come back in text format through the cell reader.
     (&mut *c)
         .prepare(sql)
         .await
-        .map_err(|e| map_read_error(Engine::Pg, e, sql, limits.timeout))?;
-    let r = fetch::<Postgres>(&mut c, sql, limits.max_rows, false, query::pg_cell)
-        .await
-        .map_err(|e| map_read_error(Engine::Pg, e, sql, limits.timeout));
-    // After a cut-off read the server is still sending rows; closing the connection ends the
-    // transaction without reading them.
-    if r.as_ref().is_ok_and(|f| !f.truncated && !f.over_budget) {
-        let _ =
-            tokio::time::timeout(CLOSE_TIMEOUT, (&mut *c).execute(sqlx::raw_sql("ROLLBACK"))).await;
-    }
-    put(slot, None);
-    let _ = tokio::time::timeout(CLOSE_TIMEOUT, c.detach().close()).await;
-    r.and_then(|f| {
-        if f.over_budget {
-            Err(over_budget_error())
-        } else {
-            Ok(f)
-        }
-    })
-}
-
-/// MySQL schemas an AI read may never run inside: their unqualified tables (`user`, `processlist`,
-/// `general_log`, …) resolve to system tables the privacy rule blocks only when they are named.
-fn is_system_schema(name: &str) -> bool {
-    matches!(
-        name.to_lowercase().as_str(),
-        "mysql" | "sys" | "performance_schema" | "information_schema"
-    )
+        .map_err(|e| map_read_error(SqlEngine::Pg, e, sql, limits.timeout))?;
+    Ok(())
 }
 
 /// `sql_mode` without the flags in [`LEXING_MODES`]. Only plain mode names are kept, so the
@@ -501,21 +415,16 @@ fn safe_sql_mode(mode: &str) -> String {
         .join(",")
 }
 
-async fn mysql_read(
-    p: MySqlPool,
-    sql: &str,
-    limits: ReadLimits,
-    slot: &Slot,
-) -> Result<Fetched, AppError> {
-    let mut c = p.acquire().await?;
-    c.close_on_drop();
-    let (id, version, mode, db): (i64, String, String, Option<String>) = sqlx::query_as(
-        "SELECT CAST(CONNECTION_ID() AS SIGNED), VERSION(), CAST(@@SESSION.sql_mode AS CHAR), DATABASE()",
+async fn mysql_setup(c: &mut MySqlConnection, limits: ReadLimits) -> Result<(), AppError> {
+    let (version, mode, db): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT VERSION(), CAST(@@SESSION.sql_mode AS CHAR), DATABASE()",
     )
     .fetch_one(&mut *c)
     .await?;
-    put(slot, Some(Target::MySql(id)));
-    if db.as_deref().is_some_and(is_system_schema) {
+    if db
+        .as_deref()
+        .is_some_and(|name| SqlEngine::Mysql.is_system_schema(name))
+    {
         return Err(AppError::new(
             ErrorCode::GuardRejected,
             "AI reads are blocked for privacy inside a MySQL system schema: unqualified table \
@@ -524,7 +433,7 @@ async fn mysql_read(
     }
     let ms = limits.timeout.as_millis().max(1);
     let secs = limits.timeout.as_secs().max(1);
-    let time_limit = if version.to_ascii_lowercase().contains("mariadb") {
+    let time_limit = if SqlEngine::is_mariadb(&version) {
         format!(
             "SET SESSION max_statement_time = {:.3}",
             (ms as f64 / 1000.0).max(0.001)
@@ -543,22 +452,7 @@ async fn mysql_read(
     ] {
         (&mut *c).execute(sqlx::raw_sql(&s)).await?;
     }
-    let r = fetch::<MySql>(&mut c, sql, limits.max_rows, true, query::mysql_cell_binary)
-        .await
-        .map_err(|e| map_read_error(Engine::Mysql, e, sql, limits.timeout));
-    if r.as_ref().is_ok_and(|f| !f.truncated && !f.over_budget) {
-        let _ =
-            tokio::time::timeout(CLOSE_TIMEOUT, (&mut *c).execute(sqlx::raw_sql("ROLLBACK"))).await;
-    }
-    put(slot, None);
-    let _ = tokio::time::timeout(CLOSE_TIMEOUT, c.detach().close()).await;
-    r.and_then(|f| {
-        if f.over_budget {
-            Err(over_budget_error())
-        } else {
-            Ok(f)
-        }
-    })
+    Ok(())
 }
 
 async fn sqlite_read(
@@ -567,17 +461,16 @@ async fn sqlite_read(
     limits: ReadLimits,
     slot: &Slot,
 ) -> Result<Fetched, AppError> {
-    // SQLITE_OPEN_READONLY (what `mode=ro` sets), without building a URI from the path.
-    let opts = pool::sqlite_options(conn, true)?;
-    let mut c = SqliteConnection::connect_with(&opts).await?;
-    (&mut c)
+    let mut c = Conn::sqlite_read_only(conn).await?;
+    let cc = c.as_sqlite().expect("a SQLite connection");
+    (&mut *cc)
         .execute(sqlx::raw_sql("PRAGMA query_only = ON"))
         .await?;
     let deadline = Instant::now() + limits.timeout;
     {
-        let mut h = c.lock_handle().await?;
+        let mut h = cc.lock_handle().await?;
         let raw = h.as_raw_handle().as_ptr();
-        put(slot, Some(Target::Sqlite(SqliteHandle(raw))));
+        put(slot, Some(Session::Sqlite(SqliteHandle(raw))));
         // Returning false interrupts the running statement (SQLITE_INTERRUPT).
         h.set_progress_handler(1_000, move || Instant::now() < deadline);
         // SAFETY: `h` holds the connection lock, so `raw` is valid and exclusively ours here.
@@ -596,30 +489,20 @@ async fn sqlite_read(
             );
         }
     }
-    let r = fetch::<Sqlite>(&mut c, sql, limits.max_rows, false, query::sqlite_cell)
-        .await
-        .map_err(|e| map_read_error(Engine::Sqlite, e, sql, limits.timeout));
+    let r = finish_read::<Sqlite>(
+        cc,
+        SqlEngine::Sqlite,
+        sql,
+        limits,
+        false,
+        reader::sqlite_cell::<Preview>,
+    )
+    .await;
     // Cleared before the connection closes, so the safety net never interrupts a freed handle.
     put(slot, None);
-    let _ = tokio::time::timeout(CLOSE_TIMEOUT, c.close()).await;
-    r.and_then(|f| {
-        if f.over_budget {
-            Err(over_budget_error())
-        } else {
-            Ok(f)
-        }
-    })
+    c.close().await;
+    r
 }
-
-/// Pragmas the authorizer lets through, in read (no value) form only — the same schema-info
-/// list the layer 1 guard accepts.
-const AUTH_PRAGMAS: &[&str] = &[
-    "table_info",
-    "table_xinfo",
-    "index_list",
-    "index_info",
-    "foreign_key_list",
-];
 
 fn c_str(p: *const c_char) -> Option<String> {
     if p.is_null() {
@@ -650,7 +533,9 @@ unsafe extern "C" fn ai_authorizer(
             // arg1 = pragma name, arg2 = its argument or new value. Only the schema-info
             // pragmas pass, whatever their argument; `PRAGMA query_only = 0` has a name that
             // is not listed, so it is denied.
-            if c_str(arg1).is_some_and(|n| AUTH_PRAGMAS.contains(&n.as_str())) {
+            if c_str(arg1)
+                .is_some_and(|n| SqlEngine::Sqlite.is_read_pragma(&n))
+            {
                 SQLITE_OK
             } else {
                 SQLITE_DENY
@@ -679,9 +564,47 @@ unsafe extern "C" fn ai_authorizer(
 mod tests {
     use super::*;
     use crate::core::connections::{ConnectionInput, Env, SslMode};
-    use crate::core::db::query::RunRequest;
+    use crate::core::db::query;
+    use crate::core::engine::Engine;
+    use crate::core::result::RunRequest;
     use crate::core::secrets::MemoryStore;
-    use sqlx::sqlite::SqliteConnectOptions;
+    use crate::core::state::AppState;
+    use sqlx::Connection as _;
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+
+    // The tests run on one SQLite connection, so these wrappers route for them.
+    async fn run_ai_read(
+        state: &AppState,
+        conn_id: &str,
+        database: Option<&str>,
+        sql: &str,
+        limits: ReadLimits,
+    ) -> Result<AiReadResult, AppError> {
+        let conn = state.connection(conn_id).unwrap();
+        let engine = conn.engine.sql().unwrap();
+        super::run_ai_read(&state.db(), &conn, engine, database, sql, limits).await
+    }
+
+    async fn run_read_only_unchecked(
+        state: &AppState,
+        conn_id: &str,
+        database: Option<&str>,
+        sql: &str,
+        limits: ReadLimits,
+    ) -> Result<AiReadResult, AppError> {
+        let conn = state.connection(conn_id).unwrap();
+        let engine = conn.engine.sql().unwrap();
+        super::execute(&state.db(), &conn, engine, database, sql, limits).await
+    }
+
+    async fn run_sql(
+        state: &AppState,
+        req: RunRequest,
+    ) -> Result<crate::core::result::QueryRun, AppError> {
+        let conn = state.connection(&req.conn_id).unwrap();
+        let engine = conn.engine.sql().unwrap();
+        query::run(&state.db(), &conn, engine, req).await
+    }
 
     fn state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().unwrap();
@@ -729,14 +652,14 @@ mod tests {
             .await
             .unwrap();
         c.close().await.unwrap();
-        let conn =
-            connections::create(&st, input(Engine::Sqlite, 0, &file.to_string_lossy()), None)
-                .unwrap();
+        let conn = st
+            .create_connection(input(Engine::Sqlite, 0, &file.to_string_lossy()), None)
+            .unwrap();
         (dir, st, conn.id, file)
     }
 
     async fn count(st: &AppState, id: &str) -> String {
-        let r = query::run(
+        let r = run_sql(
             st,
             RunRequest {
                 conn_id: id.into(),
@@ -754,28 +677,27 @@ mod tests {
     }
 
     /// Port 1 refuses connections: a DELETE must be refused by the guard before any connect
-    /// attempt (an immediate `guard_rejected`), while an allowed read does try to connect.
+    /// attempt (an immediate `guard_rejected`), while an allowed read goes on to the read path and
+    /// is stopped by its own time limit instead (`timeout`, not a guard refusal).
     #[tokio::test]
     async fn guard_runs_before_any_database_contact() {
         let (_d, st) = state();
+        let quick = ReadLimits {
+            max_rows: 1,
+            timeout: Duration::from_millis(200),
+        };
         for engine in [Engine::Pg, Engine::Mysql] {
-            let c = connections::create(&st, input(engine, 1, ""), None).unwrap();
-            let e = run_ai_read(&st, &c.id, None, "DELETE FROM t", ReadLimits::default())
+            let c = st.create_connection(input(engine, 1, ""), None).unwrap();
+            let e = run_ai_read(&st, &c.id, None, "DELETE FROM t", quick)
                 .await
                 .unwrap_err();
             assert_eq!(e.code, ErrorCode::GuardRejected, "{engine:?}: {e:?}");
-            // The pool retries a refused port until the safety net stops it.
-            let quick = ReadLimits {
-                max_rows: 1,
-                timeout: Duration::from_millis(200),
-            };
             let e = run_ai_read(&st, &c.id, None, "SELECT 1", quick)
                 .await
                 .unwrap_err();
-            assert!(
-                matches!(e.code, ErrorCode::ConnectFailed | ErrorCode::Timeout),
-                "{engine:?}: {e:?}"
-            );
+            // The read's own limit stopped it: the pool's own error carries a detail.
+            assert_eq!(e.code, ErrorCode::Timeout, "{engine:?}: {e:?}");
+            assert!(e.detail.is_none(), "{engine:?}: {e:?}");
         }
     }
 
@@ -856,7 +778,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !st.pools.contains(&id),
+            !st.pools().contains(&id),
             "the AI read opened the user's pool"
         );
     }
@@ -876,67 +798,116 @@ mod tests {
     }
 
     #[test]
-    fn limits_default_and_json_shape() {
+    fn limits_sanitize_zero_and_the_timeout_error_names_the_limit() {
+        // PG and MySQL read 0 as "no limit"; the read never may.
         assert_eq!(
-            ReadLimits::default(),
             ReadLimits {
-                max_rows: 500,
-                timeout: Duration::from_secs(15)
+                max_rows: 0,
+                timeout: Duration::ZERO
+            }
+            .sanitized(),
+            ReadLimits {
+                max_rows: 1,
+                timeout: Duration::from_millis(1)
             }
         );
-        let v = serde_json::to_value(AiReadResult {
-            columns: vec![],
-            rows: vec![],
-            truncated: true,
-            elapsed_ms: 3,
-            documents: None,
-        })
-        .unwrap();
-        assert_eq!(
-            v,
-            serde_json::json!({"columns": [], "rows": [], "truncated": true, "elapsedMs": 3})
+        let e = timeout_error(Duration::from_millis(300));
+        assert_eq!(e.code, ErrorCode::Timeout);
+        assert!(e.message.contains("300 ms"), "{}", e.message);
+        assert!(e.detail.is_none());
+    }
+
+    /// A fake server error, so the code tables can be checked without PostgreSQL or SQLite.
+    /// MySQL numbers live on the driver's own error type, so that arm stays integration-only.
+    #[derive(Debug)]
+    struct FakeDbError(&'static str, &'static str);
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake {}", self.0)
+        }
+    }
+    impl std::error::Error for FakeDbError {}
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            self.1
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    /// The server's answer decides between a refused write, a stacked statement, the read's own
+    /// limit, and the plain database error.
+    #[test]
+    fn server_codes_map_to_their_refusal() {
+        let err = |code: &'static str, message: &'static str| {
+            sqlx::Error::Database(Box::new(FakeDbError(code, message)))
+        };
+        let limit = Duration::from_secs(5);
+        let map = |engine, e, sql: &str| map_read_error(engine, e, sql, limit);
+
+        let e = map(
+            SqlEngine::Pg,
+            err("25006", "cannot execute INSERT in a read-only transaction"),
+            "INSERT INTO t VALUES (1)",
         );
-        assert_eq!(
-            timeout_error(Duration::from_secs(15)).message,
-            "The AI query did not finish within 15 s and was stopped"
+        assert_eq!(e.code, ErrorCode::ReadOnlyViolation);
+
+        // A syntax error on stacked text is the server stopping at the second statement; the
+        // same code on one statement stays the server's error.
+        let e = map(
+            SqlEngine::Pg,
+            err("42601", "cannot insert multiple commands into a prepared statement"),
+            "SELECT 1; DELETE FROM t",
         );
-        assert_eq!(
-            timeout_error(Duration::from_millis(300)).message,
-            "The AI query did not finish within 300 ms and was stopped"
-        );
+        assert_eq!(e.code, ErrorCode::ReadOnlyViolation);
+        let e = map(SqlEngine::Pg, err("42601", "syntax error"), "SELECT 1");
+        assert_eq!(e.code, ErrorCode::Database);
+
+        let e = map(SqlEngine::Pg, err("57014", "canceling statement"), "SELECT 1");
+        assert_eq!(e.code, ErrorCode::Timeout);
+        assert!(e.message.contains("5 s"), "{}", e.message);
+
+        // SQLite's extended result code: the low byte is the primary code.
+        for code in ["1032", "8"] {
+            let e = map(
+                SqlEngine::Sqlite,
+                err(code, "attempt to write a readonly database"),
+                "INSERT INTO t VALUES (1)",
+            );
+            assert_eq!(e.code, ErrorCode::ReadOnlyViolation, "{code}");
+        }
+        let e = map(SqlEngine::Sqlite, err("9", "interrupted"), "SELECT 1");
+        assert_eq!(e.code, ErrorCode::Timeout);
     }
 
     #[test]
     fn stacked_detection_ignores_semicolons_in_strings() {
+        let many = |e, sql: &str| crate::core::sql::split::split(e, sql).len() >= 2;
         // A `;` inside a string literal is one statement: a 1064 on it stays `database`, not
         // "refused a stacked statement".
-        assert!(!has_multiple_statements(
-            Engine::Mysql,
+        assert!(!many(
+            SqlEngine::Mysql,
             "SELECT id FROM orders WHERE status ILIKE 'a;b'"
         ));
-        assert!(has_multiple_statements(
-            Engine::Mysql,
+        assert!(many(
+            SqlEngine::Mysql,
             "SELECT 1; SET SESSION max_execution_time = 0"
         ));
-        assert!(has_multiple_statements(Engine::Pg, "COMMIT; SELECT 1"));
+        assert!(many(SqlEngine::Pg, "COMMIT; SELECT 1"));
         // Trailing semicolons and comments are still one statement.
-        assert!(!has_multiple_statements(Engine::Mysql, "SELECT 1; -- x"));
-    }
-
-    #[test]
-    fn system_schemas_are_recognised() {
-        // `SELECT DATABASE()` answers may vary in case; the check folds it.
-        for s in [
-            "mysql",
-            "MySQL",
-            "sys",
-            "performance_schema",
-            "information_schema",
-        ] {
-            assert!(is_system_schema(s), "{s}");
-        }
-        for s in ["shop", "analytics", "test", ""] {
-            assert!(!is_system_schema(s), "{s}");
-        }
+        assert!(!many(SqlEngine::Mysql, "SELECT 1; -- x"));
     }
 }

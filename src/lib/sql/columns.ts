@@ -14,7 +14,6 @@ const CLAUSE = new Set([
   'where', 'group', 'order', 'having', 'limit', 'offset', 'fetch', 'for', 'returning', 'window', 'qualify',
   'union', 'intersect', 'except', 'set', 'values', 'on', 'using', 'asc', 'desc', 'nulls', 'collate',
 ]);
-/** Words that follow a table without being its alias. */
 const NOT_ALIAS = new Set([
   ...JOIN_MODS,
   ...CLAUSE,
@@ -28,7 +27,6 @@ interface Token {
   kind: 'id' | 'punct';
 }
 
-/** Words, quoted identifiers and the punctuation that the scan cares about; numbers are ignored. */
 function tokenize(text: string): Token[] {
   const re = /"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[A-Za-z_][\w$]*|\d+(?:\.\d+)?|\.|\(|\)|,|;|[^\s]/g;
   const out: Token[] = [];
@@ -43,7 +41,6 @@ function tokenize(text: string): Token[] {
   return out;
 }
 
-/** `schema.table` at `start`; null for a function call, a subquery or anything else. */
 function readRef(tokens: Token[], start: number, columnList = false): { path: string[]; end: number } | null {
   let i = start;
   while (tokens[i]?.kind === 'id' && /^(only|lateral)$/i.test(tokens[i].value)) i++;
@@ -77,7 +74,6 @@ export function relationsIn(sql: string, dialect: Dialect): Relation[] {
   const seen = new Set<string>();
   let inFrom = false;
   let expectRef = false;
-  /** The next reference is `INSERT INTO t (cols)`, whose parentheses are a column list. */
   let refColumnList = false;
   let depth = 0;
   for (let i = 0; i < tokens.length; i++) {

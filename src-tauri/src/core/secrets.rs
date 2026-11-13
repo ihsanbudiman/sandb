@@ -20,6 +20,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 
+use crate::core::connections::Connection;
 use crate::core::error::{AppError, ErrorCode};
 use crate::core::store::write_atomic;
 
@@ -30,6 +31,8 @@ pub const LEGACY_CREDENTIALS_FILE: &str = "credentials.enc";
 pub const VAULT_FILE: &str = "secrets.enc";
 /// The one credential store entry of the app: the base64 key of `VAULT_FILE`.
 pub const VAULT_KEY_ACCOUNT: &str = "vault:key";
+/// Secret store account of the AI API key.
+pub const AI_KEY_ACCOUNT: &str = "ai:api_key";
 
 /// The key of `credentials.enc`. Kept only to read old files during migration.
 const KEY: [u8; 32] = [
@@ -43,6 +46,14 @@ const NONCE_LEN: usize = 12;
 
 pub fn password_account(conn_id: &str) -> String {
     format!("conn:{conn_id}:password")
+}
+
+/// Every password account of `connections`, in order.
+pub fn password_accounts(connections: &[Connection]) -> Vec<String> {
+    connections
+        .iter()
+        .map(|c| password_account(&c.id))
+        .collect()
 }
 
 pub trait SecretStore: Send + Sync {
@@ -60,7 +71,7 @@ fn secret_err(e: impl std::fmt::Display) -> AppError {
     .with_detail(e.to_string())
 }
 
-/// One credential store entry per account, all under the same `service` name.
+/// The credential store entry that holds the base64 key of `VAULT_FILE`, under `service`.
 pub struct KeychainStore {
     service: String,
 }

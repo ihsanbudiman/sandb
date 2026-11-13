@@ -6,13 +6,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AccessExpr, AlterTableOperation, BinaryOperator, Expr, Ident, ObjectName, ObjectNamePart,
-    Query, SetExpr, Statement, TableAliasColumnDef, TableFactor, Visit, Visitor,
+    AccessExpr, AlterTableOperation, BinaryOperator, ContextModifier, Expr, Ident, LimitClause,
+    ObjectName, ObjectNamePart, Query, Set, SetExpr, Statement, TableAliasColumnDef, TableFactor,
+    Value, Visit, Visitor,
 };
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
-use crate::core::connections::Engine;
+use crate::core::engine::SqlEngine;
 use crate::core::sql::functions;
 use crate::core::sql::split::{dialect, has_executable_comment};
 
@@ -29,19 +30,27 @@ pub enum StatementKind {
     Update,
     Delete,
     Merge,
-    /// BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE.
     Transaction,
-    /// SQLite `PRAGMA`; see [`StatementFacts::pragma`].
     Pragma,
-    /// CREATE … (table, view, index, schema, function, …).
     Create,
-    /// ALTER …
     Alter,
-    /// DROP …
     Drop,
     Truncate,
+    /// RENAME TABLE … (MySQL; PG spells it `ALTER TABLE … RENAME`, which is [`Alter`](Self::Alter)).
+    Rename,
     /// Anything else (SET, USE, CALL, COPY, LOCK, GRANT, …).
     Other,
+}
+
+impl StatementKind {
+    /// CREATE / ALTER / DROP / TRUNCATE / RENAME TABLE: the statement changes the schema, so a
+    /// catalog has to reload after it.
+    pub fn is_ddl(self) -> bool {
+        matches!(
+            self,
+            Self::Create | Self::Alter | Self::Drop | Self::Truncate | Self::Rename
+        )
+    }
 }
 
 /// How a SQLite `PRAGMA` is written.
@@ -76,7 +85,11 @@ pub struct StatementFacts {
     pub alter_drops: bool,
     /// EXPLAIN: the kind of the explained statement.
     pub explained: Option<Box<StatementKind>>,
-    /// SQLite PRAGMA: name and form.
+    /// MySQL commits the open transaction before running this statement (DDL, `SET autocommit`,
+    /// LOCK/UNLOCK TABLES, CALL, GRANT/REVOKE, ANALYZE, FLUSH, RESET). Always `false` for the
+    /// other engines, whose DDL is transactional. MySQL statements the parser cannot read carry
+    /// no fact: their text does not parse at all.
+    pub implicit_commit: bool,
     pub pragma: Option<Pragma>,
     /// Every function called, anywhere in the statement (subqueries, FROM, EXPLAIN targets):
     /// unquoted name parts lowercased, quoted parts as written, joined with `.`.
@@ -137,7 +150,7 @@ pub struct FieldAccess {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlFacts {
-    pub engine: Engine,
+    pub engine: SqlEngine,
     pub statements: Vec<StatementFacts>,
     /// MySQL `/*! … */` or `/*M! … */`: the server runs SQL the parser may not see.
     pub has_executable_comment: bool,
@@ -154,7 +167,7 @@ impl SqlFacts {
 
 /// Parses `sql` and collects facts per statement. MySQL text that does not parse (e.g.
 /// `INTO OUTFILE`, `INTO @v` after FROM) is an error; callers treat it as unknown.
-pub fn analyze(engine: Engine, sql: &str) -> Result<SqlFacts, ParserError> {
+pub fn analyze(engine: SqlEngine, sql: &str) -> Result<SqlFacts, ParserError> {
     let statements = match sqlite_pragma(engine, sql)? {
         Some(p) => vec![pragma_facts(p)],
         None => Parser::parse_sql(&*dialect(engine), sql)?
@@ -170,7 +183,7 @@ pub fn analyze(engine: Engine, sql: &str) -> Result<SqlFacts, ParserError> {
     })
 }
 
-fn has_optimizer_hint(engine: Engine, sql: &str) -> bool {
+fn has_optimizer_hint(engine: SqlEngine, sql: &str) -> bool {
     let d = dialect(engine);
     match Tokenizer::new(&*d, sql).tokenize() {
         Ok(tokens) => tokens.iter().any(|t| {
@@ -189,6 +202,7 @@ fn empty_facts(kind: StatementKind, label: String) -> StatementFacts {
         has_where: None,
         alter_drops: false,
         explained: None,
+        implicit_commit: false,
         pragma: None,
         functions: BTreeSet::new(),
         has_locking: false,
@@ -214,8 +228,8 @@ fn pragma_facts(p: Pragma) -> StatementFacts {
 /// `PRAGMA table_info(t)`), so a lone SQLite PRAGMA is read from the tokens:
 /// `PRAGMA [schema.]name [= value | (value)] [;]`. `Ok(None)` when the text is not a lone PRAGMA,
 /// so the normal parser handles it (and sees every statement of a multi-statement text).
-fn sqlite_pragma(engine: Engine, sql: &str) -> Result<Option<Pragma>, ParserError> {
-    if engine != Engine::Sqlite {
+fn sqlite_pragma(engine: SqlEngine, sql: &str) -> Result<Option<Pragma>, ParserError> {
+    if engine != SqlEngine::Sqlite {
         return Ok(None);
     }
     let d = dialect(engine);
@@ -271,9 +285,10 @@ fn sqlite_pragma(engine: Engine, sql: &str) -> Result<Option<Pragma>, ParserErro
     Ok(Some(Pragma { name, form }))
 }
 
-fn statement_facts(engine: Engine, s: &Statement) -> StatementFacts {
+fn statement_facts(engine: SqlEngine, s: &Statement) -> StatementFacts {
     let k = kind(s);
     let mut facts = empty_facts(k, label(s, k));
+    facts.implicit_commit = engine == SqlEngine::Mysql && commits_implicitly(s, k);
     facts.show_processlist = matches!(s, Statement::ShowProcessList { .. });
     if let Statement::ShowVariable { variable } = s {
         // Quoted names count too: `SHOW "primary_conninfo"` is valid on PG, and a quoted
@@ -357,12 +372,62 @@ fn kind(s: &Statement) -> StatementKind {
         Statement::Pragma { .. } => StatementKind::Pragma,
         Statement::Drop { .. } => StatementKind::Drop,
         Statement::Truncate(_) => StatementKind::Truncate,
+        Statement::RenameTable(_) => StatementKind::Rename,
         _ => match first_word(s).as_str() {
             "CREATE" => StatementKind::Create,
             "ALTER" => StatementKind::Alter,
             "DROP" => StatementKind::Drop,
             _ => StatementKind::Other,
         },
+    }
+}
+
+/// MySQL statements that commit the open transaction before they run, as far as the parser
+/// exposes them. MySQL spellings it cannot parse (`OPTIMIZE TABLE`, `REPAIR TABLE`, `LOAD DATA`,
+/// `INSTALL PLUGIN`, …) reach the callers as unparsable text, which is already reported as an
+/// unknown effect; the approved write treats it as a possible commit.
+fn commits_implicitly(s: &Statement, k: StatementKind) -> bool {
+    if k.is_ddl() {
+        return true;
+    }
+    match s {
+        Statement::Set(set) => sets_autocommit(set),
+        Statement::LockTables { .. }
+        | Statement::UnlockTables
+        | Statement::Call(_)
+        | Statement::Grant(_)
+        | Statement::Revoke(_)
+        | Statement::Analyze(_)
+        | Statement::Flush { .. }
+        | Statement::Reset(_) => true,
+        _ => false,
+    }
+}
+
+/// `SET [SESSION | LOCAL] autocommit = …` commits implicitly; `SET GLOBAL autocommit` only
+/// changes the default for new sessions, and every other variable (`FOREIGN_KEY_CHECKS`, `@x`)
+/// commits nothing. The `@@` spelling carries the scope inside the variable name:
+/// `@@autocommit` and `@@session.autocommit` are the session variable, `@@global.autocommit`
+/// is the global one.
+fn sets_autocommit(s: &Set) -> bool {
+    let autocommit = |name: &ObjectName| {
+        // MySQL tokenizes `@@global.autocommit` as the parts `@@global`, `autocommit`.
+        let mut parts = name.0.iter().filter_map(|p| match p {
+            ObjectNamePart::Identifier(i) => Some(i.value.trim_start_matches('@')),
+            _ => None,
+        });
+        let first = parts.next();
+        let last = parts.next_back().or(first);
+        first.is_none_or(|f| !f.eq_ignore_ascii_case("global"))
+            && last.is_some_and(|l| l.eq_ignore_ascii_case("autocommit"))
+    };
+    let session = |scope: &Option<ContextModifier>| !matches!(scope, Some(ContextModifier::Global));
+    match s {
+        Set::SingleAssignment { scope, variable, .. } => session(scope) && autocommit(variable),
+        Set::MultipleAssignments { assignments } => assignments
+            .iter()
+            .any(|a| session(&a.scope) && autocommit(&a.name)),
+        _ => false,
     }
 }
 
@@ -504,7 +569,7 @@ fn modifies(body: &SetExpr) -> bool {
 }
 
 struct Collector {
-    engine: Engine,
+    engine: SqlEngine,
     facts: StatementFacts,
 }
 
@@ -520,9 +585,9 @@ fn alias_columns<'a>(cols: impl Iterator<Item = &'a TableAliasColumnDef>) -> BTr
 /// column and not a possible attribute call. PG's json SRFs return `(key, value)`; the
 /// `*_object_keys` functions return a single column named after the function, which the
 /// default `{function_name}` fallback already covers. Other engines get the same fallback.
-fn srf_columns(engine: Engine, name: &str) -> &'static [&'static str] {
+fn srf_columns(engine: SqlEngine, name: &str) -> &'static [&'static str] {
     match engine {
-        Engine::Pg => match name {
+        SqlEngine::Pg => match name {
             "json_each" | "jsonb_each" | "json_each_text" | "jsonb_each_text" => &["key", "value"],
             _ => &[],
         },
@@ -553,7 +618,7 @@ fn column_name(i: &Ident) -> String {
 /// column list when there is one, else the function's own name plus the record columns of the
 /// SRFs that have them.
 fn row_function_columns(
-    engine: Engine,
+    engine: SqlEngine,
     name: &ObjectName,
     alias: Option<&sqlparser::ast::TableAlias>,
     with_ordinality: bool,
@@ -825,17 +890,17 @@ fn table_factor_alias(t: &TableFactor) -> Option<&Ident> {
 /// - the qualifier is the alias of a scalar row source (a set-returning function or UNNEST)
 ///   and the field is not a known output column, so `q.f` is `f(q)`.
 ///
-/// Callers reject when the list is not empty. Only for `Engine::Pg`: other dialects have no
+/// Callers reject when the list is not empty. Only for `SqlEngine::Pg`: other dialects have no
 /// attribute notation, so nothing is reported.
-pub fn attribute_calls(facts: &SqlFacts, s: &StatementFacts) -> Vec<String> {
-    if facts.engine != Engine::Pg {
+fn attribute_calls(facts: &SqlFacts, s: &StatementFacts) -> Vec<String> {
+    if facts.engine != SqlEngine::Pg {
         return Vec::new();
     }
     let mut out = BTreeSet::new();
     out.extend(s.dot_fields.iter().cloned());
     for fa in &s.field_accesses {
         if is_dangerous_field_name(&fa.field.to_lowercase())
-            && !functions::is_pure(Engine::Pg, &fa.field.to_lowercase())
+            && !functions::is_pure(SqlEngine::Pg, &fa.field.to_lowercase())
         {
             out.insert(fa.field.clone());
         }
@@ -885,47 +950,254 @@ pub(crate) fn is_dangerous_field_name(name: &str) -> bool {
         )
 }
 
+const READ_KINDS: &str = "Only one SELECT, WITH … SELECT, VALUES, SHOW, DESCRIBE or EXPLAIN \
+                          (without ANALYZE) statement is allowed";
+
+/// Who asks whether SQL only reads. The shared conjunction is the same; the profile picks which
+/// statements count as reads, which functions are allowed, and how a refusal reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadProfile {
+    /// The editor: one statement that can run again ("Load more", export), so every function
+    /// must be a pure built-in and its connection may go back to the pool.
+    Editor,
+    /// The AI read: the editor's rules, plus the [`AMPLIFYING`] overlay.
+    AiRead,
+    /// The read-only editor: the database barrier refuses writes, so the pre-check only has to
+    /// reject SQL that could write and session-mode changes. User-defined functions pass.
+    ReadOnlyEditor,
+}
+
+/// What the shared rules say about one statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadVerdict {
+    /// The statement only reads; `kind` is the word to show (`SELECT`, `SHOW`, …).
+    Read { kind: &'static str },
+    /// A non-read the profile lets through on a read-only connection: transaction control, a
+    /// `SET`, a SQLite PRAGMA. The caller adds its session-escape rules.
+    Mode,
+    /// Refused, with the sentence the caller shows.
+    Refused(String),
+}
+
+/// The executable-comment refusal for a profile, or `None`. MySQL runs the body of
+/// `/*! … */`, so the SQL the parser saw is not the SQL the server runs; every profile refuses
+/// it. Exposed so a caller can apply it before its own text checks.
+pub fn executable_comment_error(facts: &SqlFacts, profile: ReadProfile) -> Option<String> {
+    facts.has_executable_comment.then(|| match profile {
+        ReadProfile::AiRead => {
+            "MySQL executable comments (/*! … */ or /*M! … */) are not allowed".to_string()
+        }
+        ReadProfile::ReadOnlyEditor => {
+            "MySQL executable comments (/*! … */ or /*M! … */) are refused".to_string()
+        }
+        ReadProfile::Editor => "An executable comment is not a plain read".to_string(),
+    })
+}
+
+/// The shared read policy over a parsed text. `Err` refuses the text as a whole: executable
+/// comments, or a statement count the profile does not allow. Callers add their own rules
+/// (privacy, session-mode escapes) to a [`ReadVerdict::Read`].
+pub fn read_policy(facts: &SqlFacts, profile: ReadProfile) -> Result<Vec<ReadVerdict>, String> {
+    if let Some(reason) = executable_comment_error(facts, profile) {
+        return Err(reason);
+    }
+    match facts.statements.as_slice() {
+        [] => Err(match profile {
+            ReadProfile::AiRead => "The query has no statement".into(),
+            _ => "No statement".into(),
+        }),
+        [s] => Ok(vec![statement_read(facts, s, profile)]),
+        many if profile == ReadProfile::ReadOnlyEditor => {
+            // Each split statement is analysed on its own; text the splitter could not cut is
+            // still checked statement by statement.
+            Ok(many
+                .iter()
+                .map(|s| statement_read(facts, s, profile))
+                .collect())
+        }
+        many => Err(format!(
+            "Exactly one statement is allowed, found {}",
+            many.len()
+        )),
+    }
+}
+
+fn refused_label(s: &StatementFacts) -> String {
+    format!("{} statements are refused", s.label)
+}
+
+fn statement_read(facts: &SqlFacts, s: &StatementFacts, profile: ReadProfile) -> ReadVerdict {
+    let refuse = |reason: String| ReadVerdict::Refused(reason);
+    let not_a_read = || refuse(format!("{} is not a read. {READ_KINDS}", s.label));
+    let kind = match s.kind {
+        StatementKind::Query => "SELECT",
+        StatementKind::Show => {
+            if s.label == "DESCRIBE" {
+                "DESCRIBE"
+            } else {
+                "SHOW"
+            }
+        }
+        StatementKind::Explain { analyze: true } => {
+            return refuse(match profile {
+                ReadProfile::AiRead => {
+                    "EXPLAIN ANALYZE runs the statement; use EXPLAIN without ANALYZE".into()
+                }
+                _ => refused_label(s),
+            });
+        }
+        StatementKind::Explain { analyze: false } => {
+            if s.explained.as_deref() != Some(&StatementKind::Query) {
+                return refuse(match profile {
+                    ReadProfile::AiRead => {
+                        "EXPLAIN is only allowed for a SELECT query".into()
+                    }
+                    _ => refused_label(s),
+                });
+            }
+            "EXPLAIN"
+        }
+        StatementKind::Pragma => match profile {
+            ReadProfile::AiRead if facts.engine == SqlEngine::Sqlite => "PRAGMA",
+            ReadProfile::ReadOnlyEditor => return ReadVerdict::Mode,
+            _ => return not_a_read(),
+        },
+        // Transaction control and SET leave a read-only connection's data alone; the
+        // read-only editor checks them for session-mode escapes separately.
+        StatementKind::Transaction | StatementKind::Other
+            if profile == ReadProfile::ReadOnlyEditor =>
+        {
+            return ReadVerdict::Mode;
+        }
+        _ => return not_a_read(),
+    };
+    let flag = |set: bool, ai: &str, other: &str| {
+        if !set {
+            None
+        } else if profile == ReadProfile::AiRead {
+            Some(refuse(ai.to_string()))
+        } else {
+            Some(refuse(other.to_string()))
+        }
+    };
+    if let Some(v) = flag(
+        s.has_into,
+        "SELECT … INTO (a table, file or variable) is not allowed",
+        &refused_label(s),
+    ) {
+        return v;
+    }
+    if let Some(v) = flag(
+        s.has_locking,
+        "Locking reads (FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE) are not allowed",
+        &refused_label(s),
+    ) {
+        return v;
+    }
+    if let Some(v) = flag(
+        s.has_modifying_cte,
+        "A CTE or subquery that changes data (INSERT / UPDATE / DELETE / MERGE) is not allowed",
+        &refused_label(s),
+    ) {
+        return v;
+    }
+    if let Some(v) = flag(
+        s.has_variable_assignment,
+        "Assigning user variables (@v := …) is not allowed",
+        &refused_label(s),
+    ) {
+        return v;
+    }
+    if matches!(profile, ReadProfile::Editor | ReadProfile::AiRead) {
+        // `x.f` can be the attribute notation call `f(x)`, which `s.functions` never records.
+        let attr = attribute_calls(facts, s);
+        if !attr.is_empty() {
+            return refuse(match profile {
+                ReadProfile::AiRead => format!(
+                    "Possible attribute-notation function call{}: {}. PostgreSQL reads x.f as \
+                     f(x); write the column or an allowed function call instead",
+                    if attr.len() == 1 { "" } else { "s" },
+                    attr.join(", ")
+                ),
+                _ => refused_label(s),
+            });
+        }
+    }
+    if profile == ReadProfile::AiRead {
+        // The overlay next to the allow-list it narrows (`functions::AMPLIFYING`).
+        let amplifying: Vec<&str> = s
+            .functions
+            .iter()
+            .filter(|f| functions::is_amplifying(f))
+            .map(String::as_str)
+            .collect();
+        if !amplifying.is_empty() {
+            return refuse(format!(
+                "Function{} can build arbitrarily large values and is not allowed: {}",
+                if amplifying.len() == 1 { "" } else { "s" },
+                amplifying.join(", ")
+            ));
+        }
+    }
+    if matches!(profile, ReadProfile::Editor | ReadProfile::AiRead) {
+        let blocked: Vec<&str> = s
+            .functions
+            .iter()
+            .filter(|f| !functions::is_pure(facts.engine, f))
+            .map(String::as_str)
+            .collect();
+        if !blocked.is_empty() {
+            return refuse(match profile {
+                ReadProfile::AiRead => format!(
+                    "Function{} not on the read-only allow-list: {}. Use built-in string, math, \
+                     date, JSON, aggregate or window functions instead",
+                    if blocked.len() == 1 { "" } else { "s" },
+                    blocked.join(", ")
+                ),
+                _ => refused_label(s),
+            });
+        }
+    }
+    ReadVerdict::Read { kind }
+}
+
 /// The editor's phase 2 policy: one statement that only reads and leaves no session state, so
 /// "Load more" and export may run it again and its connection may go back to the pool.
-/// Every called function must be a pure built-in ([`functions::is_pure`]); a user-defined
-/// function is unknown and therefore not a plain read.
 pub fn is_plain_read(facts: &SqlFacts) -> bool {
-    let [s] = facts.statements.as_slice() else {
-        return false;
-    };
-    let explains_read = match s.kind {
-        StatementKind::Explain { analyze: false } => {
-            s.explained.as_deref() == Some(&StatementKind::Query)
-        }
-        _ => true,
-    };
-    !facts.has_executable_comment
-        && matches!(
-            s.kind,
-            StatementKind::Query | StatementKind::Show | StatementKind::Explain { analyze: false }
-        )
-        && explains_read
-        && !s.has_into
-        && !s.has_locking
-        && !s.has_modifying_cte
-        && !s.has_variable_assignment
-        && s.functions
-            .iter()
-            .all(|f| functions::is_pure(facts.engine, f))
-        // PG `x.f` can be `f(x)`; the same rule the AI guard applies.
-        && attribute_calls(facts, s).is_empty()
+    read_policy(facts, ReadProfile::Editor)
+        .is_ok_and(|v| v.iter().all(|r| matches!(r, ReadVerdict::Read { .. })))
 }
 
 /// [`analyze`] then [`is_plain_read`]; SQL that does not parse is not a plain read.
-pub fn is_plain_read_sql(engine: Engine, sql: &str) -> bool {
+pub fn is_plain_read_sql(engine: SqlEngine, sql: &str) -> bool {
     analyze(engine, sql).is_ok_and(|f| is_plain_read(&f))
+}
+
+/// The literal row count of the last statement's own `LIMIT` (also `LIMIT n OFFSET m` and
+/// MySQL/SQLite `LIMIT m, n`); `None` when it has none or the text does not parse.
+pub fn row_limit(engine: SqlEngine, sql: &str) -> Option<u64> {
+    let parsed = Parser::parse_sql(&*dialect(engine), sql).ok()?;
+    let Some(Statement::Query(q)) = parsed.last() else {
+        return None;
+    };
+    let n = match q.limit_clause.as_ref()? {
+        LimitClause::LimitOffset { limit, .. } => limit.as_ref()?,
+        LimitClause::OffsetCommaLimit { limit, .. } => limit,
+    };
+    match n {
+        Expr::Value(v) => match &v.value {
+            Value::Number(s, _) => s.parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn facts(e: Engine, sql: &str) -> StatementFacts {
+    fn facts(e: SqlEngine, sql: &str) -> StatementFacts {
         let f = analyze(e, sql).unwrap_or_else(|err| panic!("{sql}: {err}"));
         assert_eq!(f.statement_count(), 1, "{sql}");
         f.statements.into_iter().next().unwrap()
@@ -934,7 +1206,7 @@ mod tests {
     #[test]
     fn collects_function_names_everywhere() {
         let f = facts(
-            Engine::Pg,
+            SqlEngine::Pg,
             "SELECT lower(a), analytics.Score(b), \"MyFn\"(c) FROM generate_series(1, 3) g \
              WHERE id IN (SELECT max(id) FROM t WHERE x = nextval('s'))",
         );
@@ -956,36 +1228,108 @@ mod tests {
     #[test]
     fn statement_kinds_and_flags() {
         assert_eq!(
-            facts(Engine::Pg, "EXPLAIN ANALYZE SELECT 1").kind,
+            facts(SqlEngine::Pg, "EXPLAIN ANALYZE SELECT 1").kind,
             StatementKind::Explain { analyze: true }
         );
         assert_eq!(
-            facts(Engine::Pg, "EXPLAIN (ANALYZE) SELECT 1").kind,
+            facts(SqlEngine::Pg, "EXPLAIN (ANALYZE) SELECT 1").kind,
             StatementKind::Explain { analyze: true }
         );
         assert_eq!(
-            facts(Engine::Pg, "EXPLAIN (ANALYSE) SELECT 1").kind,
+            facts(SqlEngine::Pg, "EXPLAIN (ANALYSE) SELECT 1").kind,
             StatementKind::Explain { analyze: true }
         );
         assert_eq!(
-            facts(Engine::Pg, "WITH x AS (SELECT 1) DELETE FROM t").kind,
+            facts(SqlEngine::Pg, "WITH x AS (SELECT 1) DELETE FROM t").kind,
             StatementKind::Delete
         );
-        assert_eq!(facts(Engine::Pg, "BEGIN").kind, StatementKind::Transaction);
-        assert_eq!(facts(Engine::Mysql, "DESCRIBE t").kind, StatementKind::Show);
+        assert_eq!(facts(SqlEngine::Pg, "BEGIN").kind, StatementKind::Transaction);
+        assert_eq!(facts(SqlEngine::Mysql, "DESCRIBE t").kind, StatementKind::Show);
         let f = facts(
-            Engine::Pg,
+            SqlEngine::Pg,
             "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
         );
         assert!(f.has_modifying_cte && f.kind == StatementKind::Query);
-        assert!(facts(Engine::Mysql, "SELECT @v := 1").has_variable_assignment);
-        assert!(facts(Engine::Pg, "SELECT * INTO t2 FROM t").has_into);
+        assert!(facts(SqlEngine::Mysql, "SELECT @v := 1").has_variable_assignment);
+        assert!(facts(SqlEngine::Pg, "SELECT * INTO t2 FROM t").has_into);
         assert_eq!(
-            analyze(Engine::Pg, "SELECT 1; SELECT 2")
+            analyze(SqlEngine::Pg, "SELECT 1; SELECT 2")
                 .unwrap()
                 .statement_count(),
             2
         );
+    }
+
+    #[test]
+    fn mysql_implicit_commits_are_found() {
+        for sql in [
+            "CREATE TABLE t (id int)",
+            "ALTER TABLE t ADD COLUMN b int",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "RENAME TABLE a TO b",
+            "SET autocommit = 0",
+            "SET SESSION autocommit = 1",
+            "SET @@autocommit = 1",
+            "SET @@session.autocommit = 1",
+            "LOCK TABLES t WRITE",
+            "UNLOCK TABLES",
+            "CALL p()",
+            "GRANT SELECT ON db.* TO u",
+            "REVOKE SELECT ON db.* FROM u",
+            "ANALYZE TABLE t",
+            "FLUSH TABLES",
+            "RESET MASTER",
+        ] {
+            assert!(facts(SqlEngine::Mysql, sql).implicit_commit, "{sql}");
+        }
+        // MySQL `OPTIMIZE TABLE`, `REPAIR TABLE` and `LOAD DATA` do not parse under this
+        // dialect, so they reach the callers as unparsable text instead of a fact.
+        for sql in [
+            "OPTIMIZE TABLE t",
+            "REPAIR TABLE t",
+            "LOAD DATA INFILE 'f' INTO TABLE t",
+        ] {
+            assert!(analyze(SqlEngine::Mysql, sql).is_err(), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1 WHERE id = 2",
+            "DELETE FROM t WHERE id = 3",
+            "SET FOREIGN_KEY_CHECKS = 0",
+            "SET @x = 1",
+            "SET SESSION sql_mode = ''",
+            "SET GLOBAL autocommit = 1",
+            "SET @@global.autocommit = 1",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "USE db",
+        ] {
+            assert!(!facts(SqlEngine::Mysql, sql).implicit_commit, "{sql}");
+        }
+        // DDL is transactional outside MySQL, so the fact stays false there.
+        assert!(!facts(SqlEngine::Pg, "CREATE TABLE t (id int)").implicit_commit);
+        assert!(!facts(SqlEngine::Sqlite, "DROP TABLE t").implicit_commit);
+    }
+
+    #[test]
+    fn ddl_kinds() {
+        for k in [
+            StatementKind::Create,
+            StatementKind::Alter,
+            StatementKind::Drop,
+            StatementKind::Truncate,
+            StatementKind::Rename,
+        ] {
+            assert!(k.is_ddl(), "{k:?}");
+        }
+        for k in [
+            StatementKind::Query,
+            StatementKind::Insert,
+            StatementKind::Other,
+        ] {
+            assert!(!k.is_ddl(), "{k:?}");
+        }
     }
 
     #[test]
@@ -996,47 +1340,47 @@ mod tests {
             "WITH a AS (WITH b AS (DELETE FROM t RETURNING *) SELECT * FROM b) SELECT * FROM a",
             "WITH a AS (SELECT 1 UNION ALL (UPDATE t SET x = 1 RETURNING 1)) SELECT * FROM a",
         ] {
-            let f = analyze(Engine::Pg, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let f = analyze(SqlEngine::Pg, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
             assert!(f.statements[0].has_modifying_cte, "{sql}");
         }
     }
 
     #[test]
     fn labels_targets_and_where() {
-        let f = facts(Engine::Pg, "CREATE OR REPLACE TEMP VIEW v AS SELECT 1");
+        let f = facts(SqlEngine::Pg, "CREATE OR REPLACE TEMP VIEW v AS SELECT 1");
         assert_eq!(
             (f.kind, f.label.as_str()),
             (StatementKind::Create, "CREATE VIEW")
         );
         assert_eq!(f.target.as_deref(), Some("v"));
-        let f = facts(Engine::Pg, "CREATE MATERIALIZED VIEW m AS SELECT 1");
+        let f = facts(SqlEngine::Pg, "CREATE MATERIALIZED VIEW m AS SELECT 1");
         assert_eq!(f.label, "CREATE MATERIALIZED VIEW");
-        let f = facts(Engine::Pg, "DROP TABLE IF EXISTS a, s.b");
+        let f = facts(SqlEngine::Pg, "DROP TABLE IF EXISTS a, s.b");
         assert_eq!(
             (f.kind, f.label.as_str()),
             (StatementKind::Drop, "DROP TABLE")
         );
         assert_eq!(f.target.as_deref(), Some("a, s.b"));
-        let f = facts(Engine::Pg, "UPDATE s.t SET a = 1");
+        let f = facts(SqlEngine::Pg, "UPDATE s.t SET a = 1");
         assert_eq!(
             (f.target.as_deref(), f.has_where),
             (Some("s.t"), Some(false))
         );
-        let f = facts(Engine::Pg, "DELETE FROM t WHERE id = 1");
+        let f = facts(SqlEngine::Pg, "DELETE FROM t WHERE id = 1");
         assert_eq!((f.target.as_deref(), f.has_where), (Some("t"), Some(true)));
-        let f = facts(Engine::Mysql, "ALTER TABLE t DROP COLUMN a");
+        let f = facts(SqlEngine::Mysql, "ALTER TABLE t DROP COLUMN a");
         assert_eq!((f.kind, f.alter_drops), (StatementKind::Alter, true));
-        assert!(!facts(Engine::Mysql, "ALTER TABLE t ADD COLUMN b int").alter_drops);
-        assert_eq!(facts(Engine::Pg, "SET ROLE admin").label, "SET");
-        assert_eq!(facts(Engine::Pg, "COPY t TO PROGRAM 'x'").label, "COPY");
-        assert_eq!(facts(Engine::Mysql, "DESC t").label, "DESCRIBE");
-        let f = facts(Engine::Pg, "EXPLAIN DELETE FROM t");
+        assert!(!facts(SqlEngine::Mysql, "ALTER TABLE t ADD COLUMN b int").alter_drops);
+        assert_eq!(facts(SqlEngine::Pg, "SET ROLE admin").label, "SET");
+        assert_eq!(facts(SqlEngine::Pg, "COPY t TO PROGRAM 'x'").label, "COPY");
+        assert_eq!(facts(SqlEngine::Mysql, "DESC t").label, "DESCRIBE");
+        let f = facts(SqlEngine::Pg, "EXPLAIN DELETE FROM t");
         assert_eq!(f.explained.as_deref(), Some(&StatementKind::Delete));
     }
 
     #[test]
     fn sqlite_pragmas() {
-        let p = |sql: &str| facts(Engine::Sqlite, sql).pragma.unwrap();
+        let p = |sql: &str| facts(SqlEngine::Sqlite, sql).pragma.unwrap();
         assert_eq!(
             p("PRAGMA table_info(t)"),
             Pragma {
@@ -1049,10 +1393,10 @@ mod tests {
         assert_eq!(p("PRAGMA cache_size = -2000").form, PragmaForm::Assign);
         assert_eq!(p("PRAGMA writable_schema=1").form, PragmaForm::Assign);
         assert_eq!(p("PRAGMA user_version").form, PragmaForm::Read);
-        assert!(analyze(Engine::Sqlite, "PRAGMA table_info(t) junk").is_err());
+        assert!(analyze(SqlEngine::Sqlite, "PRAGMA table_info(t) junk").is_err());
         // A second statement goes to the normal parser, which sees both statements or fails.
         assert!(
-            analyze(Engine::Sqlite, "PRAGMA table_info('t'); DELETE FROM t")
+            analyze(SqlEngine::Sqlite, "PRAGMA table_info('t'); DELETE FROM t")
                 .is_ok_and(|f| f.statement_count() == 2)
         );
     }
@@ -1060,22 +1404,22 @@ mod tests {
     #[test]
     fn optimizer_hints_are_seen_in_comments_only() {
         assert!(
-            analyze(Engine::Mysql, "SELECT /*+ MAX_EXECUTION_TIME(0) */ 1")
+            analyze(SqlEngine::Mysql, "SELECT /*+ MAX_EXECUTION_TIME(0) */ 1")
                 .unwrap()
                 .has_optimizer_hint
         );
         assert!(
-            analyze(Engine::Pg, "/*+ Set(statement_timeout 0) */ SELECT 1")
+            analyze(SqlEngine::Pg, "/*+ Set(statement_timeout 0) */ SELECT 1")
                 .unwrap()
                 .has_optimizer_hint
         );
         assert!(
-            !analyze(Engine::Pg, "SELECT '/*+ x */'")
+            !analyze(SqlEngine::Pg, "SELECT '/*+ x */'")
                 .unwrap()
                 .has_optimizer_hint
         );
         assert!(
-            !analyze(Engine::Pg, "SELECT 1 /* plain */")
+            !analyze(SqlEngine::Pg, "SELECT 1 /* plain */")
                 .unwrap()
                 .has_optimizer_hint
         );
@@ -1084,12 +1428,12 @@ mod tests {
     #[test]
     fn plain_reads() {
         for (e, sql) in [
-            (Engine::Pg, "SELECT 1"),
-            (Engine::Pg, "with x as (select 1) select * from x"),
-            (Engine::Pg, "SELECT 1 UNION SELECT 2"),
-            (Engine::Pg, "VALUES (1)"),
+            (SqlEngine::Pg, "SELECT 1"),
+            (SqlEngine::Pg, "with x as (select 1) select * from x"),
+            (SqlEngine::Pg, "SELECT 1 UNION SELECT 2"),
+            (SqlEngine::Pg, "VALUES (1)"),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT c.name, count(o.id) AS n, sum(o.total), \
                  row_number() OVER (ORDER BY count(o.id) DESC) AS r, \
                  lag(sum(o.total)) OVER (ORDER BY c.name) \
@@ -1097,73 +1441,73 @@ mod tests {
                  WHERE o.created_at > now() - interval '1 day' AND lower(c.email) LIKE '%@x' \
                  GROUP BY c.name HAVING count(*) > 1 ORDER BY 2 DESC",
             ),
-            (Engine::Pg, "SELECT * FROM generate_series(1, 10) g"),
+            (SqlEngine::Pg, "SELECT * FROM generate_series(1, 10) g"),
             // qualified columns on real tables and aliases stay plain reads
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT c.name, o.id FROM customers c JOIN orders o ON o.customer_id = c.id",
             ),
-            (Engine::Pg, "SELECT a.b.c FROM analytics.events a"),
-            (Engine::Pg, "SELECT x.unnest FROM unnest(ARRAY[1, 2]) x"),
+            (SqlEngine::Pg, "SELECT a.b.c FROM analytics.events a"),
+            (SqlEngine::Pg, "SELECT x.unnest FROM unnest(ARRAY[1, 2]) x"),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT u.generate_series FROM generate_series(1, 5) u",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT d.a FROM (SELECT id AS a FROM customers) d",
             ),
-            (Engine::Pg, "SELECT v.x FROM (VALUES (1, 'a')) v(x, y)"),
+            (SqlEngine::Pg, "SELECT v.x FROM (VALUES (1, 'a')) v(x, y)"),
             // the implicit unnest alias names its own row column
-            (Engine::Pg, "SELECT unnest.unnest FROM unnest(ARRAY[1])"),
+            (SqlEngine::Pg, "SELECT unnest.unnest FROM unnest(ARRAY[1])"),
             // a PG SRF's real record columns stay readable
-            (Engine::Pg, "SELECT e.key FROM jsonb_each('{}') e"),
+            (SqlEngine::Pg, "SELECT e.key FROM jsonb_each('{}') e"),
             // column references that match the declared name exactly, quoted or not
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT x.upper FROM unnest(ARRAY['abc']) AS x(\"upper\")",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT x.\"UPPER\" FROM unnest(ARRAY['abc']) AS x(\"UPPER\")",
             ),
             // CTE/derived/VALUES aliases address rows: any field name is allowed
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "WITH x AS (SELECT * FROM orders) SELECT x.id FROM x",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT s.customer_id FROM (SELECT customer_id, sum(total) FROM orders GROUP BY 1) s",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT o.id, c.customer_id FROM orders o JOIN (SELECT customer_id, count(*) FROM orders GROUP BY 1) c ON o.customer_id = c.customer_id",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT o.id FROM (SELECT o.*, 1 AS k FROM orders o) o",
             ),
-            (Engine::Pg, "SELECT t.column1 FROM (VALUES (1)) t"),
+            (SqlEngine::Pg, "SELECT t.column1 FROM (VALUES (1)) t"),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT n.i FROM (SELECT i FROM generate_series(1, 5) i) n",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT CAST(a AS text), EXTRACT(year FROM d) FROM t",
             ),
-            (Engine::Pg, "SHOW search_path"),
-            (Engine::Pg, "EXPLAIN SELECT * FROM t"),
-            (Engine::Mysql, "SHOW TABLES"),
-            (Engine::Mysql, "DESCRIBE t"),
+            (SqlEngine::Pg, "SHOW search_path"),
+            (SqlEngine::Pg, "EXPLAIN SELECT * FROM t"),
+            (SqlEngine::Mysql, "SHOW TABLES"),
+            (SqlEngine::Mysql, "DESCRIBE t"),
             (
-                Engine::Mysql,
+                SqlEngine::Mysql,
                 "SELECT CONCAT(a, '\\n', b), GROUP_CONCAT(c) FROM t",
             ),
-            (Engine::Mysql, "SELECT 1 /* plain comment */"),
-            (Engine::Sqlite, "SELECT * FROM t"),
-            (Engine::Sqlite, "SELECT 'a' || char(10) || 'b'"),
+            (SqlEngine::Mysql, "SELECT 1 /* plain comment */"),
+            (SqlEngine::Sqlite, "SELECT * FROM t"),
+            (SqlEngine::Sqlite, "SELECT 'a' || char(10) || 'b'"),
         ] {
             assert!(is_plain_read_sql(e, sql), "{sql}");
         }
@@ -1173,125 +1517,125 @@ mod tests {
     fn not_plain_reads() {
         for (e, sql) in [
             // functions with side effects or session state
-            (Engine::Pg, "SELECT nextval('s')"),
+            (SqlEngine::Pg, "SELECT nextval('s')"),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT nextval('s') FROM generate_series(1, 1000)",
             ),
-            (Engine::Pg, "SELECT set_config('search_path', 'x', false)"),
-            (Engine::Pg, "SELECT pg_advisory_lock(1)"),
-            (Engine::Mysql, "SELECT GET_LOCK('k', 0)"),
-            (Engine::Pg, "SELECT my_func()"),
-            (Engine::Pg, "SELECT * FROM my_set_returning_func()"),
-            (Engine::Pg, "SELECT public.lower(a) FROM t"),
-            (Engine::Mysql, "SELECT @v := 1"),
+            (SqlEngine::Pg, "SELECT set_config('search_path', 'x', false)"),
+            (SqlEngine::Pg, "SELECT pg_advisory_lock(1)"),
+            (SqlEngine::Mysql, "SELECT GET_LOCK('k', 0)"),
+            (SqlEngine::Pg, "SELECT my_func()"),
+            (SqlEngine::Pg, "SELECT * FROM my_set_returning_func()"),
+            (SqlEngine::Pg, "SELECT public.lower(a) FROM t"),
+            (SqlEngine::Mysql, "SELECT @v := 1"),
             // PG attribute notation calls a function the functions list never sees
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT x.pg_terminate_backend FROM pg_stat_activity a, unnest(ARRAY[a.pid]) x",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT g.pg_terminate_backend FROM generate_series(1, 100000) g",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT g.pg_sleep FROM unnest(ARRAY[10::float8]) g",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT f.pg_read_file FROM unnest(ARRAY['/etc/passwd']) f",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT (g).pg_cancel_backend FROM generate_series(1, 10) g",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT d.pg_sleep FROM (SELECT pid FROM pg_stat_activity) d",
             ),
-            (Engine::Pg, "SELECT c.pg_sleep FROM (VALUES (1)) c(x)"),
+            (SqlEngine::Pg, "SELECT c.pg_sleep FROM (VALUES (1)) c(x)"),
             // dot steps on a non-column root call a one-argument function on the value
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT ('SELECT to_tsvector(pg_cancel_backend(0)::text)'::text).ts_stat",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT (x.c).ts_stat FROM unnest(ARRAY[$$SELECT to_tsvector(pg_cancel_backend(0)::text)$$]) AS x(c)",
             ),
-            (Engine::Pg, "SELECT (CAST('q' AS text)).ts_stat"),
+            (SqlEngine::Pg, "SELECT (CAST('q' AS text)).ts_stat"),
             // a CTE name shadowed by a row-function alias, and the implicit unnest alias
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "WITH x AS (SELECT 1) SELECT x.gin_clean_pending_list FROM unnest(ARRAY['orders_pkey'::regclass]) x",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "WITH x AS (SELECT 1) SELECT x.http_get FROM unnest(ARRAY['http://e']) x",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT unnest.http_get FROM unnest(ARRAY['http://e'])",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "WITH x AS (SELECT 1) SELECT x.upper FROM unnest(ARRAY['abc']) x",
             ),
             // quoted/unquoted and ASCII/non-ASCII case variants of the same alias
-            (Engine::Pg, "SELECT \"É\".upper FROM unnest(ARRAY['abc']) É"),
-            (Engine::Pg, "SELECT É.upper FROM unnest(ARRAY['abc']) \"É\""),
+            (SqlEngine::Pg, "SELECT \"É\".upper FROM unnest(ARRAY['abc']) É"),
+            (SqlEngine::Pg, "SELECT É.upper FROM unnest(ARRAY['abc']) \"É\""),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT \"É\".gin_clean_pending_list FROM unnest(ARRAY['orders_pkey'::regclass]) É",
             ),
-            (Engine::Pg, "SELECT \"X\".upper FROM unnest(ARRAY['abc']) x"),
+            (SqlEngine::Pg, "SELECT \"X\".upper FROM unnest(ARRAY['abc']) x"),
             // an explicit column list wins over the SRF's own columns on PG
-            (Engine::Pg, "SELECT e.path FROM jsonb_each('{}') AS e(k, v)"),
+            (SqlEngine::Pg, "SELECT e.path FROM jsonb_each('{}') AS e(k, v)"),
             // a quoted column name does not answer to a differently-cased field reference
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT x.upper FROM unnest(ARRAY['abc']) AS x(\"UPPER\")",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT x.gin_clean_pending_list FROM unnest(ARRAY['orders_pkey'::regclass]) AS x(\"GIN_CLEAN_PENDING_LIST\")",
             ),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT x.upper FROM generate_series(1,2) AS x(\"Upper\")",
             ),
             // locking, INTO, data-modifying CTE
-            (Engine::Pg, "SELECT * FROM t FOR UPDATE"),
-            (Engine::Pg, "SELECT * FROM (SELECT * FROM t FOR UPDATE) s"),
+            (SqlEngine::Pg, "SELECT * FROM t FOR UPDATE"),
+            (SqlEngine::Pg, "SELECT * FROM (SELECT * FROM t FOR UPDATE) s"),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "SELECT * FROM t WHERE id IN (SELECT id FROM u FOR SHARE)",
             ),
-            (Engine::Mysql, "SELECT * FROM t LOCK IN SHARE MODE"),
-            (Engine::Pg, "SELECT * INTO t2 FROM t"),
-            (Engine::Mysql, "SELECT a INTO @v FROM t"),
-            (Engine::Mysql, "SELECT a FROM t INTO OUTFILE '/tmp/x'"),
+            (SqlEngine::Mysql, "SELECT * FROM t LOCK IN SHARE MODE"),
+            (SqlEngine::Pg, "SELECT * INTO t2 FROM t"),
+            (SqlEngine::Mysql, "SELECT a INTO @v FROM t"),
+            (SqlEngine::Mysql, "SELECT a FROM t INTO OUTFILE '/tmp/x'"),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
             ),
-            (Engine::Pg, "SELECT 1 UNION (DELETE FROM t RETURNING 1)"),
+            (SqlEngine::Pg, "SELECT 1 UNION (DELETE FROM t RETURNING 1)"),
             // EXPLAIN that runs the statement, or explains a write
-            (Engine::Pg, "EXPLAIN ANALYZE SELECT * FROM t"),
-            (Engine::Pg, "EXPLAIN (ANALYZE) DELETE FROM t"),
-            (Engine::Mysql, "EXPLAIN ANALYZE SELECT * FROM t"),
-            (Engine::Pg, "EXPLAIN DELETE FROM t"),
+            (SqlEngine::Pg, "EXPLAIN ANALYZE SELECT * FROM t"),
+            (SqlEngine::Pg, "EXPLAIN (ANALYZE) DELETE FROM t"),
+            (SqlEngine::Mysql, "EXPLAIN ANALYZE SELECT * FROM t"),
+            (SqlEngine::Pg, "EXPLAIN DELETE FROM t"),
             // writes, session state, several statements, unparsable text
-            (Engine::Pg, "UPDATE t SET a = 1 RETURNING a"),
-            (Engine::Pg, "SET search_path TO analytics"),
-            (Engine::Pg, "BEGIN"),
-            (Engine::Pg, "SELECT 1; SELECT 2"),
-            (Engine::Mysql, "USE analytics"),
-            (Engine::Sqlite, "PRAGMA journal_mode = WAL"),
-            (Engine::Pg, "SELEC 1"),
+            (SqlEngine::Pg, "UPDATE t SET a = 1 RETURNING a"),
+            (SqlEngine::Pg, "SET search_path TO analytics"),
+            (SqlEngine::Pg, "BEGIN"),
+            (SqlEngine::Pg, "SELECT 1; SELECT 2"),
+            (SqlEngine::Mysql, "USE analytics"),
+            (SqlEngine::Sqlite, "PRAGMA journal_mode = WAL"),
+            (SqlEngine::Pg, "SELEC 1"),
             (
-                Engine::Pg,
+                SqlEngine::Pg,
                 "DO $$ BEGIN PERFORM 1; END $$; SELECT 1 AS a; SELECT 'x' AS b, 'y' AS c",
             ),
         ] {
@@ -1305,7 +1649,7 @@ mod tests {
     /// parser at all, so any executable comment makes the text "not a plain read".
     #[test]
     fn mysql_executable_comments() {
-        let f = analyze(Engine::Mysql, "SELECT 1 /*!; DELETE FROM t */").unwrap();
+        let f = analyze(SqlEngine::Mysql, "SELECT 1 /*!; DELETE FROM t */").unwrap();
         assert_eq!(f.statement_count(), 2);
         assert_eq!(f.statements[1].kind, StatementKind::Delete);
         assert!(f.has_executable_comment);
@@ -1316,11 +1660,22 @@ mod tests {
             "SELECT 1 /*!*/",
             "SELECT 1 /*M! , GET_LOCK('k', 0) */",
         ] {
-            let f = analyze(Engine::Mysql, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let f = analyze(SqlEngine::Mysql, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
             assert!(f.has_executable_comment, "{sql}");
             assert!(!is_plain_read(&f), "{sql}");
         }
         // Not an executable comment for PG/SQLite.
-        assert!(is_plain_read_sql(Engine::Pg, "SELECT 1 /*! x */"));
+        assert!(is_plain_read_sql(SqlEngine::Pg, "SELECT 1 /*! x */"));
+    }
+
+    /// The row count, not the offset, sizes the first page: `LIMIT 10, 500` asks for 500 rows.
+    #[test]
+    fn row_limit_is_the_count_of_the_last_query() {
+        assert_eq!(row_limit(SqlEngine::Pg, "SELECT * FROM t LIMIT 500 OFFSET 10"), Some(500));
+        assert_eq!(row_limit(SqlEngine::Mysql, "SELECT * FROM t LIMIT 10, 500"), Some(500));
+        assert_eq!(row_limit(SqlEngine::Sqlite, "SELECT 1 LIMIT 5; SELECT 2 LIMIT 700"), Some(700));
+        assert_eq!(row_limit(SqlEngine::Pg, "SELECT * FROM t LIMIT ALL"), None);
+        assert_eq!(row_limit(SqlEngine::Pg, "SELECT * FROM (SELECT 1 LIMIT 900) s"), None);
+        assert_eq!(row_limit(SqlEngine::Pg, "DELETE FROM t"), None);
     }
 }

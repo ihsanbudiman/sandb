@@ -5,55 +5,33 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::TryStreamExt;
-use serde::Deserialize;
 use sqlx::mysql::MySqlRow;
 use sqlx::postgres::PgRow;
 use sqlx::{Decode, MySql, MySqlPool, PgPool, Row, Sqlite, SqlitePool, TypeInfo, ValueRef};
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use crate::core::connections::{self, Connection, Engine};
-use crate::core::db::export::{self, ExportResult};
-use crate::core::db::introspect::not_found_table;
+use crate::core::connections::Connection;
+use crate::core::db::ctx::Ctx;
 use crate::core::db::pool::DbPool;
+use crate::core::db::reader::mysql_text;
 use crate::core::db::value::SqliteRaw;
+use crate::core::engine::SqlEngine;
 use crate::core::error::AppError;
-use crate::core::mongo;
-use crate::core::state::AppState;
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TableExportRequest {
-    pub conn_id: String,
-    pub database: String,
-    /// PG schema (default `public`); ignored elsewhere.
-    #[serde(default)]
-    pub schema: Option<String>,
-    pub table: String,
-    /// Also write INSERT statements for every row (tables only; a view exports its DDL alone).
-    pub data: bool,
-}
+use crate::core::export_file::ExportFile;
+use crate::core::result::{ExportResult, TableExportRequest, not_found_table};
 
 /// Rows per INSERT statement.
 const BATCH: usize = 100;
 
-/// The DDL of one table or view, as statements that each end with `;`. On MongoDB: the mongosh
-/// text that creates the collection with its options, validator and indexes.
+/// The DDL of one table or view, as statements that each end with `;`.
 pub async fn table_ddl(
-    state: &AppState,
-    conn_id: &str,
+    ctx: &Ctx<'_>,
+    conn: &Connection,
     database: &str,
     schema: Option<&str>,
     table: &str,
 ) -> Result<String, AppError> {
-    if connections::get(state, conn_id)?.engine == Engine::Mongo {
-        return mongo::dump::collection_ddl(
-            &mongo::client::client(state, conn_id).await?,
-            database,
-            table,
-        )
-        .await;
-    }
-    let ddl = match connections::pool_for(state, conn_id, Some(database))? {
+    let ddl = match ctx.pool_for(conn, Some(database))? {
         DbPool::Pg(p) => pg_ddl(&p, schema.unwrap_or("public"), table).await?.ddl,
         DbPool::MySql(p) => mysql_ddl(&p, database, table).await?.ddl,
         DbPool::Sqlite(p) => sqlite_ddl(&p, table).await?.ddl,
@@ -62,74 +40,33 @@ pub async fn table_ddl(
 }
 
 /// Writes a header comment, the DDL and (when `req.data`) the rows to a temp file next to
-/// `path`, then renames it over `path`. On failure only the temp file is removed.
+/// `path`, then renames it over `path`.
 pub async fn export_table_sql(
-    state: &AppState,
+    ctx: &Ctx<'_>,
+    conn: &Connection,
+    engine: SqlEngine,
     req: TableExportRequest,
     path: &Path,
 ) -> Result<ExportResult, AppError> {
-    if !path.is_absolute() {
-        return Err(AppError::invalid("Choose a file to export to"));
-    }
-    let conn = connections::get(state, &req.conn_id)?;
-    if conn.engine == Engine::Mongo {
-        return mongo::dump::export_collection(state, &conn, req, path).await;
-    }
-    let pool = connections::pool_for(state, &conn.id, Some(&req.database))?;
-    let tmp = export::temp_path(path);
-    let file = tokio::fs::File::create(&tmp).await?;
-    let mut out = BufWriter::new(file);
-    let res = async {
-        let rows = match &pool {
-            DbPool::Pg(p) => pg_export(p, &conn, &req, &mut out).await?,
-            DbPool::MySql(p) => mysql_export(p, &conn, &req, &mut out).await?,
-            DbPool::Sqlite(p) => sqlite_export(p, &conn, &req, &mut out).await?,
-        };
-        out.flush().await?;
-        out.get_ref().sync_all().await?;
-        Ok::<_, AppError>(rows)
-    }
-    .await;
-    drop(out);
-    let res = match res {
-        Ok(rows) => tokio::fs::rename(&tmp, path)
-            .await
-            .map(|()| rows)
-            .map_err(AppError::from),
-        Err(e) => Err(e),
-    };
-    match res {
-        Ok(rows) => Ok(ExportResult {
-            cancelled: false,
-            rows,
-            path: path.display().to_string(),
-        }),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            Err(e)
+    let pool = ctx.pool_for(conn, Some(&req.database))?;
+    let mut file =
+        ExportFile::for_query(path, ctx.queries, &conn.id, &req.database, conn.engine).await?;
+    let rows = {
+        let out = file.out();
+        match &pool {
+            DbPool::Pg(p) => pg_export(p, conn, engine, &req, out).await?,
+            DbPool::MySql(p) => mysql_export(p, conn, engine, &req, out).await?,
+            DbPool::Sqlite(p) => sqlite_export(p, conn, engine, &req, out).await?,
         }
-    }
+    };
+    file.finish(rows).await
 }
 
-/// A resolved table or view and its DDL.
 struct Target {
     ddl: String,
     view: bool,
     /// Quoted name the INSERT statements target.
     qualified: String,
-}
-
-// ---------------------------------------------------------------------------------------------
-// Literals and identifiers (pure, unit tested)
-
-/// `"name"` (SQLite, standard SQL): inner `"` doubled.
-pub(crate) fn quote_dq(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// `` `name` `` (MySQL): inner backticks doubled.
-pub(crate) fn quote_bt(name: &str) -> String {
-    format!("`{}`", name.replace('`', "``"))
 }
 
 /// `'text'` with `'` doubled: PG (standard_conforming_strings, the default) and SQLite.
@@ -258,7 +195,6 @@ fn pg_column_def(c: &PgColumn) -> String {
     s
 }
 
-/// `s` with one trailing `;`.
 fn statement(s: &str) -> String {
     let s = s.trim_end();
     if s.ends_with(';') {
@@ -290,14 +226,9 @@ fn format_utc(secs: u64) -> String {
     )
 }
 
-pub(crate) fn header(conn: &Connection, table: &str) -> String {
+pub(crate) fn header(conn: &Connection, engine: SqlEngine, table: &str) -> String {
     let engine = if conn.version.is_empty() {
-        match conn.engine {
-            Engine::Pg => "PostgreSQL",
-            Engine::Mysql => "MySQL",
-            Engine::Sqlite => "SQLite",
-            Engine::Mongo => "MongoDB",
-        }
+        engine.label()
     } else {
         conn.version.as_str()
     };
@@ -315,7 +246,6 @@ pub(crate) fn header(conn: &Connection, table: &str) -> String {
     )
 }
 
-/// INSERT statements of up to `batch` rows each, written as rows arrive.
 pub(crate) struct Inserts<'a, W> {
     out: &'a mut W,
     head: String,
@@ -386,9 +316,6 @@ async fn write_ddl(
     out.write_all(b"\n").await?;
     Ok(())
 }
-
-// ---------------------------------------------------------------------------------------------
-// PostgreSQL
 
 struct PgColumn {
     name: String,
@@ -588,6 +515,7 @@ async fn pg_ddl(p: &PgPool, schema: &str, table: &str) -> Result<Target, AppErro
 async fn pg_export<W: AsyncWrite + Unpin>(
     p: &PgPool,
     conn: &Connection,
+    engine: SqlEngine,
     req: &TableExportRequest,
     out: &mut W,
 ) -> Result<u64, AppError> {
@@ -595,7 +523,7 @@ async fn pg_export<W: AsyncWrite + Unpin>(
     let t = pg_ddl(p, schema, &req.table).await?;
     write_ddl(
         out,
-        &header(conn, &format!("{schema}.{}", req.table)),
+        &header(conn, engine, &format!("{schema}.{}", req.table)),
         &t.ddl,
     )
     .await?;
@@ -667,20 +595,6 @@ pub(crate) fn push_pg_cell(buf: &mut String, row: &PgRow, i: usize) -> Result<()
     Ok(())
 }
 
-// ---------------------------------------------------------------------------------------------
-// MySQL / MariaDB
-
-/// Catalog values as raw bytes: MySQL 8 reports some as binary strings.
-fn mysql_text(row: &MySqlRow, i: usize) -> Option<String> {
-    let v = row.try_get_raw(i).ok()?;
-    if v.is_null() {
-        return None;
-    }
-    <&[u8] as Decode<MySql>>::decode(v)
-        .ok()
-        .map(|b| String::from_utf8_lossy(b).into_owned())
-}
-
 async fn mysql_ddl(p: &MySqlPool, database: &str, table: &str) -> Result<Target, AppError> {
     let found = sqlx::query(
         "SELECT TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
@@ -692,33 +606,36 @@ async fn mysql_ddl(p: &MySqlPool, database: &str, table: &str) -> Result<Target,
     let Some(found) = found else {
         return Err(not_found_table(table));
     };
-    let ty = mysql_text(&found, 0).unwrap_or_default();
+    let ty = mysql_text(&found, 0).ok_or_else(|| {
+        AppError::internal("Could not read the table type").with_detail(table.to_string())
+    })?;
     let view = ty.eq_ignore_ascii_case("VIEW") || ty.eq_ignore_ascii_case("SYSTEM VIEW");
     // Second column: `Create Table`, or `Create View` for a view.
     let sql = format!(
         "SHOW CREATE TABLE {}.{}",
-        quote_bt(database),
-        quote_bt(table)
+        SqlEngine::Mysql.quote(database),
+        SqlEngine::Mysql.quote(table)
     );
     let row = sqlx::raw_sql(&sql).fetch_one(p).await?;
     let ddl = mysql_text(&row, 1).ok_or_else(|| not_found_table(table))?;
     Ok(Target {
         ddl: statement(&ddl),
         view,
-        qualified: quote_bt(table),
+        qualified: SqlEngine::Mysql.quote(table),
     })
 }
 
 async fn mysql_export<W: AsyncWrite + Unpin>(
     p: &MySqlPool,
     conn: &Connection,
+    engine: SqlEngine,
     req: &TableExportRequest,
     out: &mut W,
 ) -> Result<u64, AppError> {
     let t = mysql_ddl(p, &req.database, &req.table).await?;
     write_ddl(
         out,
-        &header(conn, &format!("{}.{}", req.database, req.table)),
+        &header(conn, engine, &format!("{}.{}", req.database, req.table)),
         &t.ddl,
     )
     .await?;
@@ -733,18 +650,26 @@ async fn mysql_export<W: AsyncWrite + Unpin>(
     .bind(&req.table)
     .fetch_all(p)
     .await?;
-    let names: Vec<String> = cols
-        .iter()
-        .filter(|r| !mysql_generated(&mysql_text(r, 1).unwrap_or_default()))
-        .map(|r| quote_bt(&mysql_text(r, 0).unwrap_or_default()))
-        .collect();
+    let mut names: Vec<String> = Vec::with_capacity(cols.len());
+    for r in &cols {
+        let extra = mysql_text(r, 1).ok_or_else(|| {
+            AppError::internal("Could not read a column definition").with_detail(req.table.clone())
+        })?;
+        if mysql_generated(&extra) {
+            continue;
+        }
+        let name = mysql_text(r, 0).ok_or_else(|| {
+            AppError::internal("Could not read a column name").with_detail(req.table.clone())
+        })?;
+        names.push(SqlEngine::Mysql.quote(&name));
+    }
     if names.is_empty() {
         return Ok(0);
     }
     let list = names.join(", ");
     let select = format!(
         "SELECT {list} FROM {}.{}",
-        quote_bt(&req.database),
+        SqlEngine::Mysql.quote(&req.database),
         t.qualified
     );
     out.write_all(b"\n").await?;
@@ -768,7 +693,6 @@ async fn mysql_export<W: AsyncWrite + Unpin>(
     ins.finish().await
 }
 
-/// One cell of a text-protocol MySQL row as a literal.
 pub(crate) fn push_mysql_cell(buf: &mut String, row: &MySqlRow, i: usize) -> Result<(), AppError> {
     let v = row.try_get_raw(i)?;
     if v.is_null() {
@@ -781,9 +705,6 @@ pub(crate) fn push_mysql_cell(buf: &mut String, row: &MySqlRow, i: usize) -> Res
     push_mysql_value(buf, &ty, raw);
     Ok(())
 }
-
-// ---------------------------------------------------------------------------------------------
-// SQLite
 
 async fn sqlite_ddl(p: &SqlitePool, table: &str) -> Result<Target, AppError> {
     let rows: Vec<(String, String)> = sqlx::query_as(
@@ -807,18 +728,19 @@ async fn sqlite_ddl(p: &SqlitePool, table: &str) -> Result<Target, AppError> {
     Ok(Target {
         ddl,
         view,
-        qualified: quote_dq(table),
+        qualified: SqlEngine::Sqlite.quote(table),
     })
 }
 
 async fn sqlite_export<W: AsyncWrite + Unpin>(
     p: &SqlitePool,
     conn: &Connection,
+    engine: SqlEngine,
     req: &TableExportRequest,
     out: &mut W,
 ) -> Result<u64, AppError> {
     let t = sqlite_ddl(p, &req.table).await?;
-    write_ddl(out, &header(conn, &req.table), &t.ddl).await?;
+    write_ddl(out, &header(conn, engine, &req.table), &t.ddl).await?;
     if !req.data || t.view {
         return Ok(0);
     }
@@ -833,7 +755,7 @@ async fn sqlite_export<W: AsyncWrite + Unpin>(
     }
     let list = names
         .iter()
-        .map(|n| quote_dq(n))
+        .map(|n| SqlEngine::Sqlite.quote(n))
         .collect::<Vec<_>>()
         .join(", ");
     let select = format!("SELECT {list} FROM {}", t.qualified);
@@ -903,8 +825,30 @@ pub(crate) fn push_sqlite_cell(
 mod tests {
     use super::*;
     use crate::core::connections::{ConnectionInput, Env, SslMode};
+
+    /// The tests run on one SQLite connection, so these wrappers route for them.
+    async fn export_table_sql(
+        state: &AppState,
+        req: TableExportRequest,
+        path: &std::path::Path,
+    ) -> Result<ExportResult, AppError> {
+        let conn = state.connection(&req.conn_id).unwrap();
+        super::export_table_sql(&state.db(), &conn, SqlEngine::Sqlite, req, path).await
+    }
+
+    async fn table_ddl(
+        state: &AppState,
+        conn_id: &str,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<String, AppError> {
+        let conn = state.connection(conn_id).unwrap();
+        super::table_ddl(&state.db(), &conn, database, schema, table).await
+    }
     use crate::core::error::ErrorCode;
     use crate::core::secrets::MemoryStore;
+    use crate::core::state::AppState;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
     use sqlx::{Connection as _, Executor};
 
@@ -916,9 +860,9 @@ mod tests {
 
     #[test]
     fn identifiers_are_quoted() {
-        assert_eq!(quote_dq("a\"b"), "\"a\"\"b\"");
-        assert_eq!(quote_dq("plain"), "\"plain\"");
-        assert_eq!(quote_bt("a`b"), "`a``b`");
+        assert_eq!(SqlEngine::Pg.quote("a\"b"), "\"a\"\"b\"");
+        assert_eq!(SqlEngine::Pg.quote("plain"), "\"plain\"");
+        assert_eq!(SqlEngine::Mysql.quote("a`b"), "`a``b`");
     }
 
     #[test]
@@ -1072,7 +1016,7 @@ mod tests {
     fn input(file: &str) -> ConnectionInput {
         ConnectionInput {
             name: "t".into(),
-            engine: Engine::Sqlite,
+            engine: crate::core::engine::Engine::Sqlite,
             env: Env::Local,
             host: String::new(),
             port: 0,
@@ -1113,7 +1057,7 @@ mod tests {
         .unwrap();
         (&mut c).execute(sqlx::raw_sql(SETUP)).await.unwrap();
         c.close().await.unwrap();
-        let conn = connections::create(&st, input(&file.to_string_lossy()), None).unwrap();
+        let conn = st.create_connection(input(&file.to_string_lossy()), None).unwrap();
 
         let ddl = table_ddl(&st, &conn.id, "main", None, "it's")
             .await
@@ -1168,7 +1112,7 @@ mod tests {
         let q = "SELECT id, name, score, hex(data), twice FROM \"it's\" ORDER BY id";
         type R = (i64, String, Option<f64>, String, i64);
         let got: Vec<R> = sqlx::query_as(q).fetch_all(&mut fresh).await.unwrap();
-        let p = connections::pool_for(&st, &conn.id, Some("main")).unwrap();
+        let p = st.pool_for(&conn, Some("main")).unwrap();
         let DbPool::Sqlite(p) = p else { unreachable!() };
         let want: Vec<R> = sqlx::query_as(q).fetch_all(&p).await.unwrap();
         assert_eq!(got, want);

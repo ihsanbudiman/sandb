@@ -8,6 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "pnpm check && cargo test --manifest-path src-tauri/Cargo.toml --lib --bins --all-features",
+    "test:it": "cargo test --manifest-path src-tauri/Cargo.toml --features it",
     "tauri": "tauri",
     "build:mac-intel": "tauri build --target x86_64-apple-darwin",
     "build:mac-arm": "tauri build --target aarch64-apple-darwin",
@@ -17,6 +19,7 @@
     "db:down": "testdb/scripts/down.sh",
     "db:reset": "testdb/scripts/reset.sh",
     "db:sqlite": "testdb/scripts/build-sqlite.sh",
+    "gen:api": "cargo test --manifest-path src-tauri/Cargo.toml export_bindings",
     "mock-llm": "node testdb/mock-llm/server.mjs"
   },
   "devDependencies": {

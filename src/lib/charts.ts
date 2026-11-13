@@ -5,7 +5,7 @@ import { GridComponent, LegendComponent, TitleComponent, TooltipComponent } from
 import { SVGRenderer } from 'echarts/renderers';
 import type { EChartsCoreOption } from 'echarts/core';
 import type { CellValue } from './api';
-import type { ChartPart } from './chat.svelte';
+import type { ChartPart } from './chatModel';
 import { formatCell } from './results';
 
 echarts.use([BarChart, LineChart, PieChart, ScatterChart, GridComponent, LegendComponent, TitleComponent, TooltipComponent, SVGRenderer]);
@@ -25,7 +25,6 @@ const DARK = ['#eda33c', '#60a5fa', '#2dd4bf', '#a78bfa', '#fb7185', '#a3e635', 
 /** Light colors, for paper. */
 export const PRINT_COLORS: ChartColors = { ink: '#1c1b19', muted: '#5f5b55', line: '#e5e3df', palette: LIGHT };
 
-/** The app's current theme colors. */
 export function themeColors(dark: boolean): ChartColors {
   const css = getComputedStyle(document.documentElement);
   const v = (name: string) => css.getPropertyValue(name).trim();
@@ -119,7 +118,6 @@ export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: bo
   };
 }
 
-/** The chart as an SVG string, at a fixed size, for the PDF. */
 export function chartSvg(p: ChartPart, width: number, height: number): string {
   const chart = echarts.init(null, null, { renderer: 'svg', ssr: true, width, height });
   try {
