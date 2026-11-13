@@ -4,6 +4,14 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-11-13
+
+- Changed: an aggregate with an `$out` or `$merge` stage in a MongoDB query now runs as a write. The assistant must ask for approval before it runs.
+- Changed: in a dialog, Escape closes the dialog on top. A click on the background does not close a dialog. The command palette is the only exception.
+- Changed: the assistant can propose a write only when the connection can write, its **AI writes** setting is on, and the chat allows writes. The switches in the chat and in Settings now save this setting to the connection.
+- Changed: the approval card of a write on MySQL now warns you when a statement can commit at once, for example `CREATE TABLE`. Such a write is not one transaction.
+- Changed: every export and PDF save writes a temporary file and then renames it. If the export fails or you cancel it, the old file stays. You can now cancel a MongoDB export.
+- Fixed: a PDF file name that is not valid now shows an error. Before, the app saved the file as `report.pdf`.
 - Fixed: in a chat on a MongoDB database, the assistant's list-tables and describe-table steps now answer. Before, they failed with "Not a SQL connection", so the assistant could not see the collection or field list.
 - Fixed: sandb no longer stops at launch when the connections file has a connection that this version cannot read. A newer version can write such a connection, for example a MongoDB connection that version 0.11.0 does not know. sandb now starts with the other connections and hides that connection. When sandb saves the list, it keeps the hidden connection unchanged. If you install the newer version again, the connection is still there.
 - Fixed: in the Data view of a MongoDB collection, a filter on a UUID field now finds the documents. Before, the filter sent the value as a string, so it found no document.
