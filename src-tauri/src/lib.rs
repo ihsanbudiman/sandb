@@ -6,7 +6,11 @@ mod wire;
 
 use std::path::PathBuf;
 
-use tauri::menu::{Menu, MenuItem, MenuItemKind, WINDOW_SUBMENU_ID};
+use tauri::menu::Menu;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use tauri::menu::{MenuItem, MenuItemKind};
+#[cfg(target_os = "macos")]
+use tauri::menu::WINDOW_SUBMENU_ID;
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, Runtime, WindowEvent};
 
