@@ -13,6 +13,7 @@ use crate::core::ai::settings::{
     AiSettings, AiSettingsView, AiTestResult, DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL, MAX_ROWS_LIMIT,
     Privacy, TIMEOUT_SEC_LIMIT,
 };
+use crate::core::ai::skills::SKILLS;
 use crate::core::ai::tools::{CHART_ROWS, CHART_TYPES, UI_ROWS};
 use crate::core::cell::PREVIEW_BYTES;
 use crate::core::connections::{
@@ -145,6 +146,22 @@ fn export_conflict() -> String {
     serde_json::Value::Object(clauses).to_string()
 }
 
+/// The skills for the `/` menu: everything but the instructions, which stay in the backend.
+fn skills() -> String {
+    let list: Vec<_> = SKILLS
+        .iter()
+        .map(|k| {
+            serde_json::json!({
+                "name": k.name,
+                "title": k.title,
+                "description": k.description,
+                "engines": k.engines,
+            })
+        })
+        .collect();
+    serde_json::Value::from(list).to_string()
+}
+
 fn constants() -> String {
     [
         ("PREVIEW_BYTES", PREVIEW_BYTES.to_string()),
@@ -169,6 +186,7 @@ fn constants() -> String {
         ("MONGOSH_DB_METHODS", js_strings(DB_METHODS)),
         ("MONGO_WRITABLE_TYPES", js_strings(WRITABLE_TYPES)),
         ("EXPORT_CONFLICT", export_conflict()),
+        ("SKILLS", skills()),
     ]
     .into_iter()
     .fold(

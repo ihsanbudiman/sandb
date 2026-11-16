@@ -1,9 +1,10 @@
-//! The system prompt: the databases of the chat, a bounded schema summary of each, and the
-//! rules.
+//! The system prompt: the databases of the chat, a bounded schema summary of each, the rules and
+//! the skills.
 
 use std::fmt::Write as _;
 
 use crate::core::ai::settings::{AiSettings, Privacy};
+use crate::core::ai::skills::{self, Skill};
 use crate::core::connections::Env;
 use crate::core::engine::Engine;
 use crate::core::result::{Engines, SchemaSnapshot, Source, TableKind, WriteOff};
@@ -22,6 +23,8 @@ pub struct PromptInput<'a> {
     pub settings: &'a AiSettings,
     /// The local date of the user's machine, for example "2026-11-04 (Wednesday), time zone UTC+07:00".
     pub today: &'a str,
+    /// Skills the user picked; they go in full. The other skills that fit are only listed.
+    pub picked: &'a [&'static Skill],
 }
 
 /// `sql` in SQL-only chats, `mongo` in MongoDB-only chats, both in mixed chats.
@@ -36,7 +39,12 @@ fn tool(eng: Engines, sql: &str, mongo: &str) -> String {
 pub fn system_prompt(p: &PromptInput<'_>) -> String {
     let many = p.sources.len() > 1;
     let eng = p.engines;
-    let mut s = String::with_capacity(SUMMARY_MAX_BYTES + 4500 + 400 * p.sources.len());
+    let mut s = String::with_capacity(
+        SUMMARY_MAX_BYTES
+            + 6000
+            + 400 * p.sources.len()
+            + p.picked.iter().map(|k| k.body.len()).sum::<usize>(),
+    );
     let role = if eng.mongo { "database" } else { "SQL" };
     if many {
         let _ = write!(
@@ -201,6 +209,7 @@ pub fn system_prompt(p: &PromptInput<'_>) -> String {
          small Markdown tables of key figures. You cannot create files. When the user asks for a \
          PDF, write the report and tell them to click Export PDF under the reply."
     );
+    skill_lines(&mut s, p);
 
     let budget = SUMMARY_MAX_BYTES / p.sources.len().max(1);
     for (src, snap) in p.sources.iter().zip(p.snapshots) {
@@ -217,6 +226,33 @@ pub fn system_prompt(p: &PromptInput<'_>) -> String {
         }
     }
     s
+}
+
+/// The skills that fit the chat: the picked ones in full, the others as a list for `load_skill`.
+fn skill_lines(s: &mut String, p: &PromptInput<'_>) {
+    let listed: Vec<&Skill> = skills::available(p.sources)
+        .into_iter()
+        .filter(|k| !p.picked.iter().any(|x| x.name == k.name))
+        .collect();
+    if !listed.is_empty() {
+        s.push_str(
+            "\nSkills: when a question matches a description below, call load_skill with that \
+             name first, then follow its instructions. A skill loaded in an earlier reply is \
+             gone; load it again when you need it.\n",
+        );
+        for k in listed {
+            let _ = writeln!(s, "- {}: {}", k.name, k.description);
+        }
+    }
+    if !p.picked.is_empty() {
+        s.push_str("\nThe user picked these skills for this chat. Follow them:\n");
+        for k in p.picked {
+            let _ = write!(s, "\n## Skill {}\n{}", k.name, k.body);
+            if !k.body.ends_with('\n') {
+                s.push('\n');
+            }
+        }
+    }
 }
 
 fn mongo_rules(s: &mut String, eng: Engines) {
@@ -430,6 +466,7 @@ mod tests {
             snapshots,
             settings,
             today: TODAY,
+            picked: &[],
         })
     }
 
@@ -606,6 +643,34 @@ mod tests {
         for mongo in ["mongo", "Mongo", "mongosh", "$match"] {
             assert!(!p.contains(mongo), "{mongo}: {p}");
         }
+    }
+
+    #[test]
+    fn picked_skills_go_in_full_and_the_others_are_listed() {
+        let settings = AiSettings::default();
+        let sources = [src("db1", false, false)];
+        let p = prompt(&sources, &[None], &settings);
+        // A PostgreSQL chat lists its dialect skill and the shared ones, but no text of any.
+        assert!(p.contains("call load_skill"), "{p}");
+        assert!(p.contains("\n- postgres: PostgreSQL syntax"), "{p}");
+        assert!(p.contains("\n- time-series: "), "{p}");
+        assert!(!p.contains("\n- mysql: ") && !p.contains("mongo-aggregation"), "{p}");
+        assert!(!p.contains("## Skill"), "{p}");
+
+        let picked = skills::picked(&["postgres".into()], &sources).unwrap();
+        let p = system_prompt(&PromptInput {
+            sources: &sources,
+            engines: Engines::of(&sources),
+            snapshots: &[None],
+            settings: &settings,
+            today: TODAY,
+            picked: &picked,
+        });
+        assert!(p.contains("The user picked these skills"), "{p}");
+        assert!(p.contains(&format!("## Skill postgres\n{}", picked[0].body)), "{p}");
+        // A picked skill is not offered again.
+        assert!(!p.contains("\n- postgres: "), "{p}");
+        assert!(p.contains("\n- time-series: "), "{p}");
     }
 
     #[test]

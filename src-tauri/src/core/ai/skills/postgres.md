@@ -1,0 +1,15 @@
+PostgreSQL dialect:
+- Quote identifiers with double quotes only when they have capitals, spaces or reserved words ("Order", "user"). Strings use single quotes.
+- Use the default schema from the source lines. Qualify tables of other schemas: sales.orders.
+- Case-insensitive match: ILIKE, or lower(col) = lower('x'). Regex: ~ and ~*.
+- Casts: col::date, col::numeric, col::text. Integer division truncates: use sum(a)::numeric / nullif(sum(b), 0).
+- Dates: date_trunc('month', ts), ts >= date '2026-01-01', now() - interval '7 days', extract(dow from ts), to_char(ts, 'YYYY-MM').
+- Time zones: timestamptz is stored in UTC. Use ts AT TIME ZONE 'Asia/Jakarta' to group by local day.
+- Fill gaps in a series with generate_series(start, end, interval '1 day') LEFT JOIN the data.
+- JSON: jsonb col->'key' gives jsonb, col->>'key' gives text, col @> '{"a":1}' tests containment, jsonb_array_elements(col) expands an array.
+- Arrays: 'x' = ANY(tags), array_agg(x ORDER BY y), unnest(arr).
+- Text aggregation: string_agg(name, ', ' ORDER BY name).
+- Top N per group: DISTINCT ON (group_col) ... ORDER BY group_col, metric DESC, or row_number() OVER (PARTITION BY ...).
+- Conditional aggregates: count(*) FILTER (WHERE status = 'paid').
+- Percentiles: percentile_cont(0.5) WITHIN GROUP (ORDER BY amount).
+- Use EXPLAIN (without ANALYZE) to read a plan. Catalog views: information_schema.columns, pg_indexes, pg_stat_user_tables.

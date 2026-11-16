@@ -5,6 +5,7 @@ import { afterWrite } from './catalog.svelte';
 import { type Msg, type Session, type ToolPart } from './chatModel';
 import { UI_ROWS } from './api/generated/constants';
 import { isReadTool, isWriteTool } from './chatTools';
+import { applicable } from './skills';
 import { canWrite, connOf, dbOf, defaultDb, sameSource, type Conn, type Source } from './connections.svelte';
 import { autosave, readStored } from './persist.svelte';
 import { ui, flushAi } from './state.svelte';
@@ -45,6 +46,8 @@ export const chat = $state({
   open: null as string | null,
   /** Databases of the new, empty chat. null: the active tab's database, and it follows the tab. */
   draft: null as Source[] | null,
+  /** Skills picked for the new, empty chat; they move to the session its first question creates. */
+  draftSkills: null as string[] | null,
   /** Id of the session that the running reply writes to; null when the assistant is idle. */
   live: null as string | null,
   /** A proposed write that waits for Approve or Deny. */
@@ -70,6 +73,7 @@ export function openSession(id: string) {
   if (chat.live) return;
   chat.open = id;
   chat.draft = null;
+  chat.draftSkills = null;
 }
 
 /** The active tab's connection and database; null while there is no connection, or when a MongoDB
@@ -98,6 +102,21 @@ export function setScope(list: Source[]) {
   else chat.draft = list;
 }
 
+/** The skills of the open chat; the empty chat keeps them in `draftSkills` until its first question. */
+export function skillsOf(s: Session | undefined): string[] {
+  if (s) return s.skills ?? [];
+  return chat.draftSkills ?? [];
+}
+
+/** Sets the skills of the open chat. They stay for its later questions; a picked skill that no longer applies is only kept, not sent. */
+export function setSkills(list: string[]) {
+  if (chat.live) return;
+  const names = [...new Set(list)];
+  const s = current();
+  if (s) s.skills = names;
+  else chat.draftSkills = names;
+}
+
 /** Opens the assistant on the active tab's database. A chat that does not use it gives way to a new chat; an empty chat takes the tab's database. */
 export function openChatOnTab() {
   ui.chatOpen = true;
@@ -123,6 +142,7 @@ $effect.root(() => {
       if (s && !s.sources.some((x) => sameSource(x, t))) {
         chat.open = '';
         chat.draft = null;
+        chat.draftSkills = null;
       }
     });
   });
@@ -172,15 +192,19 @@ export async function rerun(t: ToolPart) {
   }
 }
 
-export async function send(text: string) {
+export async function send(text: string, skills?: string[]) {
   if (!text.trim() || chat.live) return;
   let s = current();
   const sources = scopeOf(s).filter((x) => connOf(x));
   if (!sources.length) return;
+  // The picked skills, minus the ones that do not apply to this chat's engines. A retry passes the skills of its message.
+  const picked = skills ?? skillsOf(s);
+  const names = applicable(picked, sources.map((x) => connOf(x)!.engine));
   if (!s) {
-    chat.sessions.unshift({ id: crypto.randomUUID(), sources: sources.map((x) => ({ ...x })), title: text.trim(), updated: Date.now(), messages: [] });
+    chat.sessions.unshift({ id: crypto.randomUUID(), sources: sources.map((x) => ({ ...x })), title: text.trim(), updated: Date.now(), messages: [], skills: [...new Set(picked)] });
     s = chat.sessions[0];
     chat.draft = null;
+    chat.draftSkills = null;
     if (chat.sessions.length > MAX_SESSIONS) {
       const oldest = [...chat.sessions].sort((a, b) => a.updated - b.updated)[0];
       chat.sessions = chat.sessions.filter((x) => x !== oldest);
@@ -190,11 +214,11 @@ export async function send(text: string) {
   chat.live = s.id;
   s.updated = Date.now();
   const history = historyOf(s.messages);
-  s.messages.push({ role: 'user', parts: [{ kind: 'text', text }] });
+  s.messages.push({ role: 'user', parts: [{ kind: 'text', text }], ...(names.length ? { skills: names } : {}) });
   s.messages.push({ role: 'assistant', parts: [], started: Date.now() });
   const msg = s.messages[s.messages.length - 1];
   try {
-    await liveReply(msg, text, sources, history);
+    await liveReply(msg, text, sources, history, names);
   } finally {
     msg.ended = Date.now();
     chat.live = chat.pending = chat.cancel = chat.starting = null;
@@ -216,7 +240,7 @@ function historyOf(messages: Msg[]): ChatRequest['history'] {
 const BLOCKED: Partial<Record<ErrorCode, true>> = { guard_rejected: true, write_blocked: true, read_only_violation: true, connection_read_only: true };
 
 // Real backends: the Rust tool loop streams its steps; this maps each event onto the reply's parts.
-async function liveReply(msg: Msg, text: string, sources: Source[], history: ChatRequest['history']) {
+async function liveReply(msg: Msg, text: string, sources: Source[], history: ChatRequest['history'], skills: string[]) {
   const chatId = crypto.randomUUID();
   let stopped = false;
   let ended = false;
@@ -244,6 +268,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
     sources: sources.map((x, i) => ({ connId: x.connId, database: x.database, schema: null, allowWrites: conns[i].aiWrite && canWrite(conns[i]) })),
     history,
     message: text,
+    ...(skills.length ? { skills } : {}),
   };
   /** The source a tool call names (`db1` is the first); the only one when it names none. */
   const sourceIn = (args: Record<string, unknown>) => {

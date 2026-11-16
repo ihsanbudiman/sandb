@@ -5,6 +5,11 @@ export function selectOnMount(el: HTMLInputElement) {
   el.select();
 }
 
+/** Focus without a text selection: a checkbox holds no selection. */
+export function focusOnMount(el: HTMLElement) {
+  el.focus();
+}
+
 export function focusOn(el: HTMLElement, token: number) {
   if (token) el.focus({ preventScroll: true });
 }

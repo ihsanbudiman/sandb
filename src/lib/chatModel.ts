@@ -35,12 +35,16 @@ export type ChartPart = { kind: 'chart'; spec: ChartSpec; columns: string[]; row
 
 export type Part = { kind: 'text'; text: string } | ToolPart | ErrorPart | ChartPart;
 
-/** `started`/`ended`: when the assistant reply was sent and when it finished, stopped or failed (missing in chats saved before they were kept). */
+/**
+ * `started`/`ended`: when the assistant reply was sent and when it finished, stopped or failed (missing in chats saved before they were kept).
+ * `skills`: the skills a question carried, by name (missing when it carried none); a retry sends the same ones.
+ */
 export interface Msg {
   role: 'user' | 'assistant';
   parts: Part[];
   started?: number;
   ended?: number;
+  skills?: string[];
 }
 
 export interface Session {
@@ -49,4 +53,6 @@ export interface Session {
   title: string;
   updated: number;
   messages: Msg[];
+  /** Skills the user picked for this chat, by name. Missing in chats saved before skills existed; a new chat starts with none. */
+  skills?: string[];
 }

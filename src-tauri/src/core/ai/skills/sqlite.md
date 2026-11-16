@@ -1,0 +1,12 @@
+SQLite dialect:
+- Quote identifiers with double quotes. Strings use single quotes.
+- Types are loose: a column can hold text in one row and a number in the next. Use typeof(col) to check, and CAST(col AS REAL) before math.
+- No date type: dates are text ('2026-01-31 10:00:00'), Unix seconds or Julian days. Look at the values before you filter.
+- Dates: date(ts), strftime('%Y-%m', ts), date('now', '-7 days'), julianday(a) - julianday(b) for days between. For Unix seconds: datetime(ts, 'unixepoch').
+- Integer division truncates: 1.0 * a / NULLIF(b, 0).
+- LIKE ignores case for ASCII only. GLOB is case-sensitive.
+- Booleans are 0 and 1.
+- Text aggregation: group_concat(name, ', ').
+- JSON: json_extract(col, '$.key'), col ->> '$.key' (3.38 or later), json_each(col) to expand an array.
+- Window functions need 3.25 or later; RIGHT and FULL JOIN need 3.39 or later. Check the server version in the source lines.
+- Schema: PRAGMA table_info('t'), PRAGMA index_list('t'), PRAGMA foreign_key_list('t'). Plans: EXPLAIN QUERY PLAN SELECT ...

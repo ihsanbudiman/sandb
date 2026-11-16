@@ -56,6 +56,7 @@ fn request(ctx: &Ctx, chat_id: &str, message: &str, allow_writes: bool) -> ChatR
             content: "Hello, how can I help?".into(),
         }],
         message: message.into(),
+        skills: Vec::new(),
     }
 }
 

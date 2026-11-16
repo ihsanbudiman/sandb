@@ -100,6 +100,7 @@ async fn chat_on(
                 content: "Hello, how can I help?".into(),
             }],
             message: message.into(),
+            skills: Vec::new(),
         },
         |e| {
             if let ChatEvent::WritePreview { id, .. } = &e {

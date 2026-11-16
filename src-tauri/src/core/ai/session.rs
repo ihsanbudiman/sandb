@@ -14,6 +14,7 @@ use crate::core::ai::client::{Completion, StreamEvent};
 use crate::core::ai::event::ChatEvent;
 use crate::core::ai::prompt::{self, PromptInput};
 use crate::core::ai::settings;
+use crate::core::ai::skills;
 use crate::core::ai::tools::{self, Decision, ToolContext};
 use crate::core::connections::target_database;
 use crate::core::error::{AppError, ErrorCode};
@@ -74,6 +75,10 @@ pub struct ChatRequest {
     #[cfg_attr(test, ts(optional = nullable))]
     pub history: Vec<ChatTurn>,
     pub message: String,
+    /// Names of the skills the user picked; their full text goes into the system prompt.
+    #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
+    pub skills: Vec<String>,
 }
 
 /// Running chats by id, for `chat_cancel`.
@@ -236,6 +241,7 @@ async fn converse(
         });
     }
     let engines = Engines::of(&sources);
+    let picked = skills::picked(&req.skills, &sources)?;
     let (settings, client) = settings::for_chat(state).await?;
 
     // The summaries are a help, not a need: on an error or a slow server the model uses the tools.
@@ -273,6 +279,7 @@ async fn converse(
         snapshots: &snapshots,
         settings: &settings,
         today: &today,
+        picked: &picked,
     });
 
     let mut body = json!({
@@ -575,6 +582,7 @@ mod tests {
                 content: "earlier".into(),
             }],
             message: message.into(),
+            skills: Vec::new(),
         }
     }
 

@@ -512,6 +512,27 @@ fn value_sql(
     }
 }
 
+/// The grid's "Set NOW()" value: the server's clock, written as SQL instead of a bind.
+fn is_now(value: &CellValue) -> bool {
+    matches!(value, Value::Object(o) if o.len() == 1 && o.get("$now") == Some(&Value::Bool(true)))
+}
+
+/// `CURRENT_TIMESTAMP` for the now marker (PostgreSQL, MySQL and SQLite all have it), else the bind.
+fn set_value_sql<'a>(
+    engine: SqlEngine,
+    push: &mut impl FnMut(&'a str, &'a CellValue) -> usize,
+    name: &'a str,
+    value: &'a CellValue,
+    data_type: &str,
+    update: bool,
+) -> String {
+    if is_now(value) {
+        return "CURRENT_TIMESTAMP".into();
+    }
+    let i = push(name, value);
+    value_sql(engine, i, name, data_type, update)
+}
+
 fn operation_sql<'a>(
     target: &'a Target,
     engine: SqlEngine,
@@ -556,11 +577,11 @@ fn operation_sql<'a>(
                 .set
                 .iter()
                 .map(|(name, value)| {
-                    let i = push(name, value);
-                    let p = value_sql(
+                    let p = set_value_sql(
                         engine,
-                        i,
+                        &mut push,
                         name,
+                        value,
                         target.columns[name.as_str()].as_str(),
                         true,
                     );
@@ -606,11 +627,11 @@ fn operation_sql<'a>(
                 .set
                 .iter()
                 .map(|(name, value)| {
-                    let i = push(name, value);
-                    value_sql(
+                    set_value_sql(
                         engine,
-                        i,
+                        &mut push,
                         name,
+                        value,
                         target.columns[name.as_str()].as_str(),
                         false,
                     )
@@ -1617,6 +1638,44 @@ mod tests {
         let (sql, binds) = operation_sql(&target, SqlEngine::Sqlite, &op).unwrap();
         assert_eq!(sql, "INSERT INTO \"main\".\"t\" DEFAULT VALUES");
         assert!(binds.is_empty());
+    }
+
+    #[test]
+    fn now_marker_writes_server_clock_and_keeps_placeholders_aligned() {
+        let target = Target {
+            result: EditableResult {
+                table: Some("t".into()),
+                schema: Some("public".into()),
+                pk: vec!["id".into()],
+                reason: None,
+                transactions: None,
+            },
+            database: "db".into(),
+            relation: "\"public\".\"t\"".into(),
+            columns: BTreeMap::from([
+                ("deleted_at".into(), "timestamp without time zone".into()),
+                ("id".into(), "text".into()),
+                ("note".into(), "text".into()),
+            ]),
+        };
+        let op = EditOperation {
+            key: "0".into(),
+            kind: EditKind::Update,
+            pk: BTreeMap::from([("id".into(), Value::from("key"))]),
+            set: BTreeMap::from([
+                ("deleted_at".into(), serde_json::json!({"$now": true})),
+                ("note".into(), Value::from("gone")),
+            ]),
+            old: BTreeMap::new(),
+            document: None,
+        };
+        // The marker takes no bind, so `note` is $1 and the key $2.
+        let (sql, binds) = operation_sql(&target, SqlEngine::Pg, &op).unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE \"public\".\"t\" SET \"deleted_at\" = CURRENT_TIMESTAMP, \"note\" = CAST($1 AS text) WHERE \"id\" = CAST($2 AS text)"
+        );
+        assert_eq!(binds.len(), 2);
     }
 
     #[tokio::test]

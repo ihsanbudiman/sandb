@@ -9,6 +9,7 @@ export const TOOL_LABEL: Record<string, string> = {
   read: 'Read query',
   chart: 'Chart',
   write: 'Proposed write',
+  skill: 'Skill',
 };
 
 export const isReadTool = (p: ToolPart) => p.tool === 'read';
@@ -32,6 +33,8 @@ export function startingLabel(kind: ToolKind | undefined, name: string): string 
       return 'Preparing chart…';
     case 'write':
       return 'Preparing change…';
+    case 'skill':
+      return 'Loading skill…';
     default:
       return `Using ${name}…`;
   }

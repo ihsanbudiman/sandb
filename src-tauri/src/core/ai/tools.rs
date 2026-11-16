@@ -1,6 +1,7 @@
 //! The tools the model can call. One table lists every tool: the definitions sent to the model,
 //! the dispatcher, the privacy rule, the write result and the UI kinds all come from it, so a
-//! new tool is one row and no caller can disagree about a name.
+//! new tool is one row and no caller can disagree about a name. `load_skill` is the one tool
+//! that runs on no database: it returns a built-in skill's instructions.
 //!
 //! Reads go through the AI read path (guard, read-only session, limits); one read executor builds
 //! the summary and the model's view for both `run_read_query` and `render_chart`, and a chart is
@@ -15,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::core::ai::approval::APPROVAL_TIMEOUT;
 use crate::core::ai::event::{ChatEvent, ToolKind, ToolResultData};
 use crate::core::ai::settings::{AiSettings, Privacy};
+use crate::core::ai::skills;
 use crate::core::engine::Engine;
 use crate::core::error::{AppError, ErrorCode};
 use crate::core::ops;
@@ -39,12 +41,14 @@ enum Serves {
     All,
     Sql,
     Mongo,
+    /// The chat itself, not a database: the tool takes no `source`.
+    Chat,
 }
 
 impl Serves {
     fn matches(self, engine: Engine) -> bool {
         match self {
-            Self::All => true,
+            Self::All | Self::Chat => true,
             Self::Sql => engine != Engine::Mongo,
             Self::Mongo => engine == Engine::Mongo,
         }
@@ -95,7 +99,7 @@ impl Tool {
 }
 
 /// Every tool, in the order the model sees the definitions.
-static TOOLS: [Tool; 8] = [
+static TOOLS: [Tool; 9] = [
     Tool {
         name: "list_tables",
         serves: Serves::All,
@@ -176,6 +180,16 @@ static TOOLS: [Tool; 8] = [
         data: true,
         handler: handle_write,
     },
+    Tool {
+        name: "load_skill",
+        serves: Serves::Chat,
+        kind: ToolKind::Skill,
+        build: build_skill,
+        text: None,
+        other: None,
+        data: false,
+        handler: handle_skill,
+    },
 ];
 
 fn tool_named(name: &str) -> Option<&'static Tool> {
@@ -203,8 +217,9 @@ pub fn catalog() -> impl Iterator<Item = (&'static str, ToolKind)> {
 
 /// OpenAI function tool definitions for the engines of `sources`. The schema tools serve every
 /// source; the SQL read/chart/write tools exist when a SQL source does, the Mongo ones when a
-/// Mongo source does. Every tool takes `source`, an enum of the ids it serves; it is required
-/// when the chat has more than one source.
+/// Mongo source does. Every database tool takes `source`, an enum of the ids it serves; it is
+/// required when the chat has more than one source. `load_skill` takes the skill names that fit
+/// the chat's engines instead.
 pub fn definitions(sources: &[Source], engines: Engines) -> Value {
     let ids = |serves: Serves| -> Vec<&str> {
         sources
@@ -230,15 +245,23 @@ pub fn definitions(sources: &[Source], engines: Engines) -> Value {
             }
             _ => description.to_string(),
         };
-        params["properties"]["source"] = json!({
-            "type": "string",
-            "enum": ids,
-            "description": "Id of the database to use, from the system prompt (for example db1).",
-        });
-        if sources.len() > 1 {
-            match params["required"].as_array_mut() {
-                Some(r) => r.push(json!("source")),
-                None => params["required"] = json!(["source"]),
+        if t.serves == Serves::Chat {
+            let names: Vec<&str> = skills::available(sources).iter().map(|k| k.name).collect();
+            if names.is_empty() {
+                continue;
+            }
+            params["properties"]["name"]["enum"] = json!(names);
+        } else {
+            params["properties"]["source"] = json!({
+                "type": "string",
+                "enum": ids,
+                "description": "Id of the database to use, from the system prompt (for example db1).",
+            });
+            if sources.len() > 1 {
+                match params["required"].as_array_mut() {
+                    Some(r) => r.push(json!("source")),
+                    None => params["required"] = json!(["source"]),
+                }
             }
         }
         defs.push(json!({
@@ -403,6 +426,18 @@ fn build_write(t: &Tool, _mongo: bool) -> (&'static str, Value) {
     )
 }
 
+fn build_skill(_: &Tool, _mongo: bool) -> (&'static str, Value) {
+    (
+        "Get the instructions of one skill from the system prompt's skill list. Call it before \
+         you work on a question that a skill's description matches.",
+        json!({
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Skill name."}},
+            "required": ["name"]
+        }),
+    )
+}
+
 fn handle_list<'a, 'b>(
     _: &'static Tool,
     ctx: &'a ToolContext<'b>,
@@ -446,6 +481,15 @@ fn handle_write<'a, 'b>(
     args: &'a Map<String, Value>,
 ) -> Pin<Box<dyn Future<Output = Result<Done, AppError>> + Send + 'a>> {
     Box::pin(write_tool(t, ctx, id, args))
+}
+
+fn handle_skill<'a, 'b>(
+    _: &'static Tool,
+    ctx: &'a ToolContext<'b>,
+    _id: &'a str,
+    args: &'a Map<String, Value>,
+) -> Pin<Box<dyn Future<Output = Result<Done, AppError>> + Send + 'a>> {
+    Box::pin(async move { load_skill(ctx, args) })
 }
 
 pub fn parse_args(raw: &str) -> Option<Map<String, Value>> {
@@ -779,6 +823,23 @@ async fn describe_table(
     Ok(Done::plain(
         count(columns.len(), "column", "columns"),
         json!({ "table": table, "columns": columns }),
+    ))
+}
+
+fn load_skill(ctx: &ToolContext<'_>, args: &Map<String, Value>) -> Result<Done, AppError> {
+    let name = req_str(args, "name")?;
+    let fits = skills::available(ctx.sources);
+    let Some(k) = fits.iter().find(|k| k.name == name) else {
+        let names: Vec<&str> = fits.iter().map(|k| k.name).collect();
+        return Err(AppError::invalid(format!(
+            "Unknown skill {} for this chat. Use one of: {}",
+            quoted(name),
+            names.join(", ")
+        )));
+    };
+    Ok(Done::plain(
+        k.title.to_string(),
+        json!({ "skill": k.name, "instructions": k.body }),
     ))
 }
 
@@ -1263,7 +1324,7 @@ mod tests {
         assert_eq!(kind("nope"), ToolKind::Other);
         // Every engine-specific tool names its other engine's twin.
         for t in &TOOLS {
-            if t.serves == Serves::All {
+            if matches!(t.serves, Serves::All | Serves::Chat) {
                 assert!(t.other.is_none() && t.text.is_none(), "{}", t.name);
             } else {
                 assert!(t.other.is_some() && t.text.is_some(), "{}", t.name);
@@ -1283,7 +1344,8 @@ mod tests {
                 "describe_table",
                 "run_read_query",
                 "render_chart",
-                "propose_write"
+                "propose_write",
+                "load_skill"
             ]
         );
         // No MongoDB wording reaches a SQL-only chat.
@@ -1306,7 +1368,8 @@ mod tests {
                 "describe_table",
                 "run_mongo_read",
                 "render_mongo_chart",
-                "propose_mongo_write"
+                "propose_mongo_write",
+                "load_skill"
             ]
         );
         assert_eq!(
@@ -1323,7 +1386,7 @@ mod tests {
     fn mixed_chats_split_the_source_enum_per_engine() {
         let sources = [source("db1", "pg"), mongo_source("db2", "m")];
         let defs = definitions(&sources, Engines::of(&sources));
-        assert_eq!(defs.as_array().unwrap().len(), 8);
+        assert_eq!(defs.as_array().unwrap().len(), 9);
         let ids = |name: &str| {
             tool(&defs, name)["function"]["parameters"]["properties"]["source"]["enum"].clone()
         };
@@ -1340,11 +1403,23 @@ mod tests {
         ] {
             assert_eq!(ids(name), json!(["db2"]), "{name}");
         }
-        // Several sources: every tool must name one.
+        // Several sources: every database tool must name one.
         for d in defs.as_array().unwrap() {
+            if d["function"]["name"] == "load_skill" {
+                continue;
+            }
             let required = d["function"]["parameters"]["required"].as_array().unwrap();
             assert!(required.contains(&json!("source")), "{d}");
         }
+        // load_skill runs on no database; it offers the skills of both engines.
+        let skill = &tool(&defs, "load_skill")["function"]["parameters"];
+        assert!(skill["properties"]["source"].is_null(), "{skill}");
+        assert_eq!(skill["required"], json!(["name"]));
+        let offered = skill["properties"]["name"]["enum"].as_array().unwrap();
+        for name in ["postgres", "mongo-aggregation", "time-series"] {
+            assert!(offered.contains(&json!(name)), "{name}: {skill}");
+        }
+        assert!(!offered.contains(&json!("mysql")), "{skill}");
         assert!(
             tool(&defs, "run_read_query")["function"]["description"]
                 .as_str()
@@ -1359,6 +1434,9 @@ mod tests {
     fn source_is_required_only_with_several_sources() {
         let one = [source("db1", "a")];
         for d in definitions(&one, Engines::of(&one)).as_array().unwrap() {
+            if d["function"]["name"] == "load_skill" {
+                continue;
+            }
             let p = &d["function"]["parameters"];
             assert_eq!(p["properties"]["source"]["enum"], json!(["db1"]));
             let required = p["required"].as_array().cloned().unwrap_or_default();
@@ -1367,6 +1445,9 @@ mod tests {
         let two = [source("db1", "a"), source("db2", "b")];
         let defs = definitions(&two, Engines::of(&two));
         for d in defs.as_array().unwrap() {
+            if d["function"]["name"] == "load_skill" {
+                continue;
+            }
             let p = &d["function"]["parameters"];
             assert_eq!(p["properties"]["source"]["enum"], json!(["db1", "db2"]));
             assert!(
@@ -1666,6 +1747,41 @@ mod tests {
                 .starts_with("The database refused the query (MongoDB error 11000)."),
             "{v}"
         );
+    }
+
+    #[tokio::test]
+    async fn load_skill_returns_only_skills_that_fit_the_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            dir.path(),
+            Box::new(crate::core::secrets::MemoryStore::new()),
+        )
+        .unwrap();
+        let settings = AiSettings::default();
+        let sources = [source("db1", "a")];
+        let ctx = ToolContext {
+            state: &state,
+            sources: &sources,
+            settings: &settings,
+        };
+        let out = execute(&ctx, "c1", "load_skill", r#"{"name": "postgres"}"#).await;
+        match &out.events[..] {
+            [ChatEvent::ToolResult { ok: true, summary, .. }] => assert_eq!(summary, "PostgreSQL"),
+            other => panic!("{other:?}"),
+        }
+        let content: Value = serde_json::from_str(&out.content).unwrap();
+        assert!(
+            content["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("date_trunc"),
+            "{content}"
+        );
+        // A skill of another engine is not offered to this chat, and the error lists the ones that are.
+        let out = execute(&ctx, "c2", "load_skill", r#"{"name": "mysql"}"#).await;
+        let e = error_of(&out);
+        assert_eq!(e.code, ErrorCode::InvalidInput);
+        assert!(e.message.contains("postgres"), "{}", e.message);
     }
 
     #[test]

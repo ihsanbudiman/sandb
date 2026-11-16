@@ -2,7 +2,7 @@
   import { ArrowLeft, FileCode, History, ListCollapse, Play, SquarePen, SquarePlus, Trash2, X } from '@lucide/svelte';
   import ChatTranscript from './ChatTranscript.svelte';
   import ChatComposer from './ChatComposer.svelte';
-  import { chat, current, deleteSession, openSession, scopeOf, send, sessionsByDate } from '../chat.svelte';
+  import { chat, current, deleteSession, openSession, scopeOf, send, sessionsByDate, setSkills, skillsOf } from '../chat.svelte';
   import { ago, sourceLabel } from '../chatParts';
   import { connOf, sameSource, type Conn, type Source } from '../connections.svelte';
   import { KEYS, isKey } from '../keys';
@@ -16,6 +16,7 @@
 
   const session = $derived(current());
   const messages = $derived(session?.messages ?? []);
+  const skills = $derived(skillsOf(session));
   const past = $derived(sessionsByDate());
   const scope = $derived(scopeOf(session));
   /** The connections of the chat's databases, each once; deleted ones are left out. */
@@ -170,17 +171,18 @@
     }
   }
 
-  function submit(text = input) {
+  function submit(text = input, chosen?: string[]) {
     if (!text.trim()) return;
     if (chat.live || !ready) return;
     input = '';
     showHistory = false;
-    send(text);
+    send(text, chosen);
   }
 
   function retry(mi: number) {
     const q = messages[mi - 1];
-    if (q?.role === 'user' && q.parts[0]?.kind === 'text') submit(q.parts[0].text);
+    // The retry carries the skills of that question, not the chips of the composer now.
+    if (q?.role === 'user' && q.parts[0]?.kind === 'text') submit(q.parts[0].text, q.skills ?? []);
   }
 
   function newChat() {
@@ -249,6 +251,8 @@
     {placeholder}
     {scope}
     {scopeConns}
+    {skills}
+    onskills={setSkills}
     disabled={!!chat.live}
     {writesOn}
     {ready}

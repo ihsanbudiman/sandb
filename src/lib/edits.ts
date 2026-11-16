@@ -3,7 +3,7 @@ import { logQuery } from './audit.svelte';
 import type { Conn } from './connections.svelte';
 import { pendingCount, resetEdits, type Edits, type Stmt } from './editModel';
 import { mongoStatements } from './mongoEdit';
-import { isNumericText, isNumericType, quoteIdent, sqlLiteral } from './sql/value';
+import { isNumericText, isNumericType, isBooleanType, quoteIdent, sqlLiteral } from './sql/value';
 
 let addSeq = 0;
 
@@ -62,7 +62,7 @@ export function parseInput(text: string, sample: Cell, dataType = ''): Cell | un
     const n = Number(text);
     return Number.isFinite(n) ? n : undefined;
   }
-  if (typeof sample === 'boolean' || /bool/i.test(dataType)) {
+  if (typeof sample === 'boolean' || isBooleanType(dataType)) {
     if (!/^(true|false|1|0)$/i.test(text.trim())) return undefined;
     return /^(true|1)$/i.test(text.trim());
   }

@@ -4,6 +4,22 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+- New: skills for the AI assistant. A skill gives the assistant instructions for one database or one task. sandb has 12 built-in skills:
+  - Syntax: PostgreSQL, MySQL and MariaDB, SQLite, MongoDB aggregation.
+  - Performance tuning: PostgreSQL, MySQL, SQLite, MongoDB. Each one reads the query plan of its database and checks its indexes and statistics.
+  - Tasks for all databases: query tuning, data quality, time series, schema review.
+  - The assistant gets only the skills for the databases of the chat. A PostgreSQL chat does not get the MongoDB skill.
+  - The assistant loads a skill when your question matches the skill description. The step shows as **Skill** in the chat.
+  - Type `/` in the chat box to pick a skill. You can pick more than one. A picked skill stays for the next questions of the chat. Click × on the skill, or press Backspace in an empty chat box, to remove it.
+- New: **Review with AI** on a query plan. Run `EXPLAIN` or `EXPLAIN ANALYZE` in the editor (on MongoDB, an `explain` command), then click **Review with AI** under the result. The assistant opens on the tab's database and gets the statement, the run time and the plan, with the performance skill of the database. The assistant still cannot run `EXPLAIN ANALYZE` itself, because it runs the statement. A plan longer than 24,000 characters is cut, and the question says so.
+- New: when a SQL query has placeholders such as `$1` or `$2`, **Run** opens a window that asks for each value. sandb puts each value into the query as you write it, so put text in quotes, for example `'paid'`. The window keeps the last values that you used. Text in strings and comments is not a placeholder. MongoDB queries and SQL files do not open this window.
+- Changed: double-click a boolean cell to edit it with a checkbox. Click the checkbox, or press Space, to set the value to `true` or `false`. Before, the cell opened a text field.
+- New: in edit mode, right-click a date or time cell (for example `timestamp` or `datetime`) and choose **Set NOW()**. The cell shows `NOW()`. When you save, the database writes its own current time (`CURRENT_TIMESTAMP`), not the time of your computer.
+- Changed: in the chat, a long question now shows only its first 8 lines. Click **Show more** to see all of the text, and **Show less** to make it short again. The question also keeps its line breaks. Before, a long pasted text filled the chat.
+- Fixed: you can now copy the full value of a long JSON cell in the results grid. The grid shows only the first 200 characters of a JSON value. Before, a copy of the cell text gave only these characters and `…`. When your selection goes to the end of the cell, sandb now copies the full value from the start of your selection.
+- Fixed: when you select the text of a grid cell and copy it, sandb now copies only the text of that cell. Before, a triple-click or a selection past the end of the cell also copied a line break or text from the next cells.
+- Changed: charts in the chat have a new look. The chart shows in a card with more space. The title is at the top left and the legend is at the top right. Bars have round tops. Labels use the mono font. In dark mode, the colors are softer. Bar, line and area charts no longer show the value axis or grid lines. Put the pointer on the chart to see the values.
+
 ## [0.12.1] - 2026-11-13
 
 - Changed: an aggregate with an `$out` or `$merge` stage in a MongoDB query now runs as a write. The assistant must ask for approval before it runs.

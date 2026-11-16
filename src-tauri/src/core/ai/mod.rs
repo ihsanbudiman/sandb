@@ -7,6 +7,7 @@ pub mod event;
 pub mod prompt;
 pub mod session;
 pub mod settings;
+pub mod skills;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;

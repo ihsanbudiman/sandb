@@ -47,6 +47,8 @@ sandb is a light desktop database client with an AI assistant. You use your own 
 - Before a write runs, you must approve it in the chat. That covers MongoDB statements too: an approved write runs as one statement, so a change of many documents is not one transaction.
 - The assistant makes bar, line, area, pie and scatter charts.
 - Ask for a report, and the assistant writes one document with a summary, charts and tables.
+- Skills give the assistant extra instructions for one database or one task. sandb has 12 built-in skills: PostgreSQL, MySQL and MariaDB, SQLite and MongoDB aggregation; performance tuning for each of these four databases; and general query tuning, data quality, time series and schema review. The assistant sees only the skills for the databases of the chat, and loads a skill when your question matches its description. Type `/` in the chat box to pick one or more skills yourself.
+- Run `EXPLAIN ANALYZE` yourself in the editor, then click **Review with AI** under the plan. The assistant reviews the plan, but it cannot run `EXPLAIN ANALYZE` itself.
 - Export a reply as a PDF.
 - With the "Schema only" privacy setting, the AI model gets the column names and the row count, but no row values.
 - The chat history stays after a restart.

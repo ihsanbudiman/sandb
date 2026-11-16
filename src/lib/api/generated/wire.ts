@@ -155,7 +155,11 @@ sources: Array<ChatSource>,
 /**
  * Earlier turns, oldest first, without `message`.
  */
-history?: Array<ChatTurn>, message: string, };
+history?: Array<ChatTurn>, message: string, 
+/**
+ * Names of the skills the user picked; their full text goes into the system prompt.
+ */
+skills?: Array<string>, };
 
 export type ChatRole = "user" | "assistant";
 
@@ -600,7 +604,7 @@ export type TestConnectionArgs = { input: ConnectionInput, password: string | nu
 
 export type TestResult = { serverVersion: string, latencyMs: number, topology?: Topology, };
 
-export type ToolKind = "list" | "describe" | "read" | "chart" | "write" | "other";
+export type ToolKind = "list" | "describe" | "read" | "chart" | "write" | "skill" | "other";
 
 export type ToolResultData = { 
 /**

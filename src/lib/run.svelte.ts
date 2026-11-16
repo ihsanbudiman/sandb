@@ -16,12 +16,16 @@ import { ask } from './ask.svelte';
 import MongoWriteDialog from './components/MongoWriteDialog.svelte';
 import ExportDocumentsDialog from './components/ExportDocumentsDialog.svelte';
 import TableDangerDialog from './components/TableDangerDialog.svelte';
+import QueryParamsDialog from './components/QueryParamsDialog.svelte';
+import { fillPlaceholders, placeholders } from './sql/text';
 
 export interface Running {
   id: string;
   started: number;
   /** A file run: `done`/`total` come from the backend while it runs. */
   script?: { name: string; done: number; total: number };
+  /** A re-run of the shown result (load more, sort, refresh): the grid keeps its rows usable. */
+  again: boolean;
 }
 
 export const runs = $state<Record<string, Running>>({});
@@ -38,6 +42,9 @@ $effect.root(() => {
 
 const connOfTab = (t: Tab): Conn | undefined => db.connections.find((c) => c.id === t.connId) ?? db.connections[0];
 
+/** The last value typed for each `$1`, `$2`…, so a re-run offers them again. */
+const lastParams: Record<string, string> = {};
+
 /**
  * Runs the selection, or the statement at the cursor (as DBeaver's Ctrl+Enter); App passes the text.
  * `again` re-runs the shown result with a higher limit. With `append` the results open as new result
@@ -48,7 +55,19 @@ export async function run(pick: { sql: string; script?: string; sort?: RunSort; 
   if (!t || runs[t.id] || !confirmDiscard(t.edits)) return;
   const c = connOfTab(t);
   if (!c) return;
-  const cls = known ?? (await classify(c.engine, pick.sql, t.database));
+  // `$1`, `$2`… in SQL ask for their values first, as in DBeaver. A file run is sent as it is.
+  let sql = pick.sql;
+  const dialect = c.engine === 'mongo' || pick.script ? null : c.engine;
+  const names = dialect ? placeholders(sql, dialect) : [];
+  if (dialect && names.length) {
+    const values = await ask<Record<string, string> | null>(QueryParamsDialog, { names, values: lastParams });
+    // Another run of the tab may have started while the dialog was open.
+    if (!values || runs[t.id]) return;
+    Object.assign(lastParams, values);
+    sql = fillPlaceholders(sql, dialect, values);
+    known = undefined;
+  }
+  const cls = known ?? (await classify(c.engine, sql, t.database));
   if (cls.empty) return;
   // A production Mongo write asks first, like the table danger dialogs; text the backend could not
   // parse is a write too, so it cannot slip past the guard.
@@ -56,7 +75,7 @@ export async function run(pick: { sql: string; script?: string; sort?: RunSort; 
     const info = cls.info ?? { statements: [], warnings: [{ code: 'unparsable' as const, message: 'The text could not be parsed, so it is treated as a write.' }] };
     if (!(await ask<boolean>(MongoWriteDialog, { info, conn: c }))) return;
   }
-  await execute(t, c, pick.sql, t.database, cls, pick);
+  await execute(t, c, sql, t.database, cls, pick);
 }
 
 /** Re-runs the shown result with a higher limit, the grid's sort, or on Refresh; it never asks for a target. */
@@ -85,7 +104,7 @@ async function execute(
   if (!opts.again) t.sort = opts.sort;
   const id = crypto.randomUUID();
   const started = Date.now();
-  runs[t.id] = { id, started, script: opts.script ? { name: opts.script, done: 0, total: 0 } : undefined };
+  runs[t.id] = { id, started, again: !!opts.again, script: opts.script ? { name: opts.script, done: 0, total: 0 } : undefined };
   clock.now = started;
   // A run should show its result, so it opens a hidden grid.
   ui.resultsOpen = true;

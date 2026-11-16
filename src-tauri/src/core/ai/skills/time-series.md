@@ -1,0 +1,11 @@
+Time series analysis:
+- Choose the bucket from the range: day for up to about 3 months, week for up to about a year, month for longer.
+- Filter with a half-open range on the raw column: ts >= start AND ts < end. Do not wrap the column in a function in WHERE.
+- Group in the user's time zone when the data has one. Say which time zone you used.
+- Missing buckets: a period without rows must show as 0, not disappear. Generate the periods (generate_series, a recursive WITH, or fill them in the answer), or say that gaps exist.
+- The current period is incomplete. Leave it out of growth figures, or label it as partial.
+- Growth: compare a period with the one before (lag() OVER (ORDER BY period)) and with the same period last year. Give the absolute and the percent change.
+- Smoothing: a 7-day moving average with avg(x) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW).
+- Running totals: sum(x) OVER (ORDER BY period).
+- Cohorts: group users by the month of their first event, then count active users per month since that month.
+- Show trends with a line or area chart, ordered by period.

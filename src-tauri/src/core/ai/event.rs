@@ -24,6 +24,8 @@ pub enum ToolKind {
     Chart,
     /// A proposed write, approved or denied by the user.
     Write,
+    /// `load_skill`: the instructions of one built-in skill.
+    Skill,
     /// A tool name this build does not know. The call still streams and fails as `not_found`;
     /// the UI shows it without the actions of a known kind.
     Other,

@@ -1,6 +1,7 @@
 import { ApiError } from '../types';
 import type { CellValue, ChatEvent, ChatRequest, ToolKind, ToolResultData, WriteInfo } from '../generated/wire';
 import { mockSchema, nsOf, tableData } from './data';
+import { skillTitle } from '../../skills';
 import type { Row } from '../types';
 import { find } from './state';
 
@@ -83,6 +84,17 @@ async function reply(request: ChatRequest, script: Script, emit: (e: ChatEvent) 
   const done = (id: string, summary: string, extra: { columns?: string[]; rows?: CellValue[][]; result?: ToolResultData; error?: { code: 'write_blocked' | 'write_denied'; message: string } } = {}) =>
     emit({ type: 'tool_result', id, ok: !extra.error, summary, ...(extra.result ? { result: extra.result } : {}), ...(extra.error ? { error: extra.error } : {}), ...(extra.columns ? { columns: extra.columns } : {}), ...(extra.rows ? { rows: extra.rows } : {}) });
   const rowsOf = (rows: Row[], columns: string[]) => rows.map((r) => columns.map((c) => r[c]));
+
+  // Picked skills open the reply; asking about a skill without a pick makes the assistant load one by itself.
+  const picked = request.skills ?? [];
+  if (picked.length) {
+    await stream(`Using skills: ${picked.map(skillTitle).join(', ')}.\n\n`);
+  } else if (/\bskill\b/i.test(text)) {
+    await waiting(300);
+    const s = call('skill', 'load_skill', { name: 'data-quality' });
+    await waiting(500);
+    done(s, 'Data quality');
+  }
 
   if (conn.engine === 'mongo') {
     await stream(`I can read MongoDB collections on **${conn.name}**, but the demo build has no scripted Mongo answers. Ask a question about a collection and the live assistant will query it.`);

@@ -2,10 +2,10 @@
   import { onMount } from 'svelte';
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
   import { EditorState, Compartment, type Text } from '@codemirror/state';
-  import { defaultKeymap, history, historyKeymap, selectAll as selectAllCmd } from '@codemirror/commands';
+  import { defaultKeymap, history, historyKeymap, indentMore, indentLess, selectAll as selectAllCmd } from '@codemirror/commands';
   import { sql, PostgreSQL, MySQL, SQLite } from '@codemirror/lang-sql';
   import { javascript } from '@codemirror/lang-javascript';
-  import { syntaxHighlighting, HighlightStyle, syntaxTree, foldService, foldGutter, foldedRanges, foldEffect, unfoldEffect, foldAll, unfoldAll, codeFolding } from '@codemirror/language';
+  import { syntaxHighlighting, HighlightStyle, syntaxTree, foldService, foldGutter, foldedRanges, foldEffect, unfoldEffect, foldAll, unfoldAll, codeFolding, indentUnit } from '@codemirror/language';
   import { autocompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
   import { tags as t } from '@lezer/highlight';
   import { columnCompletion } from '../sql/columns';
@@ -353,6 +353,16 @@
             { key: KEYS.foldStatement.combo, run: toggleStatementFold },
             { key: KEYS.foldAll.combo, run: foldAll },
             { key: KEYS.unfoldAll.combo, run: unfoldAll },
+            // Tab inserts spaces at the cursor (or indents selected lines) instead of moving focus.
+            {
+              key: 'Tab',
+              run: (v) => {
+                if (v.state.selection.ranges.some((r) => !r.empty)) return indentMore(v);
+                v.dispatch(v.state.replaceSelection(v.state.facet(indentUnit)), { scrollIntoView: true, userEvent: 'input' });
+                return true;
+              },
+              shift: indentLess,
+            },
             ...defaultKeymap,
             ...historyKeymap,
           ]),

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Ban, Braces, Check, ChartColumn, ChevronRight, Clock, Copy, FileCode, FileDown, FileSpreadsheet, LoaderCircle, ListTree, RotateCw, Sparkles, Table2, TriangleAlert, X } from '@lucide/svelte';
+  import { Ban, BookOpen, Braces, Check, ChartColumn, ChevronRight, Clock, Copy, FileCode, FileDown, FileSpreadsheet, LoaderCircle, ListTree, RotateCw, Sparkles, Table2, TriangleAlert, X } from '@lucide/svelte';
   import Markdown from './Markdown.svelte';
   import ChartView from './ChartView.svelte';
   import TargetBadge from './TargetBadge.svelte';
@@ -12,6 +12,7 @@
   import { Flash } from '../flash.svelte';
   import { exportReply } from '../report';
   import { csvCell, formatCell } from '../results';
+  import { skillTitle } from '../skills';
   import { sqlHtml } from '../highlight';
 
   let {
@@ -49,7 +50,7 @@
   let stream = $state<HTMLDivElement>();
 
   // ---- results only ----
-  /** Replies whose steps the user opened while steps are hidden. */
+  /** Replies whose steps the user opened while steps are hidden, and long questions the user expanded. */
   let revealed = $state<Record<string, boolean>>({});
   // Open state the user chose, per step. Without a choice: closed, except while it waits for approval or after it failed.
   let opened = $state<Record<string, boolean>>({});
@@ -162,7 +163,24 @@
   <div bind:this={stream} class="space-y-4">
     {#each messages as m, mi}
       {#if m.role === 'user'}
-        <div class="ml-auto w-fit max-w-[85%] rounded-xl rounded-br-sm bg-active px-3 py-2 text-ink">{(m.parts[0] as { text: string }).text}</div>
+        {@const text = (m.parts[0] as { text: string }).text}
+        {@const uk = `${session?.id}:${mi}:user`}
+        {@const long = text.length > 600 || text.split('\n').length > 8}
+        <div class="ml-auto w-fit max-w-[85%] rounded-xl rounded-br-sm bg-active px-3 py-2 text-ink">
+          {#if m.skills?.length}
+            <div class="mb-1 flex flex-wrap justify-end gap-1">
+              {#each m.skills as name (name)}
+                <span class="inline-flex items-center gap-1 rounded bg-surface px-1.5 py-0.5 text-[10.5px] font-medium text-muted" title="Skill sent with this question"><BookOpen size={10} /> {skillTitle(name)}</span>
+              {/each}
+            </div>
+          {/if}
+          <div class="break-words whitespace-pre-wrap {long && !revealed[uk] ? 'line-clamp-8' : ''}">{text}</div>
+          {#if long}
+            <button class="-ml-1 mt-1 flex h-6 items-center gap-1 rounded px-1 text-[12px] text-muted hover:bg-hover hover:text-ink" aria-expanded={!!revealed[uk]} onclick={() => (revealed[uk] = !revealed[uk])}>
+              <ChevronRight size={12} class="transition-transform {revealed[uk] ? '-rotate-90' : 'rotate-90'}" />{revealed[uk] ? 'Show less' : 'Show more'}
+            </button>
+          {/if}
+        </div>
       {:else}
         {@const work = workSteps(m.parts)}
         {@const end = workEnd(m.parts)}
@@ -222,6 +240,7 @@
                         {:else if p.status === 'failed'}<TriangleAlert size={13} class="shrink-0 text-red-600 dark:text-red-400" />
                         {:else if p.status === 'awaiting'}<Clock size={13} class="shrink-0 text-amber-600 dark:text-amber-400" />
                         {:else if isChartTool(p)}<ChartColumn size={13} class="shrink-0 text-emerald-600 dark:text-emerald-400" />
+                        {:else if p.tool === 'skill'}<BookOpen size={13} class="shrink-0 text-sky-600 dark:text-sky-400" />
                         {:else}<Check size={13} class="shrink-0 text-emerald-600 dark:text-emerald-400" />{/if}
                         <span class="shrink-0 font-medium text-ink">{TOOL_LABEL[p.tool] ?? p.name}</span>
                         {#if many && p.source}<span class="max-w-24 shrink-0 truncate rounded bg-sunken px-1 font-mono text-[10.5px] text-muted" title={sourceLabel(p.source)}>{dbOf(p.source)}</span>{/if}

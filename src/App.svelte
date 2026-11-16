@@ -792,7 +792,7 @@
       <div class="flex min-h-0 flex-1 flex-col border-t border-line">
         <TableFilterBar {columns} types={tab.result?.types ?? []} bind:filters={tab.filters} loading={!!busy} onapply={() => loadTableData(tab)} />
         <div class="relative min-h-0 flex-1">
-          <ResultsGrid tab={tab} loading={!!busy} sort={tab.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} foreignKeys={tableFks} onfollow={(fk, row) => followForeignKey(conn, t, fk, row)} />
+          <ResultsGrid tab={tab} running={busy} oncancel={() => cancelRun(tab)} sort={tab.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} foreignKeys={tableFks} onfollow={(fk, row) => followForeignKey(conn, t, fk, row)} />
         </div>
       </div>
     {:else}
@@ -864,7 +864,7 @@
 
     <!-- Hidden, not unmounted, so the grid keeps its scroll, selection and edit mode. -->
     <div class="contents" hidden={!ui.resultsOpen}>
-      <div class="relative z-10 -my-1 h-2 shrink-0">
+      <div class="relative z-30 -my-1 h-2 shrink-0">
         <!-- Overlaps the editor and grid by 4 px each, so the grab area is wider than the border line. -->
         <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
         <div class="absolute inset-0 cursor-row-resize outline-none hover:bg-accent/25 focus-visible:bg-accent/40" role="separator" aria-orientation="horizontal" aria-label="Resize editor" aria-valuenow={Math.round(ui.editorSplit * 100)} aria-valuemin={10} aria-valuemax={80} tabindex="0" onpointerdown={resizeEditor} onkeydown={keyEditor}></div>
@@ -898,7 +898,7 @@
         {/if}
         <div class="relative min-h-0 flex-1">
           {#key `${tab.id}:${tab.resultIndex}:${tab.result?.sql ?? ''}:${tab.result?.title ?? ''}`}
-            <ResultsGrid tab={tab} loading={!!busy} sort={tab.result?.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} />
+            <ResultsGrid tab={tab} running={busy} oncancel={() => cancelRun(tab)} sort={tab.result?.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} />
           {/key}
         </div>
       </div>

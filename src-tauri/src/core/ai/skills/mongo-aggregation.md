@@ -1,0 +1,14 @@
+MongoDB aggregation patterns (one mongosh statement each):
+- Order: $match first (it can use an index), then $project or $addFields, then $group, $sort, $limit.
+- Count per value: [{$group: {_id: "$status", n: {$sum: 1}}}, {$sort: {n: -1}}].
+- Sum and average: {$group: {_id: "$country", total: {$sum: "$amount"}, avg: {$avg: "$amount"}}}.
+- Flat output for charts: end with {$project: {_id: 0, status: "$_id", n: 1}}.
+- Dates: {$dateTrunc: {date: "$createdAt", unit: "month", timezone: "Asia/Jakarta"}}, {$dateToString: {format: "%Y-%m", date: "$createdAt"}}. Range filter: {createdAt: {$gte: ISODate("2026-01-01"), $lt: ISODate("2026-02-01")}}.
+- Arrays: $unwind: "$items" to get one document per element; {$size: "$items"} for the count; {tags: "x"} matches an array that holds "x".
+- Joins: {$lookup: {from: "customers", localField: "customerId", foreignField: "_id", as: "customer"}}, then {$unwind: "$customer"}. Filter and limit before $lookup.
+- Several results in one pass: $facet with one pipeline per output.
+- Top N per group: $sort, then $group with {$first: "$$ROOT"}, or $topN (MongoDB 5.2 or later).
+- Missing fields: {field: {$exists: false}} finds documents without it; $ifNull gives a default.
+- Field types vary between documents. Check describe_table, and use $type or $convert when a field has more than one type.
+- Distinct values: db.coll.distinct("field", filter).
+- Plans: db.runCommand({explain: {aggregate: "orders", pipeline: [...], cursor: {}}, verbosity: "queryPlanner"}).

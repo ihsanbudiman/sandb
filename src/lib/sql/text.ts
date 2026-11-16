@@ -146,3 +146,33 @@ export function maskLiterals(text: string, dialect: Dialect): string {
   }
   return out.join('');
 }
+
+/**
+ * The `$1`, `$2`… placeholders of the text, outside strings, comments, quoted names and dollar
+ * quotes. A `$` inside a name, as in `price$1`, is not a placeholder.
+ */
+function placeholderRanges(text: string, dialect: Dialect): { from: number; to: number; name: string }[] {
+  const out: { from: number; to: number; name: string }[] = [];
+  // Strings are blanks in the mask, so a quote left in it opens a quoted name.
+  for (const m of maskLiterals(text, dialect).matchAll(/"[^"]*"?|`[^`]*`?|(?<![\w$])\$\d+(?!\w)/g)) {
+    if (m[0][0] === '$') out.push({ from: m.index, to: m.index + m[0].length, name: m[0] });
+  }
+  return out;
+}
+
+/** The distinct placeholders of the text in number order, e.g. `['$1', '$2']`. */
+export function placeholders(text: string, dialect: Dialect): string[] {
+  const names = new Set(placeholderRanges(text, dialect).map((r) => r.name));
+  return [...names].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
+}
+
+/** The text with each placeholder replaced by its value, written as is. */
+export function fillPlaceholders(text: string, dialect: Dialect, values: Record<string, string>): string {
+  let out = '';
+  let at = 0;
+  for (const r of placeholderRanges(text, dialect)) {
+    out += text.slice(at, r.from) + values[r.name];
+    at = r.to;
+  }
+  return out + text.slice(at);
+}

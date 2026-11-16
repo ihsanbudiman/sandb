@@ -1,0 +1,14 @@
+MySQL and MariaDB dialect:
+- Quote identifiers with backticks: `order`, `user`. Strings use single quotes.
+- Qualify tables of another database: shop.orders. There are no schemas inside a database.
+- Comparisons on text follow the column collation; most collations ignore case, so = 'abc' also matches 'ABC'. Use BINARY col = 'abc' for an exact match.
+- Dates: DATE(ts), DATE_FORMAT(ts, '%Y-%m'), YEAR(ts), MONTH(ts), ts >= '2026-01-01', NOW() - INTERVAL 7 DAY, DATEDIFF(a, b), TIMESTAMPDIFF(MINUTE, a, b).
+- Month buckets: DATE_FORMAT(ts, '%Y-%m-01'). Week buckets: YEARWEEK(ts, 3).
+- Division: a / b gives a decimal; use NULLIF(b, 0) against division by zero. DIV is integer division.
+- Conditional aggregates: SUM(status = 'paid') counts rows, SUM(CASE WHEN ... THEN amount END) sums.
+- Text aggregation: GROUP_CONCAT(name ORDER BY name SEPARATOR ', ').
+- JSON: col->'$.key' gives JSON, col->>'$.key' gives text, JSON_EXTRACT, JSON_CONTAINS, JSON_TABLE to expand arrays (MySQL 8).
+- Window functions and WITH need MySQL 8 or MariaDB 10.2 or later. Check the server version in the source lines.
+- No FULL OUTER JOIN: use a LEFT JOIN UNION a RIGHT JOIN.
+- LIMIT n OFFSET m. No FETCH FIRST before MySQL 8.0.
+- Use EXPLAIN (without ANALYZE) to read a plan. Catalog: information_schema.columns, information_schema.statistics for indexes.

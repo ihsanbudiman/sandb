@@ -20,6 +20,18 @@
   --color-faint: var(--c-faint);
   --color-accent: var(--c-accent);
   --color-accent-fg: var(--c-accent-fg);
+  /* Running query: an indeterminate bar and a skeleton shimmer (ResultsGrid). */
+  --animate-indeterminate: indeterminate 1.4s cubic-bezier(.65, 0, .35, 1) infinite;
+  --animate-shimmer: shimmer 1.6s ease-in-out infinite;
+  @keyframes indeterminate {
+    0% { transform: translateX(-100%) scaleX(.3); }
+    50% { transform: translateX(10%) scaleX(.6); }
+    100% { transform: translateX(100%) scaleX(.3); }
+  }
+  @keyframes shimmer {
+    0%, 100% { opacity: .45; }
+    50% { opacity: 1; }
+  }
 }
 
 /* Warm graphite neutrals with one amber accent. `hover`/`active` are ink overlays, so they work on the

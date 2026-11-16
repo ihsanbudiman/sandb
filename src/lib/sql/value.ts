@@ -7,6 +7,21 @@ export function isNumericType(dataType: string): boolean {
   return /^(int|integer|smallint|tinyint|mediumint|bigint|int[248]|serial|bigserial|smallserial|real|double|float|float[48]|decimal|numeric|number|money)\b/i.test(dataType);
 }
 
+/** A column that holds true or false. */
+export function isBooleanType(dataType: string): boolean {
+  return /bool/i.test(dataType);
+}
+
+/** A date or time column: "Set NOW()" applies to it. */
+export function isTemporalType(dataType: string): boolean {
+  return /^(date|datetime|time|timetz|timestamp|timestamptz)\b/i.test(dataType);
+}
+
+/** A pending cell value that the save writes as the server's `CURRENT_TIMESTAMP`, not as a literal. */
+export const NOW_VALUE: Cell = { $now: true };
+export const isNow = (v: unknown): boolean =>
+  !!v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 1 && (v as Record<string, unknown>).$now === true;
+
 /** A numeric string the SQL text may take as written (an exponent included). */
 export const isNumericText = (text: string) => /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text);
 
@@ -21,12 +36,13 @@ export function quoteIdent(engine: Engine, name: string): string {
  */
 export function sqlLiteral(engine: Engine, v: Cell, dataType = ''): string {
   if (v === null) return 'NULL';
+  if (isNow(v)) return 'CURRENT_TIMESTAMP';
   if (typeof v === 'number') return String(v);
   if (typeof v === 'boolean') return engine === 'pg' ? (v ? 'TRUE' : 'FALSE') : v ? '1' : '0';
   if (typeof v === 'string') {
     const text = v.trim();
     if (isNumericType(dataType) && isNumericText(text)) return text;
-    if (/bool/i.test(dataType) && /^(true|false|1|0)$/i.test(text)) {
+    if (isBooleanType(dataType) && /^(true|false|1|0)$/i.test(text)) {
       const yes = /^(true|1)$/i.test(text);
       return engine === 'pg' ? (yes ? 'TRUE' : 'FALSE') : yes ? '1' : '0';
     }

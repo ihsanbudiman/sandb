@@ -1,7 +1,8 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { ArrowUpDown, ArrowUp, ArrowDown, ArrowUpRight, Check, X, Pencil, Minus, Eye, Undo2, CircleSlash, CircleAlert, CircleCheck, Copy, Braces } from '@lucide/svelte';
+  import { ArrowUpDown, ArrowUp, ArrowDown, ArrowUpRight, Check, X, Pencil, Minus, Eye, Undo2, CircleSlash, CircleAlert, CircleCheck, Copy, Braces, Clock } from '@lucide/svelte';
   import { api, ApiError, type Cell, type ForeignKeyInfo, type Row, type RunSort, type TypedValue } from '../api';
+  import { focusOnMount } from '../actions';
   import { canWrite } from '../connections.svelte';
   import { pendingCount, resetEdits } from '../editModel';
   import { addRow, buildStatements, editBlocker, parseInput, prepareEdit, saveEdits, setCell } from '../edits';
@@ -9,29 +10,35 @@
   import { mongoLiteral } from '../mongo/value';
   import { MONGO_WRITABLE_TYPES } from '../api/generated/constants';
   import { cellText, copyValue, formatCell, isBytes, isCutOff, moreRows } from '../results';
+  import { isBooleanType, isNow, isTemporalType, NOW_VALUE } from '../sql/value';
   import { KEYS } from '../keys';
   import { exportCsv as runExportCsv, exportDocuments as runExportDocuments, exportSql as runExportSql, type ExportMessage } from '../gridExport';
+  import { isPlan, reviewPlan } from '../planReview';
   import type { Tab } from '../tabs.svelte';
+  import type { Running } from '../run.svelte';
   import EditSaveDialog from './EditSaveDialog.svelte';
   import MongoValueDialog from './MongoValueDialog.svelte';
   import GridCellEditor from './GridCellEditor.svelte';
   import GridToolbar from './GridToolbar.svelte';
   import JsonTree from './JsonTree.svelte';
   import Modal from './Modal.svelte';
+  import QueryRunning from './QueryRunning.svelte';
   import { ask } from '../ask.svelte';
 
-  /** The grid of one tab: its shown result, its grid edits and the API calls scoped to its session. */
+  /** The grid of one tab: its shown result, its grid edits and the API calls scoped to its session. `running`: the tab's run, if any. */
   let {
     tab,
-    loading = false,
+    running,
+    oncancel,
     onloadmore,
     onsaved,
     sort = null,
     onsort,
     foreignKeys = [],
     onfollow,
-  }: { tab: Tab; loading?: boolean; onloadmore?: () => void; onsaved: () => void; sort?: RunSort | null; onsort?: (sort: RunSort) => void; foreignKeys?: ForeignKeyInfo[]; onfollow?: (fk: ForeignKeyInfo, row: Row) => void } = $props();
+  }: { tab: Tab; running?: Running; oncancel?: () => void; onloadmore?: () => void; onsaved: () => void; sort?: RunSort | null; onsort?: (sort: RunSort) => void; foreignKeys?: ForeignKeyInfo[]; onfollow?: (fk: ForeignKeyInfo, row: Row) => void } = $props();
 
+  const loading = $derived(!!running);
   const result = $derived(tab.result);
   const conn = $derived(tab.resultConn);
   const edits = $derived(tab.edits);
@@ -207,6 +214,14 @@
   const isDeleted = (r: GridRow) => !r.isNew && !!edits.deleted[r.idx];
   const sample = (c: string) => result?.rows.find((x) => x[c] !== null)?.[c] ?? null;
 
+  /** A boolean cell: the column type says bool, or the shown value is a boolean. Mongo has its own type list. */
+  const isBoolCell = (r: GridRow, c: string, ci: number) => !mongoConn && (typeof value(r, c) === 'boolean' || isBooleanType(result?.types?.[ci] ?? ''));
+  /** The cell as a checkbox state; NULL and other values start unchecked. */
+  const isTrue = (r: GridRow, c: string) => {
+    const v = value(r, c);
+    return v === true || v === 1 || v === 'true' || v === '1';
+  };
+
   async function enableEdit(): Promise<boolean> {
     if (!result || preparing) return false;
     if (blocker) {
@@ -254,7 +269,7 @@
       edits.error = { message: 'Binary preview cells are read-only', key: r.key };
       return;
     }
-    let text: string | null = v === null ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
+    let text: string | null = v === null || isNow(v) ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v);
     full = null;
     // The grid gets at most 4 KB per cell; load the whole value from the row's primary key.
     if (isCutOff(v) && !r.isNew && !isChanged(r, c)) {
@@ -466,6 +481,34 @@
     navigator.clipboard?.writeText(text).catch(() => {});
   }
 
+  /**
+   * Copy of a selection that starts in one cell. A selection that runs past the cell (a triple-click in WebKit ends at the next row)
+   * copies only that cell's text, with no line break. The grid shows JSON cut at 200 characters; a selection that reaches the cut
+   * or runs past the cell copies the whole value from its start.
+   */
+  function copySelection(e: ClipboardEvent) {
+    const sel = getSelection();
+    if (!result || !e.clipboardData || sel?.rangeCount !== 1) return;
+    const range = sel.getRangeAt(0);
+    const start = range.startContainer;
+    const el = (start instanceof Element ? start : start.parentElement)?.closest<HTMLElement>('[data-cell]');
+    if (!el) return;
+    const v = value(rows[Number(el.dataset.row)], result.columns[Number(el.dataset.col)]);
+    const shown = el.textContent ?? '';
+    const offset = (node: Node, at: number) => {
+      const r = document.createRange();
+      r.selectNodeContents(el);
+      r.setEnd(node, at);
+      return r.toString().length;
+    };
+    const cutJson = !!v && typeof v === 'object' && !isBytes(v) && shown.endsWith('…');
+    if (el.contains(range.endContainer) && !(cutJson && offset(range.endContainer, range.endOffset) >= shown.length)) return;
+    // NULL, booleans and binary show no text the value starts with; they copy whole, as ⌘C on rows does.
+    const whole = v === null || typeof v === 'boolean' || isBytes(v);
+    e.preventDefault();
+    e.clipboardData.setData('text/plain', whole ? cellText(v) : cellText(v).slice(offset(start, range.startOffset)));
+  }
+
   function deleteRows(keys: string[]) {
     for (const k of keys) {
       const r = rows.find((x) => x.key === k);
@@ -491,7 +534,7 @@
     if (!edits.on && !mongoDocs) return;
     e.preventDefault();
     if (edits.on && !selected[r.key]) selected = { [r.key]: true };
-    menu = { x: Math.min(e.clientX, innerWidth - 170), y: Math.min(e.clientY, innerHeight - (mongoDocs ? 220 : 130)), r, col: c };
+    menu = { x: Math.min(e.clientX, innerWidth - 170), y: Math.min(e.clientY, innerHeight - (mongoDocs ? 220 : 160)), r, col: c };
   }
 
   /** Full value of a Mongo cell, read from its document at the column path; undefined for a missing field. */
@@ -579,8 +622,12 @@
   onkeydown={(e) => { if (e.key === 'Escape') { menu = null; viewing = null; } }}
 />
 
+{#if running}
+  <QueryRunning run={running} over={!!result} {oncancel} />
+{/if}
+
 {#if !result}
-  <div class="grid h-full place-items-center">
+  <div class="grid h-full place-items-center" class:invisible={loading}>
     <div class="text-center">
       <div class="text-[13px] font-medium text-ink">No results yet</div>
       <div class="mt-1 flex items-center justify-center gap-1.5 text-[12.5px] text-muted">Write a query and press <kbd class="kbd">{KEYS.run.hint}</kbd></div>
@@ -610,7 +657,7 @@
     {#if result.notices}<div class="border-b border-line px-3 py-1.5">{@render notices(result.notices)}</div>{/if}
     {#if result.summary}<div class="border-b border-line px-3 py-1.5">{@render summary(result.summary)}</div>{/if}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="min-h-0 flex-1 overflow-auto outline-none" tabindex="-1" bind:this={scroller} onscroll={loadIfAtEnd} onkeydown={copyBlock}>
+    <div class="min-h-0 flex-1 overflow-auto outline-none" tabindex="-1" bind:this={scroller} onscroll={loadIfAtEnd} onkeydown={copyBlock} oncopy={copySelection}>
       {#if mongoDocs && view === 'json'}
         <JsonTree documents={result.documents ?? []} more={moreRows(result)} {loading} onloadmore={onloadmore} />
       {:else}
@@ -686,7 +733,25 @@
                   }}
                   oncontextmenu={(e) => openMenu(e, r, c)}
                 >
-                  {#if isEd}
+                  {#if isEd && isBoolCell(r, c, ci)}
+                    <!-- WebKit does not focus a clicked checkbox: mousedown would blur it and close the editor before the click toggles it. -->
+                    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+                    <label class="absolute inset-0 flex cursor-pointer items-center px-2.5" title="Toggle {c}" onmousedown={(e) => e.preventDefault()}>
+                      <input
+                        type="checkbox"
+                        class="size-[13px] cursor-pointer accent-accent"
+                        aria-label="Toggle {c}"
+                        checked={isTrue(r, c)}
+                        use:focusOnMount
+                        onchange={(e) => write(r, c, e.currentTarget.checked)}
+                        onkeydown={(e) => {
+                          if (e.key === 'Enter') { e.preventDefault(); editing = null; }
+                          else if (e.key === 'Escape') { e.stopPropagation(); editing = null; }
+                        }}
+                        onblur={() => (editing = null)}
+                      />
+                    </label>
+                  {:else if isEd}
                     <GridCellEditor
                       mongo={mongoConn}
                       bind:value={draft}
@@ -712,7 +777,7 @@
                       ondblclick={(e) => e.stopPropagation()}
                     ><ArrowUpRight size={12} /></button>
                   {/if}
-                  <span class:invisible={isEd}>
+                  <span class:invisible={isEd} data-cell data-row={i} data-col={ci}>
                     {#if v === null}
                       <span class="text-[11px] italic {selected[r.key] ? 'text-muted' : 'text-faint'}">NULL</span>
                     {:else if typeof v === 'boolean'}
@@ -762,6 +827,7 @@
       onview={(v) => (view = v)}
       onexport={fileExport ? exportDocumentsNow : exportCsvNow}
       onexportsql={exportSqlNow}
+      onreview={isPlan(result, conn.engine) ? () => reviewPlan(result, conn.engine) : undefined}
     />
   </div>
 {/if}
@@ -795,6 +861,9 @@
       {#if !isDeleted(m.r)}
         <button class="nav-item" onclick={() => { startEdit(m.r, m.col); menu = null; }}><Pencil size={13} /> Edit cell</button>
         <button class="nav-item" onclick={() => { write(m.r, m.col, null); menu = null; }}><CircleSlash size={13} /> Set NULL</button>
+        {#if isTemporalType(result?.types?.[result.columns.indexOf(m.col)] ?? '')}
+          <button class="nav-item" onclick={() => { write(m.r, m.col, NOW_VALUE); menu = null; }}><Clock size={13} /> Set NOW()</button>
+        {/if}
         {#if isChanged(m.r, m.col)}
           <button class="nav-item" onclick={() => { setCell(edits, m.r.idx, m.r.row, m.col, m.r.row[m.col]); menu = null; }}><Undo2 size={13} /> Revert cell</button>
         {/if}

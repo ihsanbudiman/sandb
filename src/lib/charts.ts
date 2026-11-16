@@ -20,7 +20,8 @@ export interface ChartColors {
 }
 
 const LIGHT = ['#b45309', '#2563eb', '#0f766e', '#7c3aed', '#be123c', '#4d7c0f', '#0369a1', '#a16207'];
-const DARK = ['#eda33c', '#60a5fa', '#2dd4bf', '#a78bfa', '#fb7185', '#a3e635', '#38bdf8', '#facc15'];
+// Soft pastels on the dark card: easier on the eye than full saturation.
+const DARK = ['#e9c77f', '#7b9bdc', '#6cc4b0', '#a998e0', '#e98a9b', '#a9cf7a', '#72b8dc', '#d9b45a'];
 
 /** Light colors, for paper. */
 export const PRINT_COLORS: ChartColors = { ink: '#1c1b19', muted: '#5f5b55', line: '#e5e3df', palette: LIGHT };
@@ -42,25 +43,27 @@ const label = (v: CellValue | undefined) => (v === null || v === undefined ? 'NU
 const compact = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
 const full = (v: unknown) => (typeof v === 'number' ? v.toLocaleString() : String(v ?? ''));
 
-export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: boolean; font?: string } = {}): EChartsCoreOption {
+export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: boolean; font?: string; mono?: string } = {}): EChartsCoreOption {
   const { spec, columns, rows } = p;
   const col = (name: string) => columns.indexOf(name);
   const xi = col(spec.x);
-  const text = { color: c.muted, fontSize: 11 };
   const font = opts.font ?? 'Inter Variable, Helvetica, Arial, sans-serif';
+  // Legend and axis labels use the mono face, as data reads better in it.
+  const text = { color: c.muted, fontSize: 12, fontFamily: opts.mono ?? 'JetBrains Mono Variable, ui-monospace, monospace' };
+  const legendStyle = { type: 'scroll', icon: 'roundRect', itemWidth: 10, itemHeight: 10, itemGap: 20, textStyle: text };
   const base = {
     animation: opts.animation ?? true,
     color: c.palette,
     textStyle: { fontFamily: font },
-    title: spec.title ? { text: spec.title, left: 0, top: 0, textStyle: { color: c.ink, fontSize: 13, fontWeight: 'bold', fontFamily: font } } : undefined,
-    tooltip: { trigger: spec.type === 'pie' || spec.type === 'scatter' ? 'item' : 'axis', valueFormatter: full, confine: true },
+    title: spec.title ? { text: spec.title, left: 0, top: 0, padding: 0, textStyle: { color: c.ink, fontSize: 14, fontWeight: 'bold', fontFamily: font } } : undefined,
+    tooltip: { trigger: spec.type === 'pie' || spec.type === 'scatter' ? 'item' : 'axis', axisPointer: { type: spec.type === 'bar' ? 'shadow' : 'line' }, valueFormatter: full, confine: true },
   };
 
   if (spec.type === 'pie') {
     const yi = col(spec.y[0]);
     return {
       ...base,
-      legend: { type: 'scroll', bottom: 0, textStyle: text },
+      legend: { ...legendStyle, bottom: 0 },
       series: [
         {
           type: 'pie',
@@ -68,7 +71,8 @@ export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: bo
           radius: ['38%', '68%'],
           center: ['50%', spec.title ? '52%' : '46%'],
           label: { color: c.muted, fontSize: 11 },
-          itemStyle: { borderColor: 'transparent' },
+          padAngle: 1,
+          itemStyle: { borderColor: 'transparent', borderRadius: 4 },
           data: rows.map((r) => ({ name: label(r[xi]), value: num(r[yi]) })),
         },
       ],
@@ -92,28 +96,37 @@ export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: bo
   }
 
   const legend = named.size > 1;
+  const header = Boolean(spec.title) || legend;
   const axisLine = { lineStyle: { color: c.line } };
-  const splitLine = { lineStyle: { color: c.line } };
-  const valueAxis = { type: 'value', axisLabel: { ...text, formatter: (v: number) => compact.format(v) }, splitLine, axisLine };
+  // Value axes only on scatter, where both axes carry data. Bar, line and area show the values in the tooltip.
+  const valueAxis = { type: 'value', axisLabel: { ...text, formatter: (v: number) => compact.format(v) }, splitLine: { lineStyle: { color: c.line } }, axisLine };
+  const hiddenAxis = { type: 'value', axisLabel: { show: false }, splitLine: { show: false }, axisLine: { show: false }, axisTick: { show: false } };
   const stack = spec.stacked && !scatter ? 'total' : undefined;
+  const bar = spec.type === 'bar';
   return {
     ...base,
-    legend: legend ? { type: 'scroll', bottom: 0, textStyle: text } : undefined,
-    grid: { left: 8, right: 16, top: spec.title ? 40 : 16, bottom: legend ? 36 : 8, outerBoundsMode: 'same', outerBoundsContain: 'all' },
+    legend: legend ? { ...legendStyle, top: 0, right: 0, padding: 0 } : undefined,
+    grid: { left: 0, right: 0, top: header ? 52 : 12, bottom: 4, outerBoundsMode: 'same', outerBoundsContain: 'all' },
     xAxis:
       scatter
         ? { ...valueAxis, name: spec.x, nameLocation: 'middle', nameGap: 24, nameTextStyle: text, scale: true }
-        : { type: 'category', data: categories, axisLabel: { ...text, hideOverlap: true }, axisLine, axisTick: { show: false }, boundaryGap: spec.type === 'bar' },
-    yAxis: scatter ? { ...valueAxis, scale: true } : valueAxis,
+        : { type: 'category', data: categories, axisLabel: { ...text, hideOverlap: true, margin: 16 }, axisLine, axisTick: { show: false }, boundaryGap: bar },
+    yAxis: scatter ? { ...valueAxis, scale: true } : hiddenAxis,
     series: [...named].map(([name, data]) => ({
       type: spec.type === 'area' ? 'line' : spec.type,
       name,
       stack,
       data,
-      areaStyle: spec.type === 'area' ? { opacity: 0.25 } : undefined,
+      areaStyle: spec.type === 'area' ? { opacity: 0.2 } : undefined,
+      lineStyle: scatter ? undefined : { width: 2.5 },
       showSymbol: scatter || categories.length <= 40,
-      symbolSize: scatter ? 7 : 5,
-      barMaxWidth: 40,
+      symbol: 'circle',
+      symbolSize: scatter ? 7 : 6,
+      // Round only the top of a bar; stacked segments meet flat.
+      itemStyle: bar && !stack ? { borderRadius: [4, 4, 0, 0] } : undefined,
+      barGap: '10%',
+      barCategoryGap: '25%',
+      barMaxWidth: 72,
     })),
   };
 }
@@ -122,7 +135,7 @@ export function chartSvg(p: ChartPart, width: number, height: number): string {
   const chart = echarts.init(null, null, { renderer: 'svg', ssr: true, width, height });
   try {
     // The PDF has Helvetica built in; other fonts would fall back with a warning.
-    chart.setOption(chartOption(p, PRINT_COLORS, { animation: false, font: 'helvetica' }));
+    chart.setOption(chartOption(p, PRINT_COLORS, { animation: false, font: 'helvetica', mono: 'helvetica' }));
     // svg2pdf knows only normal and bold; ECharts writes bold as 600.
     return chart.renderToSVGString().replace(/font-weight:\s*[6-9]00/g, 'font-weight:bold');
   } finally {

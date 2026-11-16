@@ -1,6 +1,7 @@
 import type { BytesValue, Cell, QueryResult, QueryRun, Schema, SchemaSnapshot, StatementResult } from './api';
 import { MAX_LIMIT, PREVIEW_BYTES } from './api/generated/constants';
 import { tableLabel } from './tableId';
+import { isNow } from './sql/value';
 
 export const isBytes = (v: unknown): v is BytesValue => !!v && typeof v === 'object' && '$bytes' in v && 'len' in v;
 
@@ -10,6 +11,7 @@ export function isCutOff(v: unknown): v is string {
 }
 
 export function formatCell(v: object): string {
+  if (isNow(v)) return 'NOW()';
   if (isBytes(v)) {
     const head = atob(v.$bytes.slice(0, 12)).slice(0, 8);
     const hex = [...head].map((c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');

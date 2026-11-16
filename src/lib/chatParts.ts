@@ -2,6 +2,7 @@ import type { Row } from './api';
 import { connOf, dbOf, type Source } from './connections.svelte';
 import type { Msg, Part, ToolPart } from './chatModel';
 import { isChartTool, isDescribeTool, isReadTool, mongoStep } from './chatTools';
+import { skillTitle } from './skills';
 
 /** Consecutive tool steps of one reply form one timeline; `at` is the index of each part in the message. */
 export type Block = { kind: 'part'; p: Exclude<Part, ToolPart>; at: number } | { kind: 'steps'; steps: { p: ToolPart; at: number }[] };
@@ -36,7 +37,8 @@ export function processPart(p: Part, at: number, end: number, pending: boolean) 
 
 export const replyText = (parts: Part[]) => parts.flatMap((p) => (p.kind === 'text' ? [p.text] : [])).join('\n\n').trim();
 
-export const stepTarget = (p: ToolPart) => (isDescribeTool(p) ? p.sql : p.sql?.trim().split('\n')[0]) ?? '';
+/** The step's target: a skill's title, a described table, or the query's first line. */
+export const stepTarget = (p: ToolPart) => (p.tool === 'skill' ? skillTitle(typeof p.args?.name === 'string' ? p.args.name : '') : isDescribeTool(p) ? p.sql : p.sql?.trim().split('\n')[0]) ?? '';
 
 export const duration = (ms?: number) => (ms === undefined ? '' : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`);
 

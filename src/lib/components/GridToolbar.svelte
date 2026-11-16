@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Download, FileCode, Eye, LoaderCircle, Minus, Pencil, Plus, Undo2 } from '@lucide/svelte';
+  import { Download, FileCode, Eye, LoaderCircle, Minus, Pencil, Plus, Sparkles, Undo2 } from '@lucide/svelte';
   import type { QueryResult } from '../api';
   import { pendingCount, type Edits } from '../editModel';
   import type { ExportMessage } from '../gridExport';
@@ -26,6 +26,7 @@
     onview,
     onexport,
     onexportsql,
+    onreview,
   }: {
     result: QueryResult;
     edits: Edits;
@@ -48,6 +49,8 @@
     onview: (v: 'columns' | 'json') => void;
     onexport: () => void;
     onexportsql: () => void;
+    /** Set when the result is a query plan: sends it to the assistant for a performance review. */
+    onreview?: () => void;
   } = $props();
 
   const count = $derived(pendingCount(edits));
@@ -93,8 +96,11 @@
     <span class="min-w-0 truncate text-[12px] {exportMsg.ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}" title={exportMsg.text}>{exportMsg.text}</span>
   {/if}
   <!-- A MongoDB result has no INSERT statements; the document formats come from the export dialog. -->
-  {#if !mongo && canExportSql}
-    <button class="btn btn-ghost ml-auto h-7 px-2 text-[12px]" title="Export as SQL INSERT statements" onclick={onexportsql}><FileCode size={13} /><span class="hidden @[36rem]:inline">Export SQL</span></button>
+  {#if onreview}
+    <button class="btn btn-ghost ml-auto h-7 px-2 text-[12px] text-accent" title="Send this plan to the assistant for a performance review" onclick={onreview}><Sparkles size={13} /><span class="hidden @[36rem]:inline">Review with AI</span></button>
   {/if}
-  <button class="btn btn-ghost h-7 px-2 text-[12px] {mongo ? 'ml-auto' : ''}" title={fileExport ? 'Export the documents as CSV, JSON or NDJSON' : 'Export CSV'} onclick={onexport}><Download size={13} /><span class="hidden @[36rem]:inline">{fileExport ? 'Export...' : 'Export CSV'}</span></button>
+  {#if !mongo && canExportSql}
+    <button class="btn btn-ghost h-7 px-2 text-[12px] {onreview ? '' : 'ml-auto'}" title="Export as SQL INSERT statements" onclick={onexportsql}><FileCode size={13} /><span class="hidden @[36rem]:inline">Export SQL</span></button>
+  {/if}
+  <button class="btn btn-ghost h-7 px-2 text-[12px] {mongo && !onreview ? 'ml-auto' : ''}" title={fileExport ? 'Export the documents as CSV, JSON or NDJSON' : 'Export CSV'} onclick={onexport}><Download size={13} /><span class="hidden @[36rem]:inline">{fileExport ? 'Export...' : 'Export CSV'}</span></button>
 </footer>
