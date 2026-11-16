@@ -4,6 +4,8 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-16
+
 - New: skills for the AI assistant. A skill gives the assistant instructions for one database or one task. sandb has 12 built-in skills:
   - Syntax: PostgreSQL, MySQL and MariaDB, SQLite, MongoDB aggregation.
   - Performance tuning: PostgreSQL, MySQL, SQLite, MongoDB. Each one reads the query plan of its database and checks its indexes and statistics.
