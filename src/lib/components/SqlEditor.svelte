@@ -1,15 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
+  import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, tooltips } from '@codemirror/view';
   import { EditorState, Compartment, type Text } from '@codemirror/state';
   import { defaultKeymap, history, historyKeymap, indentMore, indentLess, selectAll as selectAllCmd } from '@codemirror/commands';
-  import { sql, PostgreSQL, MySQL, SQLite } from '@codemirror/lang-sql';
   import { javascript } from '@codemirror/lang-javascript';
-  import { syntaxHighlighting, HighlightStyle, syntaxTree, foldService, foldGutter, foldedRanges, foldEffect, unfoldEffect, foldAll, unfoldAll, codeFolding, indentUnit } from '@codemirror/language';
-  import { autocompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
+  import { syntaxHighlighting, HighlightStyle, foldService, foldGutter, foldedRanges, foldEffect, unfoldEffect, foldAll, unfoldAll, codeFolding, indentUnit } from '@codemirror/language';
+  import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
   import { tags as t } from '@lezer/highlight';
-  import { columnCompletion } from '../sql/columns';
-  import type { Engine } from '../api';
+  import { sqlCompletion, SQL_DIALECTS, type Column, type Links, type SqlCompletion } from '../sql/complete';
+  import type { Engine, SchemaSnapshot } from '../api';
+  import { snapshotSchema } from '../results';
+  import { tableLabel } from '../tableId';
   import { statementRanges, maskLiterals } from '../sql/text';
   import { mongoStatementRanges } from '../mongo/text';
   import { MONGOSH_COLLECTION_METHODS, MONGOSH_CURSOR_METHODS, MONGOSH_DB_METHODS } from '../api/generated/constants';
@@ -24,9 +25,10 @@
     onrunnew,
     onrunall,
     onformat,
-    schema = {},
+    snapshot = null,
     dialect = 'pg',
     columnsOf,
+    linksOf,
   }: {
     value?: string;
     /** Runs the selection, or the statement at the cursor. */
@@ -37,70 +39,51 @@
     onrunall?: () => void;
     /** Formats the selection, or all the text (⇧⌘F). */
     onformat?: () => void;
-    schema?: Record<string, string[]>;
+    /** The schema snapshot of the tab's database: tables, kinds and typed columns for autocomplete. */
+    snapshot?: SchemaSnapshot | null;
     dialect?: Engine;
-    /** Columns of a table that `schema` holds without columns (or not under this name); [] when unknown. */
-    columnsOf?: (path: string[]) => Promise<string[]>;
+    /** Columns of a table that the snapshot holds without columns (or not under this name); [] when unknown. */
+    columnsOf?: (path: string[]) => Promise<Column[]>;
+    /** Foreign keys of a table, for `JOIN` and `ON` completion; null when unknown. */
+    linksOf?: (path: string[]) => Promise<Links | null>;
   } = $props();
 
   /** The SQL dialect of the text; a mongosh tab gets JavaScript and the mongosh helpers instead. */
   const sqlDialect = $derived(dialect === 'mongo' ? null : dialect);
+  /** Table key → column names; the mongosh completions read collections and fields from it. */
+  const schema = $derived(snapshotSchema(snapshot));
+  /** Table key → snapshot table, for the typed columns of a table written in the editor. */
+  const byKey = $derived(new Map((snapshot?.tables ?? []).map((t) => [tableLabel(t), t])));
 
   const lang = new Compartment();
-  // A mongo tab speaks mongosh (JavaScript with `db.` calls), not SQL.
-  const langExt = () =>
-    sqlDialect ? sql({ dialect: { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite }[sqlDialect], schema, upperCaseKeywords: true }) : javascript();
+  // A mongo tab speaks mongosh (JavaScript with `db.` calls), not SQL. The SQL language comes without
+  // lang-sql's own completion sources: `sqlCompletion` replaces them.
+  const langExt = () => (sqlDialect ? SQL_DIALECTS[sqlDialect].extension : javascript());
 
-  // Fetched columns per `schema` object; a new snapshot clears them.
-  let fetched = new Map<string, Promise<string[]>>();
-  let fetchedFor: Record<string, string[]> | undefined;
+  // Fetched columns per snapshot; a new snapshot clears them.
+  let fetched = new Map<string, Promise<Column[]>>();
+  let fetchedFor: SchemaSnapshot | null | undefined;
   /** The last completion failure that was shown, so a repeated one does not stack notices. */
   let reported = '';
 
   /** Query, update and aggregation operators. */
   const mongoOps = ['$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin', '$and', '$or', '$nor', '$not', '$exists', '$type', '$regex', '$elemMatch', '$size', '$all', '$set', '$unset', '$inc', '$push', '$pull', '$addToSet', '$match', '$group', '$project', '$sort', '$limit', '$skip', '$lookup', '$unwind', '$addFields', '$count', '$facet', '$sum', '$avg', '$min', '$max', '$first', '$last'];
 
-  /** `FROM t a` / `FROM t AS a` aliases of the statement at `pos` → table path. Same scan as lang-sql. */
-  function aliasesAt(state: EditorState, pos: number): Record<string, string[]> {
-    const out: Record<string, string[]> = {};
-    let stmt = syntaxTree(state).resolveInner(pos, -1);
-    while (stmt.name !== 'Statement') {
-      if (!stmt.parent) return out;
-      stmt = stmt.parent;
-    }
-    const isId = (n: typeof stmt | null) => n?.name === 'Identifier' || n?.name === 'QuotedIdentifier';
-    const text = (n: typeof stmt) => state.sliceDoc(n.from, n.to).replace(/^(["`])(.*)\1$/, '$2');
-    const pathOf = (n: typeof stmt) => (n.name === 'CompositeIdentifier' ? n.getChildren('Identifier').concat(n.getChildren('QuotedIdentifier')).sort((a, b) => a.from - b.from).map(text) : [text(n)]);
-    let sawFrom = false;
-    let prev: typeof stmt | null = null;
-    for (let n = stmt.firstChild; n; n = n.nextSibling) {
-      const kw = n.name === 'Keyword' ? state.sliceDoc(n.from, n.to).toLowerCase() : null;
-      let alias: string | null = null;
-      if (!sawFrom) sawFrom = kw === 'from';
-      else if (kw === 'as' && prev && isId(n.nextSibling)) alias = text(n.nextSibling!);
-      else if (kw && /^(where|group|having|order|union|intersect|except|all|distinct|limit|offset|fetch|for)$/.test(kw)) break;
-      else if (prev && isId(n)) alias = text(n);
-      if (alias && prev) out[alias] = pathOf(prev);
-      prev = /Identifier$/.test(n.name) ? n : null;
-    }
-    return out;
-  }
-
   /**
-   * Columns of one table: from the snapshot when it has them, else from the database (the snapshot's
-   * column cap cut them, or a PG table outside `public` is written without its schema). Cached per
-   * snapshot, so typing does not ask again.
+   * Typed columns of one table: from the snapshot when it has them, else from the database (the
+   * snapshot's column cap cut them, or a PG table outside `public` is written without its schema).
+   * Cached per snapshot, so typing does not ask again.
    */
-  async function loadColumns(path: string[]): Promise<string[]> {
+  async function loadColumns(path: string[]): Promise<Column[]> {
     const key = path.join('.');
-    if (schema[key]?.length) return schema[key];
     // The snapshot names a `public` PG table (and a `main` SQLite table) without its schema.
-    const known = sqlDialect === 'pg' && path.length === 2 && path[0] === 'public' ? schema[path[1]] : sqlDialect === 'sqlite' && path.length === 2 && path[0] === 'main' ? schema[path[1]] : undefined;
-    if (known?.length) return known;
+    const bare = path.length === 2 && ((sqlDialect === 'pg' && path[0] === 'public') || (sqlDialect === 'sqlite' && path[0] === 'main'));
+    const known = byKey.get(key) ?? (bare ? byKey.get(path[1]) : undefined);
+    if (known?.columns.length) return known.columns.map((c) => ({ name: c.name, type: c.dataType }));
     if (!columnsOf) return [];
-    if (fetchedFor !== schema) {
+    if (fetchedFor !== snapshot) {
       fetched = new Map();
-      fetchedFor = schema;
+      fetchedFor = snapshot;
     }
     let p = fetched.get(key);
     if (!p) {
@@ -118,23 +101,18 @@
     return p;
   }
 
-  /**
-   * Columns after `table.` or `alias.` when the snapshot has none for that table: it cut them (column
-   * cap) or names the table differently (a PG table outside `public`, written without its schema).
-   */
-  async function lazyColumns(ctx: CompletionContext): Promise<CompletionResult | null> {
-    const m = /((?:(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`)\.)+)([\w$]*)$/.exec(ctx.state.sliceDoc(ctx.state.doc.lineAt(ctx.pos).from, ctx.pos));
-    if (!m || !columnsOf) return null;
-    let path = m[1].slice(0, -1).match(/"[^"]+"|`[^`]+`|[^.]+/g)!.map((p) => p.replace(/^(["`])(.*)\1$/, '$2'));
-    if (path.length === 1) path = aliasesAt(ctx.state, ctx.pos)[path[0]] ?? path;
-    if (schema[path.join('.')]?.length) return null; // lang-sql completes it
-    const cols = await loadColumns(path);
-    if (!cols.length || ctx.aborted) return null;
-    return { from: ctx.pos - m[2].length, options: cols.map((label) => ({ label, type: 'property' })), validFor: /^[\w$]*$/ };
-  }
+  /** DataGrip-style SQL completion: the clause at the cursor decides what the list offers. */
+  const sqlSource = (ctx: CompletionContext) =>
+    sqlDialect ? sqlCompletion(ctx, { dialect: sqlDialect, tables: snapshot?.tables ?? [], columns: loadColumns, links: linksOf }) : null;
 
-  /** Columns of the tables in the statement at the cursor, so a plain `SELECT col…` lists them. */
-  const columnsInScope = (ctx: CompletionContext) => (sqlDialect ? columnCompletion(ctx, { dialect: sqlDialect, schema, load: loadColumns }) : null);
+  /** The table (or alias and table) a completion comes from, right-aligned in its row. */
+  function originDom(c: SqlCompletion) {
+    if (!c.origin) return null;
+    const s = document.createElement('span');
+    s.className = 'cm-completionOrigin';
+    s.textContent = c.origin;
+    return s;
+  }
 
   /** Statement ranges of the editor text: mongosh splitting for mongo, SQL splitting otherwise. */
   const rangesOf = (doc: string, blankLines = false): { from: number; to: number }[] =>
@@ -327,8 +305,30 @@
     '.cm-cursor': { borderLeftColor: 'var(--c-accent)', borderLeftWidth: '2px' },
     '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: 'color-mix(in srgb, var(--c-accent) 24%, transparent) !important' },
     '.cm-tooltip': { backgroundColor: 'var(--c-surface)', border: '1px solid var(--c-line)', borderRadius: '8px', overflow: 'hidden', boxShadow: '0 12px 32px -8px rgba(0,0,0,.3)', fontFamily: "'JetBrains Mono Variable', ui-monospace, monospace", fontSize: '12px', padding: '4px' },
-    '.cm-tooltip-autocomplete ul li': { padding: '3px 8px !important', borderRadius: '5px' },
     '.cm-tooltip-autocomplete ul li[aria-selected]': { backgroundColor: 'var(--c-active)', color: 'var(--c-ink)' },
+    '.cm-tooltip.cm-tooltip-autocomplete > ul': { minWidth: '320px', maxWidth: '640px' },
+    '.cm-tooltip-autocomplete ul li': { display: 'flex', alignItems: 'center', padding: '3px 8px !important', borderRadius: '5px' },
+    '.cm-completionLabel': { whiteSpace: 'pre' },
+    '.cm-completionDetail': { marginLeft: '10px', color: 'var(--c-syn-type)', fontStyle: 'normal' },
+    '.cm-completionOrigin': { marginLeft: 'auto', paddingLeft: '16px', color: 'var(--c-faint)', whiteSpace: 'nowrap' },
+    // Letter badges per kind, as DataGrip marks tables, columns, keywords and functions.
+    '.cm-completionIcon': { width: '16px', height: '16px', padding: '0', marginRight: '8px', opacity: '1', display: 'inline-grid', placeItems: 'center', borderRadius: '4px', fontSize: '10px', fontWeight: '600', lineHeight: '1', flexShrink: '0' },
+    '.cm-completionIcon-table, .cm-completionIcon-view': { color: 'var(--c-accent)', backgroundColor: 'color-mix(in srgb, var(--c-accent) 16%, transparent)' },
+    '.cm-completionIcon-table:after': { content: "'T'" },
+    '.cm-completionIcon-view:after': { content: "'V'" },
+    '.cm-completionIcon-column': { color: 'var(--c-syn-type)', backgroundColor: 'color-mix(in srgb, var(--c-syn-type) 16%, transparent)' },
+    '.cm-completionIcon-column:after': { content: "'c'" },
+    '.cm-completionIcon-join': { color: 'var(--c-syn-string)', backgroundColor: 'color-mix(in srgb, var(--c-syn-string) 16%, transparent)' },
+    '.cm-completionIcon-join:after': { content: "'⋈'" },
+    '.cm-completionIcon-function': { color: 'var(--c-syn-number)', backgroundColor: 'color-mix(in srgb, var(--c-syn-number) 16%, transparent)' },
+    '.cm-completionIcon-function:after': { content: "'f'" },
+    '.cm-completionIcon-keyword, .cm-completionIcon-type, .cm-completionIcon-variable': { color: 'var(--c-muted)', backgroundColor: 'var(--c-hover)' },
+    '.cm-completionIcon-keyword:after': { content: "'k'" },
+    '.cm-completionIcon-type:after': { content: "'t'" },
+    '.cm-completionIcon-variable:after': { content: "'b'" },
+    '.cm-completionIcon-alias, .cm-completionIcon-schema': { color: 'var(--c-ink)', backgroundColor: 'var(--c-hover)' },
+    '.cm-completionIcon-alias:after': { content: "'a'" },
+    '.cm-completionIcon-schema:after': { content: "'S'" },
   });
 
   onMount(() => {
@@ -353,10 +353,14 @@
             { key: KEYS.foldStatement.combo, run: toggleStatementFold },
             { key: KEYS.foldAll.combo, run: foldAll },
             { key: KEYS.unfoldAll.combo, run: unfoldAll },
+            // Backspace between a pair that the editor closed deletes both.
+            ...closeBracketsKeymap,
             // Tab inserts spaces at the cursor (or indents selected lines) instead of moving focus.
             {
               key: 'Tab',
               run: (v) => {
+                // An open list takes Tab as DataGrip does: it inserts the selected item.
+                if (acceptCompletion(v)) return true;
                 if (v.state.selection.ranges.some((r) => !r.empty)) return indentMore(v);
                 v.dispatch(v.state.replaceSelection(v.state.facet(indentUnit)), { scrollIntoView: true, userEvent: 'input' });
                 return true;
@@ -367,10 +371,13 @@
             ...historyKeymap,
           ]),
           lang.of(langExt()),
-          autocompletion(),
-          EditorState.languageData.of(() =>
-            sqlDialect ? [{ autocomplete: columnsInScope }, { autocomplete: lazyColumns }] : [{ autocomplete: mongoCompletions }],
-          ),
+          autocompletion({ addToOptions: [{ render: (c) => originDom(c as SqlCompletion), position: 90 }] }),
+          // VS Code-style pairs: `'` gives `''` with the cursor between, and a closing bracket typed
+          // over the one the editor added moves the cursor past it.
+          closeBrackets(),
+          // The editor pane clips its content; tooltips live on <body> so the list can cover the results panel.
+          tooltips({ parent: document.body }),
+          EditorState.languageData.of(() => [{ autocomplete: sqlDialect ? sqlSource : mongoCompletions }]),
           syntaxHighlighting(hl),
           theme,
           EditorView.updateListener.of((u) => {

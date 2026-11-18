@@ -82,6 +82,10 @@
 }
 
 html, body, #app { height: 100%; }
+/* The app is a fixed-size window: the document itself never scrolls (wheel, rubber-band, or a focus/scrollIntoView
+   jump). Every pane scrolls inside its own `overflow-auto` box. `clip` on #app also blocks programmatic scrolling. */
+html, body { overflow: hidden; overscroll-behavior: none; }
+#app { overflow: clip; }
 body { @apply bg-canvas text-ink font-sans antialiased text-[13px]; font-feature-settings: 'cv11', 'ss01'; }
 
 /* Backdrop: the body goes clear and `.app-backdrop` shows the image (or the desktop) under a canvas-colored tint. */

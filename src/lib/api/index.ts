@@ -29,6 +29,7 @@ const desktop: Capabilities = {
   updates: true,
   secretStorage: 'encrypted',
   ai: true,
+  mcp: true,
 };
 
 const bridge: Capabilities = {
@@ -41,6 +42,7 @@ const bridge: Capabilities = {
   updates: false,
   secretStorage: 'memory',
   ai: true,
+  mcp: false,
 };
 
 const demo: Capabilities = {
@@ -53,6 +55,7 @@ const demo: Capabilities = {
   updates: false,
   secretStorage: 'none',
   ai: false,
+  mcp: false,
 };
 
 function pick(): Backend {

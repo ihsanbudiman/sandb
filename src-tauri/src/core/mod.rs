@@ -11,6 +11,7 @@ pub mod engine;
 pub mod error;
 pub mod export_file;
 pub mod guard;
+pub mod mcp;
 pub mod mongo;
 pub mod ops;
 pub mod query_registry;

@@ -3,6 +3,7 @@ import { db, dbOf, type Conn, type Source } from './connections.svelte';
 import { tableKey, type TableId } from './tableId';
 import type { TableRef } from './tableActions';
 import { classify, fromInfo, type Classification } from './writeCheck';
+import type { Column, Links } from './sql/complete';
 
 type Status = 'loading' | 'ok' | 'error';
 
@@ -156,20 +157,31 @@ export function hasCollection(c: Conn, database: string, collection: string): bo
   return loaded?.status === 'ok' && loaded.items.some((t) => t.name === collection);
 }
 
-/**
- * Autocomplete columns of a table the snapshot holds without columns (cut by the column cap), or of a
- * PG table outside `public` written without its schema (only when the name is unique).
- */
-export async function completionColumns(connId: string, database: string, path: string[]): Promise<string[]> {
-  if (path.length > 2) return [];
+/** The snapshot table a path written in the editor names: a `public` PG table, or a unique name in another schema. */
+async function completionTable(connId: string, database: string, path: string[]) {
+  if (path.length > 2) return undefined;
   const snap = await loadSnapshot(connId, database);
-  if (!snap) return [];
+  if (!snap) return undefined;
   const [ns, name] = path.length === 2 ? path : [undefined, path[0]];
   const hits = snap.tables.filter((t) => t.name === name && (ns === undefined || t.schema === ns));
-  const t = hits.find((x) => !x.schema || x.schema === 'public') ?? (hits.length === 1 ? hits[0] : undefined);
+  return hits.find((x) => !x.schema || x.schema === 'public') ?? (hits.length === 1 ? hits[0] : undefined);
+}
+
+/**
+ * Autocomplete columns (with types) of a table the snapshot holds without columns (cut by the column
+ * cap), or of a PG table outside `public` written without its schema (only when the name is unique).
+ */
+export async function completionColumns(connId: string, database: string, path: string[]): Promise<Column[]> {
+  const t = await completionTable(connId, database, path);
   if (!t) return [];
-  if (t.columns.length) return t.columns.map((x) => x.name);
-  return (await loadColumns(connId, database, t.schema ?? null, t.name)).map((x) => x.name);
+  const cols = t.columns.length ? t.columns : await loadColumns(connId, database, t.schema ?? null, t.name);
+  return cols.map((x) => ({ name: x.name, type: x.dataType }));
+}
+
+/** Foreign keys of a table for join completion; null when the table or its properties are unknown. */
+export async function completionLinks(connId: string, database: string, path: string[]): Promise<Links | null> {
+  const t = await completionTable(connId, database, path);
+  return t ? loadProperties(connId, database, t.schema ?? null, t.name) : null;
 }
 
 export function reloadLists(connId: string) {

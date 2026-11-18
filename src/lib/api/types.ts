@@ -36,6 +36,8 @@ import type {
   ListDatabasesArgs,
   ListSchemasArgs,
   ListTablesArgs,
+  McpSettings,
+  McpStatus,
   MongoUriParts,
   ParseMongoUriArgs,
   QueryProgress,
@@ -149,6 +151,8 @@ export interface Capabilities {
   secretStorage: 'encrypted' | 'memory' | 'none';
   /** An AI provider is reachable: test and model list. The chat works on every transport. */
   ai: boolean;
+  /** The desktop app runs the MCP server. */
+  mcp: boolean;
 }
 
 /** The commands every transport implements. The argument types are the Rust command arguments. */
@@ -202,4 +206,7 @@ export interface Backend {
   chatCancel(args: ChatCancelArgs): Promise<void>;
   approveWrite(args: ApproveWriteArgs): Promise<void>;
   denyWrite(args: DenyWriteArgs): Promise<void>;
+  getMcpStatus(): Promise<McpStatus>;
+  saveMcpSettings(settings: McpSettings): Promise<McpStatus>;
+  newMcpToken(): Promise<McpStatus>;
 }

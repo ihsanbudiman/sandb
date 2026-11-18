@@ -17,6 +17,7 @@ export const TIMEOUT_SEC_LIMIT = 300;
 export const CHART_TYPES = ["bar", "line", "area", "pie", "scatter"];
 export const DEFAULT_AI_BASE_URL = "http://localhost:11434/v1";
 export const DEFAULT_AI_MODEL = "llama3.1:8b";
+export const DEFAULT_MCP_PORT = 58124;
 export const MONGOSH_COLLECTION_METHODS = ["find", "findOne", "aggregate", "countDocuments", "estimatedDocumentCount", "distinct", "getIndexes", "stats", "insertOne", "insertMany", "updateOne", "updateMany", "replaceOne", "deleteOne", "deleteMany", "findOneAndUpdate", "findOneAndReplace", "findOneAndDelete", "bulkWrite", "createIndex", "createIndexes", "dropIndex", "dropIndexes", "drop", "renameCollection"];
 export const MONGOSH_CURSOR_METHODS = ["sort", "project", "collation", "limit", "skip", "hint", "maxTimeMS", "count", "toArray"];
 export const MONGOSH_DB_METHODS = ["getCollection", "runCommand", "adminCommand", "createCollection", "dropDatabase"];

@@ -10,6 +10,7 @@ use crate::core::connections::Connection;
 use crate::core::db::pool::PoolCache;
 use crate::core::db::session::SessionRegistry;
 use crate::core::error::AppError;
+use crate::core::mcp::server::McpServer;
 use crate::core::mongo::client::MongoClients;
 use crate::core::query_registry::QueryRegistry;
 use crate::core::secrets::SecretStore;
@@ -32,6 +33,8 @@ pub struct AppState {
     pub(in crate::core) approvals: Approvals,
     /// Unsaved grid edits, reported by the frontend: a window close asks before it drops them.
     pub(in crate::core) unsaved_edits: AtomicBool,
+    /// The MCP server task and its last start failure.
+    pub(in crate::core) mcp: McpServer,
 }
 
 impl AppState {
@@ -52,6 +55,7 @@ impl AppState {
             chats: ChatRegistry::default(),
             approvals: Approvals::default(),
             unsaved_edits: AtomicBool::new(false),
+            mcp: McpServer::default(),
         })
     }
 

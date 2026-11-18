@@ -61,5 +61,8 @@ export function makeBackend(transport: Transport, capabilities: Capabilities): B
     chatCancel: (args) => call('chat_cancel', args),
     approveWrite: (args) => call('approve_write', args),
     denyWrite: (args) => call('deny_write', args),
+    getMcpStatus: () => call('get_mcp_status'),
+    saveMcpSettings: (settings) => call('save_mcp_settings', { settings }),
+    newMcpToken: () => call('new_mcp_token'),
   };
 }

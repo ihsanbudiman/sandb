@@ -1,6 +1,4 @@
-import type { Completion, CompletionContext, CompletionResult } from '@codemirror/autocomplete';
-import { syntaxTree } from '@codemirror/language';
-import { maskLiterals, statementRangeAt, type Dialect } from './text';
+import { maskLiterals, type Dialect } from './text';
 
 /** A table that the statement at the cursor reads or writes, with its alias when it has one. */
 export interface Relation {
@@ -9,12 +7,13 @@ export interface Relation {
   alias: string | null;
 }
 
-const JOIN_MODS = new Set(['inner', 'left', 'right', 'full', 'cross', 'natural', 'outer', 'straight_join', 'lateral']);
+export const JOIN_MODS = new Set(['inner', 'left', 'right', 'full', 'cross', 'natural', 'outer', 'straight_join', 'lateral']);
 const CLAUSE = new Set([
   'where', 'group', 'order', 'having', 'limit', 'offset', 'fetch', 'for', 'returning', 'window', 'qualify',
   'union', 'intersect', 'except', 'set', 'values', 'on', 'using', 'asc', 'desc', 'nulls', 'collate',
 ]);
-const NOT_ALIAS = new Set([
+/** Words that end a table reference instead of naming its alias; completion also quotes them as names. */
+export const NOT_ALIAS = new Set([
   ...JOIN_MODS,
   ...CLAUSE,
   'select', 'from', 'join', 'update', 'into', 'as', 'and', 'or', 'not', 'in', 'is', 'like', 'ilike',
@@ -22,12 +21,12 @@ const NOT_ALIAS = new Set([
   'some', 'exists', 'over', 'partition', 'by', 'with', 'recursive', 'interval', 'cast', 'only',
 ]);
 
-interface Token {
+export interface Token {
   value: string;
   kind: 'id' | 'punct';
 }
 
-function tokenize(text: string): Token[] {
+export function tokenize(text: string): Token[] {
   const re = /"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[A-Za-z_][\w$]*|\d+(?:\.\d+)?|\.|\(|\)|,|;|[^\s]/g;
   const out: Token[] = [];
   for (const m of text.matchAll(re)) {
@@ -120,78 +119,4 @@ export function relationsIn(sql: string, dialect: Dialect): Relation[] {
     if (inFrom && CLAUSE.has(word)) inFrom = false;
   }
   return out;
-}
-
-export interface ColumnCompletionOptions {
-  dialect: Dialect;
-  /** Table key → columns, as `snapshotSchema` builds it (`public` stays implicit). */
-  schema: Record<string, string[]>;
-  /** Columns of a table that the snapshot has no columns for; [] when unknown. */
-  load: (path: string[]) => Promise<string[]>;
-}
-
-/**
- * Completes the columns of every table in the statement at the cursor. `lang-sql` already does this
- * after `table.` or `alias.`; this source covers the plain `SELECT col…`, `WHERE col…`, `ORDER BY
- * col…` positions. With no table in the statement, Ctrl+Space lists the columns of the database.
- */
-export async function columnCompletion(ctx: CompletionContext, opts: ColumnCompletionOptions): Promise<CompletionResult | null> {
-  const { state, pos } = ctx;
-  const node = syntaxTree(state).resolveInner(pos, -1);
-  if (node.name === 'String' || node.name === 'LineComment' || node.name === 'BlockComment' || node.name === 'QuotedIdentifier') return null;
-  // After `table.` or `alias.` lang-sql supplies the columns of that one relation.
-  if (state.sliceDoc(Math.max(0, pos - 1), pos) === '.') return null;
-  const word = ctx.matchBefore(/[\w$]+/);
-  if (!word && !ctx.explicit) return null;
-  const doc = state.doc.toString();
-  const range = statementRangeAt(doc, pos, opts.dialect);
-  if (!range) return null;
-  // The word right after FROM, JOIN, UPDATE or INTO is a table name; lang-sql completes those.
-  if (/\b(?:from|join|update|into)\s+[\w$"`]*$/i.test(doc.slice(range[0], pos))) return null;
-  const sql = doc.slice(range[0], range[1]);
-  if (!sql) return null;
-
-  let relations = relationsIn(sql, opts.dialect);
-  const explicitFallback = !relations.length && ctx.explicit;
-  if (!relations.length) {
-    if (!explicitFallback) return null;
-    // No table yet: the columns of the whole database, as DBeaver does on an explicit request.
-    relations = Object.keys(opts.schema)
-      .filter((key) => opts.schema[key]?.length)
-      .map((key) => ({ path: key.split('.'), alias: null }));
-    if (!relations.length) return null;
-  }
-
-  const groups = await Promise.all(
-    relations.slice(0, 500).map(async (rel) => ({ rel, columns: explicitFallback ? (opts.schema[rel.path.join('.')] ?? []) : await opts.load(rel.path) })),
-  );
-  if (ctx.aborted) return null;
-
-  const flat: { label: string; qualifier: string; table: string }[] = [];
-  for (const { rel, columns } of groups) {
-    const table = rel.path.join('.');
-    const qualifier = rel.alias ?? rel.path[rel.path.length - 1];
-    for (const label of columns) flat.push({ label, qualifier, table });
-  }
-  if (!flat.length) return null;
-
-  const count = new Map<string, number>();
-  for (const c of flat) count.set(c.label, (count.get(c.label) ?? 0) + 1);
-  const options: Completion[] = [];
-  const seen = new Set<string>();
-  for (const c of flat) {
-    const key = `${c.qualifier}\0${c.label}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    options.push({
-      label: c.label,
-      type: 'property',
-      detail: c.table,
-      boost: 1,
-      // A name that two tables share must be qualified, or the database refuses the query.
-      ...(count.get(c.label)! > 1 ? { apply: `${c.qualifier}.${c.label}` } : {}),
-    });
-    if (options.length >= 2000) break;
-  }
-  return { from: word?.from ?? pos, options, validFor: /^[\w$]*$/ };
 }

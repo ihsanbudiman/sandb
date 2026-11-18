@@ -6,7 +6,7 @@ export const ui = $state({
   chatOpen: true,
   chatWidth: 340,
   page: 'query' as 'query' | 'settings' | 'audit',
-  settingsSection: 'ai' as 'ai' | 'safeguards' | 'appearance' | 'updates',
+  settingsSection: 'ai' as 'ai' | 'safeguards' | 'mcp' | 'appearance' | 'updates',
   theme: 'light' as 'light' | 'dark' | 'system',
   /** Sidebar width in px; the title bar uses it too, so the tabs stay in line with the main card. */
   sidebarWidth: 224,

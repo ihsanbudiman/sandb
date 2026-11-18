@@ -33,6 +33,13 @@ pub const VAULT_FILE: &str = "secrets.enc";
 pub const VAULT_KEY_ACCOUNT: &str = "vault:key";
 /// Secret store account of the AI API key.
 pub const AI_KEY_ACCOUNT: &str = "ai:api_key";
+/// Secret store account of the bearer token of the MCP server.
+pub const MCP_TOKEN_ACCOUNT: &str = "mcp:token";
+
+/// Compares two secrets in time that does not depend on where they differ.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 
 /// The key of `credentials.enc`. Kept only to read old files during migration.
 const KEY: [u8; 32] = [

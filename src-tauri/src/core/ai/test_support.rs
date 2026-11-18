@@ -6,6 +6,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::core::connections::{ConnectionInput, Env, SslMode};
+use crate::core::engine::Engine;
+use crate::core::state::AppState;
+
 /// One part of a scripted response: wait `ms`, then write `bytes`.
 pub(crate) type Part = (u64, String);
 
@@ -122,4 +126,54 @@ pub(crate) fn finish_chunk(reason: &str) -> Part {
 
 pub(crate) fn done() -> Part {
     (0, "data: [DONE]\n\n".into())
+}
+
+/// A SQLite connection whose table `t` has `rows` rows.
+pub(crate) async fn sqlite_conn(
+    st: &AppState,
+    dir: &std::path::Path,
+    name: &str,
+    rows: u32,
+) -> String {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+    use sqlx::{Connection as _, Executor as _};
+    let file = dir.join(format!("{name}.db"));
+    let mut c = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(&file)
+            .create_if_missing(true),
+    )
+    .await
+    .unwrap();
+    (&mut c)
+        .execute(sqlx::raw_sql(&format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY); \
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {rows}) \
+             INSERT INTO t SELECT i FROM n"
+        )))
+        .await
+        .unwrap();
+    c.close().await.unwrap();
+    st.create_connection(
+        ConnectionInput {
+            name: name.into(),
+            engine: Engine::Sqlite,
+            env: Env::Local,
+            host: String::new(),
+            port: 0,
+            database: "main".into(),
+            user: String::new(),
+            ssl: SslMode::Disable,
+            file: file.to_string_lossy().into_owned(),
+            ai_write: true,
+            read_only: false,
+            version: None,
+            uri: String::new(),
+            auth_source: String::new(),
+            topology: None,
+        },
+        None,
+    )
+    .unwrap()
+    .id
 }

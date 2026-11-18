@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { ArrowLeft, Bot, KeyRound, Eye, EyeOff, Lock, Gauge, ShieldCheck, Palette, Sun, Moon, Monitor, Check, LoaderCircle, X, CircleArrowUp, Image, AppWindow, Square, SlidersHorizontal } from '@lucide/svelte';
+  import { ArrowLeft, Bot, KeyRound, Eye, EyeOff, Lock, Gauge, ShieldCheck, Plug, Copy, Terminal, Share2, Palette, Sun, Moon, Monitor, Check, LoaderCircle, X, CircleArrowUp, Image, AppWindow, Square, SlidersHorizontal } from '@lucide/svelte';
   import { db, engines, envTag, canWrite, setAiWrite, type Conn } from '../connections.svelte';
   import { ui, ai, providers, aiSettings, saveAiSoon, saveAiKeySoon, flushAi, removeAiKey } from '../state.svelte';
-  import type { Provider } from '../api';
+  import type { McpSettings, McpStatus, Provider } from '../api';
+  import { Flash } from '../flash.svelte';
   import { MAX_ROWS_LIMIT, TIMEOUT_SEC_LIMIT } from '../api/generated/constants';
   import { look, canSeeThrough, backdropOn, lookChanged, setTheme, setBackgroundImage, removeBackgroundImage, resetBackdrop, type Backdrop } from '../appearance.svelte';
   import { api, ApiError } from '../api';
@@ -73,9 +74,70 @@
     else if (canWrite(c)) onEnableWrites(c);
   }
 
+  // MCP: the server and its token come from the backend; the section loads them when it opens.
+  let mcp = $state<McpStatus | null>(null);
+  let mcpError = $state<ApiError | null>(null);
+  let showToken = $state(false);
+  const copied = new Flash<string>();
+
+  $effect(() => {
+    if (ui.settingsSection !== 'mcp' || mcp !== null) return;
+    void loadMcp();
+  });
+
+  async function loadMcp() {
+    try {
+      mcp = await api.getMcpStatus();
+      mcpError = null;
+    } catch (e) {
+      mcpError = ApiError.from(e);
+    }
+  }
+
+  async function saveMcp(patch: Partial<McpSettings>) {
+    if (!mcp) return;
+    try {
+      mcp = await api.saveMcpSettings({ enabled: mcp.enabled, port: mcp.port, connections: mcp.connections, ...patch });
+      mcpError = null;
+    } catch (e) {
+      mcpError = ApiError.from(e);
+    }
+  }
+
+  function share(id: string, on: boolean) {
+    const current = mcp;
+    if (!current) return;
+    // The saved order is the page order, so a client's `list_connections` matches what the user sees.
+    const connections = db.connections.map((c) => c.id).filter((cid) => (cid === id ? on : current.connections.includes(cid)));
+    void saveMcp({ connections });
+  }
+
+  async function newToken() {
+    try {
+      mcp = await api.newMcpToken();
+      mcpError = null;
+    } catch (e) {
+      mcpError = ApiError.from(e);
+    }
+  }
+
+  async function copyMcp(key: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied.show(key);
+    } catch (err) {
+      console.warn('Copy failed.', err);
+    }
+  }
+
+  const claudeCommand = $derived(mcp ? `claude mcp add --transport http sandb ${mcp.url} --header "Authorization: Bearer ${mcp.token}"` : '');
+  const clientJson = $derived(mcp ? JSON.stringify({ mcpServers: { sandb: { url: mcp.url, headers: { Authorization: `Bearer ${mcp.token}` } } } }, null, 2) : '');
+
   const sections = [
     { id: 'ai', l: 'AI', i: Bot },
     { id: 'safeguards', l: 'Safeguards', i: ShieldCheck },
+    // The server runs in the desktop app only.
+    ...(api.capabilities.mcp ? [{ id: 'mcp' as const, l: 'MCP', i: Plug }] : []),
     { id: 'appearance', l: 'Appearance', i: Palette },
     { id: 'updates', l: 'Updates', i: CircleArrowUp },
   ] as const;
@@ -126,7 +188,7 @@
   <header class="flex h-12 shrink-0 items-center gap-2.5 px-4">
     <button class="btn btn-ghost -ml-1.5 size-7 p-0" onclick={() => (ui.page = 'query')} aria-label="Back to query"><ArrowLeft size={15} /></button>
     <h1 class="text-[14px] font-semibold">Settings</h1>
-    <span class="truncate text-[12.5px] text-faint">AI provider, privacy, safeguards and appearance</span>
+    <span class="truncate text-[12.5px] text-faint">AI provider, privacy, safeguards, MCP and appearance</span>
   </header>
 
   <nav class="flex shrink-0 items-end gap-1 overflow-x-auto border-b border-line px-4" aria-label="Settings sections">
@@ -266,6 +328,114 @@
           {/each}
         </div>
       </section>
+
+      {:else if ui.settingsSection === 'mcp'}
+      {#if !mcp}
+        <p class="py-6 text-[12.5px] {mcpError ? 'text-red-700 dark:text-red-400' : 'text-muted'}">{mcpError?.message ?? 'Loading…'}</p>
+      {:else}
+      {@const status = mcp}
+      <!-- MCP server -->
+      <section class="grid gap-x-10 gap-y-3 py-6 sm:grid-cols-[180px_1fr]">
+        <div>
+          <h2 class="flex items-center gap-2 text-[13px] font-semibold"><Plug size={14} class="text-faint" /> MCP server</h2>
+          <p class="mt-1 text-[12.5px] leading-relaxed text-muted">Let AI tools such as Claude Code and Cursor read the connections that you choose. Writes are never allowed.</p>
+        </div>
+        <div class="min-w-0">
+          <div class="flex items-center gap-2.5">
+            <button
+              role="switch"
+              aria-checked={status.enabled}
+              aria-label="MCP server"
+              class="relative h-5 w-9 shrink-0 rounded-full transition {status.enabled ? 'bg-accent' : 'bg-stone-500'}"
+              onclick={() => saveMcp({ enabled: !status.enabled })}>
+              <span class="absolute top-0.5 size-4 rounded-full bg-white shadow transition-all {status.enabled ? 'left-[18px]' : 'left-0.5'}"></span>
+            </button>
+            <span class="text-[12.5px]">{status.enabled ? 'On' : 'Off'}</span>
+          </div>
+          <label class="mt-3 block max-w-[9rem]">
+            <span class="label mb-1.5 block">Port</span>
+            <input class="input font-mono tabular-nums" type="number" min="1024" max="65535" value={status.port} onchange={(e) => saveMcp({ port: Number(e.currentTarget.value) })} />
+          </label>
+          <div class="mt-3 text-[12.5px]">
+            {#if status.running}
+              <span class="flex items-center gap-1 font-medium text-emerald-700 dark:text-emerald-400"><Check size={13} /> Running at {status.url}</span>
+            {:else if status.error}
+              <span class="flex items-center gap-1 text-red-700 dark:text-red-400"><X size={13} /> {status.error}</span>
+            {:else}
+              <span class="text-muted">Off</span>
+            {/if}
+          </div>
+          {#if mcpError}
+            <p class="mt-1.5 text-[12px] break-words text-red-700 dark:text-red-400" role="alert">{mcpError.message}</p>
+          {/if}
+        </div>
+      </section>
+
+      <!-- Shared connections -->
+      <section class="grid gap-x-10 gap-y-3 py-6 sm:grid-cols-[180px_1fr]">
+        <div>
+          <h2 class="flex items-center gap-2 text-[13px] font-semibold"><Share2 size={14} class="text-faint" /> Shared connections</h2>
+          <p class="mt-1 text-[12.5px] leading-relaxed text-muted">Only the connections you tick are visible to MCP clients.</p>
+        </div>
+        <div class="min-w-0">
+          {#if db.connections.length === 0}
+            <p class="text-[12.5px] text-muted">Add a connection first.</p>
+          {:else}
+            <div class="divide-y divide-line rounded-lg border border-line">
+              {#each db.connections as c (c.id)}
+                <label class="flex items-center gap-2 px-3 py-2.5">
+                  <span class="w-5 shrink-0 font-mono text-[10.5px] font-semibold {engines[c.engine].badge}">{engines[c.engine].short}</span>
+                  <span class="truncate font-medium">{c.name}</span>
+                  <span class="tag {envTag[c.env]}">{c.env}</span>
+                  <div class="flex-1"></div>
+                  <input
+                    class="size-4 shrink-0 accent-accent"
+                    type="checkbox"
+                    checked={status.connections.includes(c.id)}
+                    aria-label="Share {c.name} with MCP clients"
+                    onchange={(e) => share(c.id, e.currentTarget.checked)} />
+                </label>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      </section>
+
+      <!-- Connect a client -->
+      <section class="grid gap-x-10 gap-y-3 py-6 sm:grid-cols-[180px_1fr]">
+        <div>
+          <h2 class="flex items-center gap-2 text-[13px] font-semibold"><Terminal size={14} class="text-faint" /> Connect a client</h2>
+          <p class="mt-1 text-[12.5px] leading-relaxed text-muted">The token is the only credential. Treat it like a password.</p>
+        </div>
+        <div class="min-w-0">
+          <div class="flex min-w-0 items-center gap-2">
+            <code class="min-w-0 flex-1 truncate rounded-md border border-line bg-surface px-2.5 py-1.5 font-mono text-[12px]">{showToken ? status.token : `••••${status.token.slice(-4)}`}</code>
+            <button class="btn btn-ghost size-7 shrink-0 p-0" onclick={() => (showToken = !showToken)} aria-label={showToken ? 'Hide token' : 'Show token'}>
+              {#if showToken}<EyeOff size={14} />{:else}<Eye size={14} />{/if}
+            </button>
+            <button class="btn btn-ghost size-7 shrink-0 p-0" onclick={() => copyMcp('token', status.token)} aria-label="Copy token">
+              {#if copied.current === 'token'}<Check size={14} class="text-emerald-600 dark:text-emerald-400" />{:else}<Copy size={14} />{/if}
+            </button>
+            <button class="btn btn-secondary shrink-0" onclick={newToken} title="Clients that use the old token stop working">New token</button>
+          </div>
+          <div class="mt-4 space-y-2">
+            <div class="relative rounded-lg border border-line bg-surface">
+              <pre class="overflow-auto px-3 py-2.5 pr-20 font-mono text-[12px] leading-[1.6] whitespace-pre-wrap">{claudeCommand}</pre>
+              <button class="btn btn-ghost absolute top-1.5 right-1.5 h-6 px-2 text-[12px]" onclick={() => copyMcp('claude', claudeCommand)}>
+                {#if copied.current === 'claude'}<Check size={12} class="text-emerald-600 dark:text-emerald-400" /> Copied{:else}<Copy size={12} /> Copy{/if}
+              </button>
+            </div>
+            <div class="relative rounded-lg border border-line bg-surface">
+              <pre class="overflow-auto px-3 py-2.5 pr-20 font-mono text-[12px] leading-[1.6] whitespace-pre-wrap">{clientJson}</pre>
+              <button class="btn btn-ghost absolute top-1.5 right-1.5 h-6 px-2 text-[12px]" onclick={() => copyMcp('json', clientJson)}>
+                {#if copied.current === 'json'}<Check size={12} class="text-emerald-600 dark:text-emerald-400" /> Copied{:else}<Copy size={12} /> Copy{/if}
+              </button>
+            </div>
+          </div>
+          <p class="mt-2 text-[12px] text-faint">Claude Desktop: use <span class="font-mono">npx mcp-remote {status.url} --header "Authorization: Bearer …"</span></p>
+        </div>
+      </section>
+      {/if}
 
       {:else if ui.settingsSection === 'appearance'}
       <!-- Theme -->

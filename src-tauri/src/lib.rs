@@ -27,6 +27,13 @@ fn has_pending<R: Runtime, M: Manager<R>>(m: &M) -> bool {
         .is_some_and(|s| s.has_pending_work())
 }
 
+/// The MCP server task outlives every command, so it reads the managed state through the handle.
+impl core::mcp::StateHandle for AppHandle {
+    fn state(&self) -> &AppState {
+        Manager::state::<AppState>(self).inner()
+    }
+}
+
 /// The default menu's Quit is the native `terminate:` action, which exits without a close request
 /// (tao has no `applicationShouldTerminate:` hook), so it would skip the pending-transaction prompt.
 /// Swap it for our own item with the same shortcut. Dock Quit still calls `terminate:` directly.
@@ -117,6 +124,23 @@ pub fn run() {
                 );
             }
             app.manage(state);
+            // The setup closure has no Tokio context, so the spawn goes through Tauri's runtime.
+            // Off (the default) does nothing: no token read, so no credential store prompt.
+            let handle = app.handle().clone();
+            let enabled = core::mcp::settings::load(core::mcp::StateHandle::state(&handle))
+                .is_ok_and(|s| s.enabled);
+            if enabled {
+                tauri::async_runtime::spawn(async move {
+                    match core::mcp::apply(&handle).await {
+                        Ok(s) => {
+                            if let Some(e) = s.error {
+                                eprintln!("sandb: MCP server: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("sandb: MCP server: {e}"),
+                    }
+                });
+            }
             app.set_menu(app_menu(app.handle())?)?;
             Ok(())
         })

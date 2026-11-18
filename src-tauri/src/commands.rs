@@ -23,6 +23,7 @@ use crate::core::db::session::{self, TabStatus};
 use crate::core::engine::Engine;
 use crate::core::error::{AppError, ErrorCode};
 use crate::core::export_file::ExportFile;
+use crate::core::mcp::{self, McpSettings, McpStatus};
 use crate::core::mongo::conn::parse_uri;
 use crate::core::ops;
 use crate::core::result::{
@@ -300,6 +301,10 @@ command_table! {
         /// Model ids of the given (maybe unsaved) settings. `key` as in `test_ai`.
         list_ai_models ListAiModelsArgs { settings: AiSettings, key: Option<String> } -> Vec<String>
             => async |st: &AppState, a: ListAiModelsArgs| { ai_settings::models(st, a.settings, a.key).await };
+
+        /// The MCP settings, the token and whether the server runs.
+        get_mcp_status GetMcpStatusArgs {} -> McpStatus
+            => async |st: &AppState, _| { mcp::status(st).await };
     }
 
     native {
@@ -332,6 +337,12 @@ command_table! {
         /// the `x-file-name` header is the suggested name. Returns the path, or `None` when the user
         /// closed the dialog.
         save_pdf,
+
+        /// Restarts the MCP server, which only the desktop app runs.
+        save_mcp_settings,
+
+        /// Restarts the MCP server, which only the desktop app runs.
+        new_mcp_token,
     }
 }
 
@@ -428,6 +439,16 @@ pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Res<()> {
     session::close_all(&state).await;
     app.exit(0);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn save_mcp_settings(app: AppHandle, settings: McpSettings) -> Res<McpStatus> {
+    mcp::save(&app, settings).await
+}
+
+#[tauri::command]
+pub async fn new_mcp_token(app: AppHandle) -> Res<McpStatus> {
+    mcp::new_token(&app).await
 }
 
 #[tauri::command]

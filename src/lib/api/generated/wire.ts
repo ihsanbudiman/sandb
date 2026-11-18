@@ -39,6 +39,7 @@ export type CommandName =
   | "set_ai_key"
   | "test_ai"
   | "list_ai_models"
+  | "get_mcp_status"
   | "quit_app"
   | "set_unsaved_edits"
   | "chat_send"
@@ -46,7 +47,9 @@ export type CommandName =
   | "export_result_sql"
   | "export_documents"
   | "export_table_sql"
-  | "save_pdf";
+  | "save_pdf"
+  | "save_mcp_settings"
+  | "new_mcp_token";
 
 export type AiReadResult = { columns: Array<ColumnMeta>, rows: Array<Array<JsonValue>>, 
 /**
@@ -337,6 +340,8 @@ onUpdate: string, onDelete: string, };
 
 export type GetAiSettingsArgs = Record<symbol, never>;
 
+export type GetMcpStatusArgs = Record<symbol, never>;
+
 export type GuardCheck = { allowed: boolean, reason?: string, kind?: string, };
 
 export type GuardCheckArgs = { engine: Engine, sql: string, };
@@ -378,6 +383,34 @@ export type ListDatabasesArgs = { connId: string, };
 export type ListSchemasArgs = { connId: string, database: string, };
 
 export type ListTablesArgs = { connId: string, database: string, schema: string | null, };
+
+export type McpSettings = { enabled: boolean, 
+/**
+ * The port on `127.0.0.1`.
+ */
+port: number, 
+/**
+ * Ids of the saved connections that MCP clients can use, in the order of the settings page.
+ */
+connections: Array<string>, };
+
+export type McpStatus = { token: string, 
+/**
+ * `http://127.0.0.1:{port}/mcp`, also when stopped, for the config snippets.
+ */
+url: string, running: boolean, 
+/**
+ * The last start failure (for example, a port in use); `None` while running or off.
+ */
+error: string | null, enabled: boolean, 
+/**
+ * The port on `127.0.0.1`.
+ */
+port: number, 
+/**
+ * Ids of the saved connections that MCP clients can use, in the order of the settings page.
+ */
+connections: Array<string>, };
 
 export type MongoCollectionInfo = { kind: MongoCollectionKind, 
 /**

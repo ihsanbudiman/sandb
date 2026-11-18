@@ -234,17 +234,8 @@ pub fn definitions(sources: &[Source], engines: Engines) -> Value {
         if ids.is_empty() {
             continue;
         }
-        let (description, mut params) = (t.build)(t, engines.mongo);
-        // A mixed SQL + MongoDB chat says which twin to use on the other engine.
-        let description = match t.serves {
-            Serves::Sql if engines.is_mixed() => {
-                format!("{description} SQL sources only: on MongoDB use {}.", t.other())
-            }
-            Serves::Mongo if engines.is_mixed() => {
-                format!("{description} MongoDB sources only: on SQL sources use {}.", t.other())
-            }
-            _ => description.to_string(),
-        };
+        let (base, mut params) = (t.build)(t, engines.mongo);
+        let description = description(t, base, engines);
         if t.serves == Serves::Chat {
             let names: Vec<&str> = skills::available(sources).iter().map(|k| k.name).collect();
             if names.is_empty() {
@@ -274,6 +265,36 @@ pub fn definitions(sources: &[Source], engines: Engines) -> Value {
         }));
     }
     Value::Array(defs)
+}
+
+/// The sentence the model reads for one tool: `base` from the tool's builder. A mixed SQL +
+/// MongoDB chat says which twin to use on the other engine.
+fn description(t: &Tool, base: &str, engines: Engines) -> String {
+    match t.serves {
+        Serves::Sql if engines.is_mixed() => {
+            format!("{base} SQL sources only: on MongoDB use {}.", t.other())
+        }
+        Serves::Mongo if engines.is_mixed() => {
+            format!(
+                "{base} MongoDB sources only: on SQL sources use {}.",
+                t.other()
+            )
+        }
+        _ => base.to_string(),
+    }
+}
+
+/// One tool's description and parameters for a client outside the chat (the MCP server):
+/// worded for SQL and MongoDB both, without `source`. `None` for a name not in the table.
+pub fn definition(name: &str) -> Option<(String, Value)> {
+    tool_named(name).map(|t| {
+        let (base, params) = (t.build)(t, true);
+        let both = Engines {
+            sql: true,
+            mongo: true,
+        };
+        (description(t, base, both), params)
+    })
 }
 
 fn build_list(_: &Tool, mongo: bool) -> (&'static str, Value) {

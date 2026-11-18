@@ -21,7 +21,7 @@ use sandb_lib::commands;
 use sandb_lib::core::ai::event::ChatEvent;
 use sandb_lib::core::ai::session as chat;
 use sandb_lib::core::error::{AppError, ErrorCode};
-use sandb_lib::core::secrets::MemoryStore;
+use sandb_lib::core::secrets::{MemoryStore, ct_eq};
 use sandb_lib::core::state::AppState;
 
 // Dev config, one place per side: the TS defaults live in `src/lib/api/devConfig.ts`.
@@ -100,10 +100,6 @@ fn env_port(name: &str, default: u16) -> u16 {
 fn dev_origin(dev_port: u16) -> HeaderValue {
     HeaderValue::from_str(&format!("http://localhost:{dev_port}"))
         .expect("the dev origin is a valid header value")
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn auth(State(token): State<Arc<str>>, req: Request, next: Next) -> Response {

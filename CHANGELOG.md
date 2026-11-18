@@ -4,6 +4,27 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+- Changed: SQL autocomplete now works more like DataGrip. The list shows the items that fit the clause at the cursor:
+  - At the start of a statement, it shows statements such as `SELECT`, `INSERT INTO` and `DELETE FROM`.
+  - After `FROM`, `JOIN`, `UPDATE` and `INSERT INTO`, it shows only tables, views and schemas. Each item shows its schema or kind on the right.
+  - After `JOIN`, the first items are full join clauses from the foreign keys, for example `orders o ON o.user_id = u.id`. After `ON`, the first items are the join conditions.
+  - After a table, it shows the next clauses: `WHERE`, `LEFT JOIN`, `GROUP BY`, `ORDER BY` and more. After an expression, it shows `AND`, `OR`, `IS NULL` and more.
+  - In `SELECT`, `WHERE` and other expressions, the columns of the tables in the statement come first. Each column shows its type and its table or alias.
+  - A function such as `count` goes in as `count()`, with the cursor between the brackets.
+  - When you pick `FROM`, `JOIN`, `WHERE` or a similar keyword, the editor adds a space and opens the list again.
+  - Tab inserts the selected item, as Enter does.
+  - A name that must have quotes, for example the column `user` on PostgreSQL, goes in with quotes.
+  - Icons show the kind of each item: table, view, column, join, function or keyword.
+- Fixed: the autocomplete list no longer gets cut off at the bottom of the editor. The list now shows on top of the results panel.
+- New: the SQL editor closes your brackets. When you type `'`, `"`, `(`, `[` or `{`, the editor adds the matching closing character and puts the cursor between the two. If you select text and type one of these characters, the pair goes around the text. When you type a closing character directly before the one that the editor added, the cursor moves past it. Backspace between a pair that is still empty deletes both characters.
+- New: an MCP server, so that AI tools such as Claude Code, Cursor and Claude Desktop can read your databases. Turn it on in **Settings > MCP**:
+  - The desktop app runs the server on `http://127.0.0.1:58124/mcp`. You can change the port. The app must be open.
+  - Each client must send the bearer token from the settings page. **New token** makes a new token, and clients with the old token stop working.
+  - Clients see only the connections that you select in **Shared connections**. No connection is shared by default.
+  - The tools are `list_connections`, `list_databases`, `list_tables`, `describe_table`, `run_read_query` and `run_mongo_read`. The server has no write tools. All queries go through the same read guard as the AI assistant.
+  - MCP reads use the AI settings for privacy, max rows and time limit. With **Schema only**, clients do not get row values.
+  - The settings page shows the command for Claude Code and the JSON for Cursor and other clients.
+
 ## [0.13.0] - 2026-11-16
 
 - New: skills for the AI assistant. A skill gives the assistant instructions for one database or one task. sandb has 12 built-in skills:

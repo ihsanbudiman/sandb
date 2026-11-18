@@ -5,7 +5,7 @@
   import { db, envTag, duplicateDraft, sameSource, setAiWrite, dbOf, defaultDb, type Conn } from './lib/connections.svelte';
   import { ui } from './lib/state.svelte';
   import { look, backdropOn, toggleTheme } from './lib/appearance.svelte';
-  import { catalog, completionColumns, forget as forgetCatalog, loadSnapshot, loadedTables, properties, snapshot, structureChanged } from './lib/catalog.svelte';
+  import { catalog, completionColumns, completionLinks, forget as forgetCatalog, loadSnapshot, loadedTables, properties, snapshot, structureChanged } from './lib/catalog.svelte';
   import { openChatOnTab } from './lib/chat.svelte';
   import type { Source as ChatSource } from './lib/connections.svelte';
   import { api, ApiError } from './lib/api';
@@ -241,7 +241,8 @@
   const database = $derived(tabDatabase(tab, conn));
   // Autocomplete and palette tables of the active database; the catalog loads them once per database.
   const snap = $derived(snapshot(conn.id, database));
-  const schema = $derived(snapshotSchema(snap?.status === 'ok' ? snap.items : null));
+  const snapItems = $derived(snap?.status === 'ok' ? snap.items : null);
+  const schema = $derived(snapshotSchema(snapItems));
   const tables = $derived(Object.keys(schema));
   // Tree highlight follows the shown result; joins, unions, CTEs and aggregates have no single table.
   const selected = $derived.by(() => {
@@ -263,8 +264,9 @@
     void loadSnapshot(conn.id, database);
   });
 
-  /** Autocomplete columns beyond the snapshot; the catalog answers from its own caches. */
+  /** Autocomplete columns beyond the snapshot and join foreign keys; the catalog answers from its own caches. */
   const columnsOf = (path: string[]) => completionColumns(conn.id, database, path);
+  const linksOf = (path: string[]) => completionLinks(conn.id, database, path);
 
   /** The SQL a plain Run executes: the selection, or the statement at the cursor, or the whole query. */
   function currentSql(): string {
@@ -857,7 +859,7 @@
     <div class="min-h-28 overflow-hidden {ui.resultsOpen ? 'shrink-0' : 'flex-1'}" style:height={ui.resultsOpen ? `${ui.editorSplit * 100}%` : undefined} oncontextmenu={openEditorMenu}>
       <!-- Keyed so undo never crosses into another tab's text. -->
       {#key tab.id}
-        <SqlEditor bind:this={editor} bind:value={tab.query} onrun={() => run({ sql: currentSql() })} onrunnew={() => run({ sql: currentSql(), append: true })} onrunall={() => run({ sql: tab.query })} onformat={formatQuery} {schema} {columnsOf} dialect={conn.engine} />
+        <SqlEditor bind:this={editor} bind:value={tab.query} onrun={() => run({ sql: currentSql() })} onrunnew={() => run({ sql: currentSql(), append: true })} onrunall={() => run({ sql: tab.query })} onformat={formatQuery} snapshot={snapItems} {columnsOf} {linksOf} dialect={conn.engine} />
       {/key}
     </div>
     <input bind:this={scriptInput} type="file" accept=".sql,text/plain" class="hidden" onchange={runScript} />

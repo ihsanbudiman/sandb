@@ -23,6 +23,7 @@ use crate::core::db::export::conflict_text;
 use crate::core::db::session::TabStatus;
 use crate::core::engine::{Engine, SqlEngine};
 use crate::core::error::{AppError, ErrorCode};
+use crate::core::mcp::{DEFAULT_MCP_PORT, McpSettings, McpStatus};
 use crate::core::mongo::parse::{COLLECTION_METHODS, CURSOR_METHODS, DB_METHODS};
 use crate::core::mongo::value::WRITABLE_TYPES;
 use crate::core::result::{
@@ -81,6 +82,8 @@ fn types(cfg: &ts_rs::Config) -> Vec<(String, String)> {
         decl::<GuardCheck>(cfg),
         decl::<IndexInfo>(cfg),
         decl::<InsertMode>(cfg),
+        decl::<McpSettings>(cfg),
+        decl::<McpStatus>(cfg),
         decl::<MongoCollectionInfo>(cfg),
         decl::<MongoCollectionKind>(cfg),
         decl::<MongoCollectionStats>(cfg),
@@ -181,6 +184,7 @@ fn constants() -> String {
         ("CHART_TYPES", js_strings(&CHART_TYPES)),
         ("DEFAULT_AI_BASE_URL", format!("{DEFAULT_AI_BASE_URL:?}")),
         ("DEFAULT_AI_MODEL", format!("{DEFAULT_AI_MODEL:?}")),
+        ("DEFAULT_MCP_PORT", DEFAULT_MCP_PORT.to_string()),
         ("MONGOSH_COLLECTION_METHODS", js_strings(COLLECTION_METHODS)),
         ("MONGOSH_CURSOR_METHODS", js_strings(CURSOR_METHODS)),
         ("MONGOSH_DB_METHODS", js_strings(DB_METHODS)),
