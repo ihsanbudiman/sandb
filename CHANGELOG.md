@@ -4,6 +4,8 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-18
+
 - Changed: SQL autocomplete now works more like DataGrip. The list shows the items that fit the clause at the cursor:
   - At the start of a statement, it shows statements such as `SELECT`, `INSERT INTO` and `DELETE FROM`.
   - After `FROM`, `JOIN`, `UPDATE` and `INSERT INTO`, it shows only tables, views and schemas. Each item shows its schema or kind on the right.
