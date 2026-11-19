@@ -21,6 +21,29 @@ use crate::core::sql::{facts, split};
 pub const OPEN_TX_NOTICE: &str =
     "Open transaction was rolled back. Runs are auto-commit; put BEGIN…COMMIT in one run.";
 
+struct StatementPlan {
+    read: bool,
+    kind: Option<facts::StatementKind>,
+    boundary: Option<facts::TransactionBoundary>,
+    implicit_commit: bool,
+}
+
+impl StatementPlan {
+    fn new(engine: SqlEngine, sql: &str) -> Self {
+        let parsed = facts::analyze(engine, sql).ok();
+        let statement = parsed.as_ref().and_then(|f| match f.statements.as_slice() {
+            [s] if !f.has_executable_comment => Some(s),
+            _ => None,
+        });
+        Self {
+            read: parsed.as_ref().is_some_and(facts::is_plain_read),
+            kind: statement.map(|s| s.kind),
+            boundary: statement.and_then(|s| s.transaction_boundary),
+            implicit_commit: statement.is_none_or(|s| s.implicit_commit),
+        }
+    }
+}
+
 /// A lone plain read that parses as one query: the only shape [`sorted_statements`] accepts.
 fn is_sortable(engine: SqlEngine, stmts: &[String], reads: &[bool]) -> bool {
     let ([sql], [true]) = (stmts, reads) else {
@@ -166,10 +189,8 @@ async fn execute(
     stmts: Vec<String>,
 ) -> Result<QueryRun, AppError> {
     let database = target_database(conn, req.database.as_deref());
-    let reads: Vec<bool> = stmts
-        .iter()
-        .map(|s| facts::is_plain_read_sql(engine, s))
-        .collect();
+    let plans: Vec<_> = stmts.iter().map(|s| StatementPlan::new(engine, s)).collect();
+    let reads: Vec<_> = plans.iter().map(|p| p.read).collect();
     let execution_stmts = sorted_statements(engine, &stmts, &reads, req.sort.as_ref())?;
     // Read-only connections never enter a tab session: there is nothing to commit, and the
     // frontend hides Commit / Rollback for them. Plain reads on a tab without a session need
@@ -189,6 +210,7 @@ async fn execute(
             &stmts,
             &execution_stmts,
             &reads,
+            &plans,
         )
         .await;
     }
@@ -277,15 +299,9 @@ async fn run_in_session(
     stmts: &[String],
     execution_stmts: &[String],
     reads: &[bool],
+    plans: &[StatementPlan],
 ) -> Result<QueryRun, AppError> {
-    let kinds: Vec<Option<facts::StatementKind>> = stmts
-        .iter()
-        .map(|s| {
-            facts::analyze(engine, s)
-                .ok()
-                .and_then(|f| f.statements.first().map(|s| s.kind))
-        })
-        .collect();
+    use facts::TransactionBoundary::{Begin, End};
     let mysql = engine == SqlEngine::Mysql;
     let limit = limit(req.limit, || facts::row_limit(engine, stmts.last()?));
     let started = Instant::now();
@@ -309,12 +325,33 @@ async fn run_in_session(
             if cancelled.is_cancelled() {
                 return Err(AppError::cancelled());
             }
-            let kind = kinds[i];
+            let plan = &plans[i];
+            let kind = plan.kind;
+            let boundary = plan.boundary;
             let probe = !reads[i] && session::may_end_tx(kind);
             // MySQL: the earlier uncommitted work an implicit commit would take along.
             let mut swept = false;
             if !reads[i] {
-                session::begin_if_needed(&mut s).await?;
+                if mysql && kind.is_none() && split::may_contain_batch(engine, sql) {
+                    return Err(AppError::invalid(
+                        "Cannot verify the transaction boundaries of this MySQL batch. Run its statements separately without executable comments.",
+                    ));
+                }
+                if s.tx_open && boundary == Some(Begin) {
+                    return Err(AppError::invalid(format!(
+                        "Statement {} of {n}: this tab already has an open transaction. Commit or roll back before starting another.",
+                        i + 1
+                    )));
+                }
+                if mysql && s.tx_open && plan.implicit_commit {
+                    return Err(AppError::invalid(format!(
+                        "Statement {} of {n} was not run: it may implicitly commit the open MySQL transaction. Commit or roll back first.",
+                        i + 1
+                    )));
+                }
+                if boundary.is_none() {
+                    session::begin_if_needed(&mut s).await?;
+                }
                 if mysql && probe && !matches!(kind, Some(facts::StatementKind::Transaction)) {
                     swept = session::pending(&mut s).await;
                 }
@@ -328,6 +365,11 @@ async fn run_in_session(
                 .await
             {
                 Ok((r, _)) => {
+                    if let Some(b) = boundary {
+                        s.user_started = matches!(b, Begin | End { chain: true });
+                        s.tx_open = s.user_started;
+                        s.dirty = false;
+                    }
                     results.extend(r);
                     done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }

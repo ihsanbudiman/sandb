@@ -2,7 +2,7 @@
 //! own dedicated session — one connection, detached from the pool, inside an explicit
 //! transaction the user commits or rolls back. The session exists only while that
 //! transaction is open: it opens with the first statement of a run that is not a plain read,
-//! and closes on Commit / Rollback, when a run ends without pending changes, when the tab
+//! and closes on Commit / Rollback, when an automatic transaction ends without changes, when the tab
 //! closes or its target changes, or when the app exits. There is no timer.
 
 use std::collections::HashMap;
@@ -24,6 +24,8 @@ pub struct TabSession {
     /// The session is inside the explicit transaction (verified after each statement that
     /// could end it, so MySQL implicit commits and user-typed COMMITs are seen).
     pub tx_open: bool,
+    /// A transaction the editor user began explicitly stays open even before the first write.
+    pub user_started: bool,
     pub dirty: bool,
     /// PG only: a statement failed inside the transaction, which is now aborted (25P02).
     pub aborted: bool,
@@ -331,6 +333,7 @@ async fn open(ctx: &Ctx<'_>, conn: &Connection, database: &str) -> Result<TabSes
         database: database.to_string(),
         conn: c,
         tx_open: false,
+        user_started: false,
         dirty: false,
         aborted: false,
     })
@@ -344,6 +347,7 @@ pub async fn begin_if_needed(s: &mut TabSession) -> Result<(), AppError> {
     }
     s.conn.begin().await?;
     s.tx_open = true;
+    s.user_started = false;
     s.dirty = false;
     s.aborted = false;
     Ok(())
@@ -356,6 +360,7 @@ pub async fn refresh(s: &mut TabSession) {
     if let Some(tx) = s.conn.tx(TX_TIMEOUT).await {
         s.dirty = tx.dirty(s.dirty);
         s.tx_open = tx.open;
+        s.user_started &= tx.open;
         s.aborted = tx.aborted;
     }
 }
@@ -369,12 +374,10 @@ pub async fn pending(s: &mut TabSession) -> bool {
     s.conn.has_changes(s.dirty).await
 }
 
-/// Ends a transaction that holds nothing worth asking about, once a run is done: a plain
-/// read must not leave the tab idle in a transaction the user cannot end (Commit / Rollback
-/// are offered only for pending work) on a stale snapshot. ROLLBACK, not COMMIT: nothing is
-/// pending, so nothing is lost, and no write ever commits without the user deciding.
+/// Don't leave automatic transactions idle on stale snapshots. A user-issued BEGIN,
+/// on the other hand, promises the same transaction on the next run even without a write.
 async fn end_if_clean(s: &mut TabSession) {
-    if s.tx_open && !s.aborted && !pending(s).await {
+    if s.tx_open && !s.user_started && !s.aborted && !pending(s).await {
         // A failed ROLLBACK cannot change the outcome: `settle` closes a session that is not
         // in a transaction, and closing rolls back on the server.
         let _ = s.conn.end_tx(false).await;
@@ -402,8 +405,10 @@ pub async fn close_tab(state: &impl TabSessions, tab_id: &str) {
 
 /// Drops every tab session, e.g. when the user quits and accepted losing uncommitted work.
 pub async fn close_all(state: &impl TabSessions) {
-    for id in state.tab_sessions().pending_tab_ids() {
-        state.tab_sessions().close(&id).await;
+    let registry = state.tab_sessions();
+    let ids: Vec<_> = registry.lock().tabs.keys().cloned().collect();
+    for id in ids {
+        registry.close(&id).await;
     }
 }
 

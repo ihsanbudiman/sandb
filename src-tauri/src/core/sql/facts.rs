@@ -71,10 +71,17 @@ pub struct Pragma {
     pub form: PragmaForm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionBoundary {
+    Begin,
+    End { chain: bool },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementFacts {
     /// For `WITH … INSERT/UPDATE/DELETE` the kind is the write, not `Query`.
     pub kind: StatementKind,
+    pub transaction_boundary: Option<TransactionBoundary>,
     /// Upper-case statement name for messages: `SELECT`, `DROP TABLE`, `COPY`, `SET`, ….
     pub label: String,
     /// The object a write or DDL statement targets, as written (e.g. `public.orders`).
@@ -197,6 +204,7 @@ fn has_optimizer_hint(engine: SqlEngine, sql: &str) -> bool {
 fn empty_facts(kind: StatementKind, label: String) -> StatementFacts {
     StatementFacts {
         kind,
+        transaction_boundary: None,
         label,
         target: None,
         has_where: None,
@@ -288,6 +296,13 @@ fn sqlite_pragma(engine: SqlEngine, sql: &str) -> Result<Option<Pragma>, ParserE
 fn statement_facts(engine: SqlEngine, s: &Statement) -> StatementFacts {
     let k = kind(s);
     let mut facts = empty_facts(k, label(s, k));
+    facts.transaction_boundary = match s {
+        Statement::StartTransaction { .. } => Some(TransactionBoundary::Begin),
+        Statement::Commit { chain, .. } | Statement::Rollback { chain, savepoint: None } => {
+            Some(TransactionBoundary::End { chain: *chain })
+        }
+        _ => None,
+    };
     facts.implicit_commit = engine == SqlEngine::Mysql && commits_implicitly(s, k);
     facts.show_processlist = matches!(s, Statement::ShowProcessList { .. });
     if let Statement::ShowVariable { variable } = s {
