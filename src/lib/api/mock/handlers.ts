@@ -71,6 +71,7 @@ function normalize(input: ConnectionInput, requireName = true): Required<Connect
     name: input.name.trim(),
     engine: input.engine,
     env: input.env ?? 'local',
+    envLabel: (input.envLabel ?? '').trim(),
     host: (input.host ?? '').trim(),
     port: input.port ?? 0,
     database: (input.database ?? '').trim(),
@@ -86,6 +87,7 @@ function normalize(input: ConnectionInput, requireName = true): Required<Connect
     redis: null,
   };
   if (requireName && !i.name) throw invalid('Name is required');
+  if ([...i.envLabel].length > 48 || /[\p{Cc}]/u.test(i.envLabel)) throw invalid('Use a single line of up to 48 characters for the environment label');
   if (i.readOnly) i.aiWrite = false;
   if (i.engine === 'sqlite') {
     if (!i.file) throw invalid('Database file is required');
@@ -153,6 +155,7 @@ function build(id: string, i: Required<ConnectionInput>, prevVersion: string, pr
     engine: i.engine,
     version: i.version ?? prevVersion,
     env: i.env,
+    envLabel: i.envLabel,
     host: i.host,
     port: i.port,
     database: i.database,

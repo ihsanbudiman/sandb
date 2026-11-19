@@ -1,7 +1,8 @@
 <script lang="ts">
+  import EnvironmentBadge from './EnvironmentBadge.svelte';
   import { ChevronDown, Check, LoaderCircle } from '@lucide/svelte';
   import { catalog, loadDatabases } from '../catalog.svelte';
-  import { db, envDot, envTag, canWrite, type Conn } from '../connections.svelte';
+  import { db, environmentLabel, canWrite, type Conn } from '../connections.svelte';
   import ReadOnlyBadge from './ReadOnlyBadge.svelte';
   import EngineBadge from './ui/EngineBadge.svelte';
   import Menu from './ui/Menu.svelte';
@@ -49,10 +50,8 @@
 <!-- shrink-[4]: in a narrow toolbar this gives up width before the transaction buttons next to it. -->
 <div class="flex min-w-0 shrink-[4] items-center text-base">
   <div class="max-w-72 min-w-0">
-    <button bind:this={connTrigger} class="btn btn-ghost h-7 max-w-full min-w-0 gap-2 overflow-hidden px-2 {menu === 'conn' ? 'bg-hover' : ''}" title="Connection: {conn.name}{conn.env === 'production' ? ' (production)' : ''}" aria-haspopup="menu" aria-expanded={menu === 'conn'} aria-busy={switching === 'conn'} disabled={!!switching} onclick={() => (menu = menu === 'conn' ? null : 'conn')}>
-      <!-- Production is the main safety cue while typing writes by hand, so it is spelled out, not only a red dot.
-           It comes first so a narrow toolbar truncates the name, never the cue. -->
-      {#if conn.env === 'production'}<span class="tag -ml-0.5 shrink-0 {envTag.production}">production</span>{:else}<span class="size-1.5 shrink-0 rounded-full {envDot[conn.env]}" title={conn.env}></span><span class="sr-only">{conn.env}</span>{/if}
+    <button bind:this={connTrigger} class="btn btn-ghost h-7 max-w-full min-w-0 gap-2 overflow-hidden px-2 {menu === 'conn' ? 'bg-hover' : ''}" title="Connection: {conn.name} · {environmentLabel(conn)}" aria-haspopup="menu" aria-expanded={menu === 'conn'} aria-busy={switching === 'conn'} disabled={!!switching} onclick={() => (menu = menu === 'conn' ? null : 'conn')}>
+      <EnvironmentBadge {conn} compact />
       <span class="min-w-0 truncate font-medium text-ink">{conn.name}</span>
       {#if !canWrite(conn)}<ReadOnlyBadge />{/if}
       {#if switching === 'conn'}<LoaderCircle size={13} class="-ml-0.5 shrink-0 text-faint motion-safe:animate-spin" />{:else}<ChevronDown size={13} class="-ml-0.5 shrink-0 text-faint" />{/if}
@@ -65,7 +64,7 @@
             <EngineBadge engine={c.engine} class="w-5" />
             <span class="min-w-0 flex-1 truncate text-ink">{c.name}</span>
             {#if !canWrite(c)}<ReadOnlyBadge />{/if}
-            <span class="size-1.5 shrink-0 rounded-full {envDot[c.env]}" title={c.env}></span><span class="sr-only">{c.env}</span>
+            <EnvironmentBadge conn={c} compact />
             <Check size={13} class="shrink-0 text-accent {c.id === conn.id ? '' : 'invisible'}" />
           </button>
         {/each}

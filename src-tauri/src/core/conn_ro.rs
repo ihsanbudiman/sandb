@@ -236,6 +236,7 @@ mod tests {
             engine: engine.engine(),
             version: String::new(),
             env: Env::Production,
+            env_label: String::new(),
             host: "h".into(),
             port: 1,
             database: "d".into(),

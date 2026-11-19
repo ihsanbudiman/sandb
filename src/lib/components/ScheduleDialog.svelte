@@ -4,7 +4,7 @@
   import type { Cadence } from '../cadence';
   import { cadenceError, nextRuns, formatWhen } from '../cadence';
   import { catalog, loadDatabases } from '../catalog.svelte';
-  import { canWrite, connOf, db, defaultDb, type Conn, type Engine } from '../connections.svelte';
+  import { environmentLabel, canWrite, connOf, db, defaultDb, type Conn, type Engine } from '../connections.svelte';
   import { SKILLS } from '../api/generated/constants';
   import { saved, suggestName } from '../saved.svelte';
   import type { Notify, PromptTask, QueryTask, ScheduleInput, Task } from '../schedules.svelte';
@@ -59,7 +59,7 @@
       if (!qconn) e.conn = 'Pick a connection.';
       if (qconn && !sqlite && qconn.engine === 'mongo' && !qd.database.trim()) e.db = 'MongoDB needs a database.';
       if (!qd.sql.trim()) e.sql = qconn?.engine === 'mongo' ? 'The mongosh script to run is missing.' : 'The query to run is missing.';
-      if (prod && qd.allowWrites && !ack) e.ack = 'Tick the box to confirm scheduled writes on production.';
+      if (prod && qd.allowWrites && !ack) e.ack = 'Tick the box to confirm scheduled writes on this protected connection.';
     } else {
       if (!pd.sources.length) e.sources = 'Pick at least one database.';
       if (!pd.prompt.trim()) e.prompt = 'The prompt to send is missing.';
@@ -193,7 +193,7 @@
             <select class="input input-sm select-native" value={qd.connId} onchange={(e) => pickConn(e.currentTarget.value)} aria-invalid={!!err.conn}>
               <option value="" disabled>Pick a connection…</option>
               {#each db.connections as c (c.id)}
-                <option value={c.id}>{c.name} · {c.env}</option>
+                <option value={c.id}>{c.name} · {environmentLabel(c)}</option>
               {/each}
             </select>
           </label>

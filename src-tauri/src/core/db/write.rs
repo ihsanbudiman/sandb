@@ -169,6 +169,7 @@ mod tests {
                 name: "w".into(),
                 engine: Engine::Sqlite,
                 env: Env::Production,
+                env_label: String::new(),
                 host: String::new(),
                 port: 0,
                 database: "main".into(),

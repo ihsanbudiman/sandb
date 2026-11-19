@@ -1,6 +1,7 @@
 <script lang="ts">
+  import EnvironmentBadge from './EnvironmentBadge.svelte';
   import { Bot, KeyRound, Eye, EyeOff, Lock, Gauge, ShieldCheck, Plug, Copy, Terminal, Share2, Palette, Sun, Moon, Monitor, Check, LoaderCircle, X, CircleArrowUp, Image, AppWindow, Square, SlidersHorizontal } from '@lucide/svelte';
-  import { db, envTag, canWrite, setAiWrite, type Conn } from '../connections.svelte';
+  import { db, canWrite, setAiWrite, type Conn } from '../connections.svelte';
   import { ui, ai, providers, aiSettings, saveAiSoon, saveAiKeySoon, flushAi, removeAiKey } from '../state.svelte';
   import type { McpSettings, McpStatus, Provider } from '../api';
   import { Flash } from '../flash.svelte';
@@ -309,7 +310,7 @@
             <div class="flex items-center gap-2 px-3 py-2.5">
               <EngineBadge engine={c.engine} class="w-5" />
               <span class="truncate font-medium">{c.name}</span>
-              <span class="tag {envTag[c.env]}">{c.env}</span>
+              <EnvironmentBadge conn={c} />
               <div class="flex-1"></div>
               {#if canWrite(c)}
                 <span class="text-sm {on ? 'text-warn' : 'text-muted'}">{on ? 'Writes need approval' : 'Writes off'}</span>
@@ -380,7 +381,7 @@
                 <label class="flex items-center gap-2 px-3 py-2.5">
                   <EngineBadge engine={c.engine} class="w-5" />
                   <span class="truncate font-medium">{c.name}</span>
-                  <span class="tag {envTag[c.env]}">{c.env}</span>
+                  <EnvironmentBadge conn={c} />
                   <div class="flex-1"></div>
                   <input
                     class="focus-ring size-4 shrink-0"

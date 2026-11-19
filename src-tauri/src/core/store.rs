@@ -153,6 +153,7 @@ mod tests {
             engine: Engine::Pg,
             version: "PostgreSQL 16.4".into(),
             env: Env::Staging,
+            env_label: String::new(),
             host: "127.0.0.1".into(),
             port: 55416,
             database: "shop".into(),

@@ -225,6 +225,7 @@ fn blank(engine: Engine, port: u16) -> ConnectionInput {
         name: String::new(),
         engine,
         env: Env::Local,
+        env_label: String::new(),
         host: "127.0.0.1".into(),
         port,
         database: String::new(),

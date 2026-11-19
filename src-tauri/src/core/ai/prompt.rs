@@ -300,7 +300,12 @@ fn source_lines(s: &mut String, src: &Source) {
         format!(" (server {})", quoted(&c.version))
     };
     let _ = writeln!(s, "Source {}:", src.id);
-    let _ = writeln!(s, "- Connection: {}, environment {env}.", quoted(&c.name));
+    let label = if c.env_label.is_empty() {
+        env.into()
+    } else {
+        quoted(&c.env_label)
+    };
+    let _ = writeln!(s, "- Connection: {}, environment {label}.", quoted(&c.name));
     if c.engine.sql().is_none() {
         let _ = writeln!(s, "- Engine: {dialect}{version}.");
     } else {
@@ -414,6 +419,7 @@ mod tests {
                 engine: Engine::Pg,
                 version: "PostgreSQL 16.4".into(),
                 env: Env::Production,
+                env_label: String::new(),
                 host: "h".into(),
                 port: 5432,
                 database: "shop".into(),

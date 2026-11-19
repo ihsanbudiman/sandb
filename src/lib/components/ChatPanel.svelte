@@ -5,7 +5,7 @@
   import Menu from './ui/Menu.svelte';
   import { chat, current, deleteSession, openSession, scopeOf, send, sessionsByDate, setSkills, skillsOf } from '../chat.svelte';
   import { ago, sourceLabel } from '../chatParts';
-  import { connOf, sameSource, type Conn, type Source } from '../connections.svelte';
+  import { environmentLabel, connOf, sameSource, type Conn, type Source } from '../connections.svelte';
   import { KEYS, isKey } from '../keys';
   import { Pref } from '../persist.svelte';
   import { ui } from '../state.svelte';
@@ -62,14 +62,14 @@
     if (active.table) return 'The active tab shows a table';
     if (activeBusy) return 'The active tab is running a query';
     const where = sourceLabel({ connId: active.connId, database: active.database });
-    const env = activeConn ? ` · ${activeConn.env}` : '';
+    const env = activeConn ? ` · ${environmentLabel(activeConn)}` : '';
     return active.query.trim() ? `${active.title} · ${where}${env} · appends below` : `${active.title} · ${where}${env} · empty`;
   }
 
   function newHint() {
     if (!runMenu?.source) return 'No database is available';
     if (!menuConn) return 'The connection is missing';
-    return `${sourceLabel(runMenu.source)} · ${menuConn.env}`;
+    return `${sourceLabel(runMenu.source)} · ${environmentLabel(menuConn)}`;
   }
 
   function insertHint() {

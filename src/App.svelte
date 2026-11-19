@@ -1,9 +1,10 @@
 <script lang="ts">
+  import EnvironmentBadge from './lib/components/EnvironmentBadge.svelte';
   import { Database, Search, Settings, ScrollText, Sun, Moon, Plus, Sparkles, PanelRight, PanelLeft, CircleArrowUp, PanelBottom, CalendarClock } from '@lucide/svelte';
   import { FileCode, Play, Square, X, LoaderCircle, Check, Undo2, ListOrdered, FileUp, Scissors, Copy, ClipboardPaste, ChevronUp, ChevronDown, Table2, Eye, ScanEye, RotateCw, Save, CopyPlus, WandSparkles, Pencil } from '@lucide/svelte';
   import { tick, untrack } from 'svelte';
   import { fade } from 'svelte/transition';
-  import { canWrite, db, envTag, duplicateDraft, isRedis, isSql, sameSource, sameTarget, setAiWrite, dbOf, defaultDb, type Conn } from './lib/connections.svelte';
+  import { canWrite, db, duplicateDraft, isRedis, isSql, sameSource, sameTarget, setAiWrite, dbOf, defaultDb, type Conn } from './lib/connections.svelte';
   import { ui } from './lib/state.svelte';
   import { look, backdropOn, toggleTheme } from './lib/appearance.svelte';
   import { catalog, completionColumns, completionLinks, forget as forgetCatalog, loadSnapshot, loadedTables, properties, snapshot, structureChanged } from './lib/catalog.svelte';
@@ -889,8 +890,8 @@
                 <input class="focus-ring w-28 rounded-sm bg-transparent" value={t.title} aria-label="Tab name" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" use:focusSelect onblur={(e) => rename(t, e.currentTarget.value)} onkeydown={(e) => keyRename(e, t)} />
               </span>
             {:else}
-              <button class="flex h-full items-center gap-2 rounded-md pl-2.5" id="query-tab-{t.id}" role="tab" aria-selected={on} aria-controls={on ? 'workspace-panel' : undefined} tabindex={on ? 0 : -1} aria-haspopup="menu" onclick={() => pickTab(t.id)} ondblclick={() => (renaming = t.id)} onkeydown={(e) => tabKey(e, t)} oncontextmenu={(e) => openTabMenu(e, t)} title="{prodT ? 'Production · ' : ''}Double-click to rename">
-                {#if t.table}<Table2 size={13} class={on ? 'text-accent' : 'text-faint'} />{:else}<FileCode size={13} class={on ? 'text-accent' : 'text-faint'} />{/if} <span class="max-w-40 truncate">{t.title}</span>{#if prodT}<span class="sr-only">, production</span>{/if}
+              <button class="flex h-full items-center gap-2 rounded-md pl-2.5" id="query-tab-{t.id}" role="tab" aria-selected={on} aria-controls={on ? 'workspace-panel' : undefined} tabindex={on ? 0 : -1} aria-haspopup="menu" onclick={() => pickTab(t.id)} ondblclick={() => (renaming = t.id)} onkeydown={(e) => tabKey(e, t)} oncontextmenu={(e) => openTabMenu(e, t)} title="{prodT ? 'Protected writes · ' : ''}Double-click to rename">
+                {#if t.table}<Table2 size={13} class={on ? 'text-accent' : 'text-faint'} />{:else}<FileCode size={13} class={on ? 'text-accent' : 'text-faint'} />{/if} <span class="max-w-40 truncate">{t.title}</span>{#if prodT}<span class="sr-only">, protected writes</span>{/if}
                 {#if runs[t.id] && (!on || ui.page !== 'query')}<LoaderCircle size={12} class="text-faint motion-safe:animate-spin" />{/if}
                 {#if t.status?.pending}<span class="size-1.5 rounded-full bg-warn" title="Transaction open"></span>{/if}
               </button>
@@ -987,7 +988,7 @@
     <div class="flex h-pane-header shrink-0 items-center gap-2 px-3">
       {#if t.kind === 'view'}<Eye size={13} class="shrink-0 text-accent" />{:else if t.kind === 'matview'}<ScanEye size={13} class="shrink-0 text-accent" />{:else}<Table2 size={13} class="shrink-0 text-accent" />{/if}
       <span class="min-w-0 truncate text-base font-semibold" title={displayName(t)}>{displayName(t)}</span>
-      {#if conn.env === 'production'}<span class="tag shrink-0 {envTag.production}">production</span>{/if}
+      {#if conn.env === 'production' || conn.envLabel}<EnvironmentBadge {conn} />{/if}
       <span class="hidden min-w-0 truncate text-sm text-faint md:inline">{conn.name} / {redis ? `db${t.database}` : database}</span>
       <div class="seg ml-2 shrink-0" role="tablist" aria-label={redis ? 'Key view' : 'Table view'}>
         <button class="seg-item {tab.view === 'data' ? 'seg-on' : ''}" role="tab" aria-selected={tab.view === 'data'} onclick={() => { tab.view = 'data'; if (redis && !tab.result) void loadTableData(tab); }}>Data</button>

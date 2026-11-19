@@ -195,6 +195,7 @@ fn shared(state: &AppState, mcp: &McpSettings) -> McpCall {
                 "name": c.name,
                 "engine": c.engine,
                 "env": c.env,
+                "envLabel": c.env_label,
                 "database": c.database,
                 "readOnly": c.read_only,
                 "version": c.version,

@@ -9,7 +9,7 @@ sandb is a light desktop database client with an AI assistant. You use your own 
 - Connect to PostgreSQL, MySQL, MariaDB and SQLite.
 - Connect to MongoDB with fields (host, port, database, user, password, auth source and TLS) or a `mongodb://` / `mongodb+srv://` connection string. A test of the connection shows the server version and the topology: standalone, replica set or sharded. A password, also one inside the string, is saved in the credential store, and the connections file keeps the string without it.
 - Connect to Redis standalone, Cluster or Sentinel. Use connection fields, `redis://` or `rediss://`. Use a Redis ACL user for server-side read-only access.
-- Set the environment of each connection: local, staging or production. A production connection asks you to confirm dangerous changes.
+- Give each connection an environment label, such as “Finance EU” or “QA”. **Protect writes** enables manual commit in SQL editor tabs and confirmation for dangerous changes, regardless of the label. Existing production connections keep these safeguards. Use **Read-only** to block writes instead.
 - Mark a connection as read-only. MongoDB has no read-only session, so a read-only MongoDB connection relies on the app's guard, and the dialog recommends a database user with the `read` role for full protection.
 - The connection tree shows tables, views and PostgreSQL materialized views in separate folders. A MongoDB connection shows its databases, then a Collections and a Views folder. Expanding a collection lists its field paths (`address.city`, `items[].sku`) with their types and the share of sampled documents that have each one.
 - Browse Redis databases and keys. Find keys with a pattern, such as `user:*`. Expand a key to see its fields.

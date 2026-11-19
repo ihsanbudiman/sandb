@@ -188,6 +188,7 @@ mod tests {
                 engine,
                 version: String::new(),
                 env: Env::Local,
+                env_label: String::new(),
                 host: "h".into(),
                 port: 1,
                 database: "shop".into(),

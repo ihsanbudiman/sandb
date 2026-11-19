@@ -568,6 +568,7 @@ mod tests {
             engine: Engine::Mongo,
             version: String::new(),
             env: crate::core::connections::Env::Local,
+            env_label: String::new(),
             host: String::new(),
             port: 0,
             database: String::new(),
