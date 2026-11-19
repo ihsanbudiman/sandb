@@ -140,10 +140,13 @@ services:
           until redis-cli -p "$$p" PING >/dev/null 2>&1; do sleep 0.1; done
         done
         redis-cli --cluster create "127.0.0.1:$$REDIS_CLUSTER_PORT_1" "127.0.0.1:$$REDIS_CLUSTER_PORT_2" "127.0.0.1:$$REDIS_CLUSTER_PORT_3" --cluster-replicas 0 --cluster-yes
+        # A redirected write can reach a primary before that node considers the cluster ready.
         for p in "$${ports[@]}"; do
           until redis-cli -p "$$p" CLUSTER INFO | grep -q '^cluster_state:ok'; do sleep 0.1; done
         done
-        redis-cli -c -e -p "$$REDIS_CLUSTER_PORT_1" < /seed/03_cluster.redis
+        # When reading commands from stdin, redis-cli can exit 0 despite server errors.
+        redis-cli -c -e --no-raw -p "$$REDIS_CLUSTER_PORT_1" < /seed/03_cluster.redis > /tmp/cluster-seed.log
+        if grep -F '(error)' /tmp/cluster-seed.log >&2; then exit 1; fi
         for p in "$${ports[@]}"; do
           redis-cli -e -p "$$p" < /seed/02_users.redis
         done
