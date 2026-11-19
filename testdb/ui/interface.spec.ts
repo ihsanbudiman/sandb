@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 async function runQuery(page: Page) {
   const editor = page.locator('.cm-content');
   await editor.fill('SELECT * FROM customers;');
-  await page.getByRole('button', { name: /^Run / }).click();
+  await page.getByRole('button', { name: 'Run', exact: true }).click();
   await expect(page.locator('#query-results table')).toBeVisible();
 }
 
