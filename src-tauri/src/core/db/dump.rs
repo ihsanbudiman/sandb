@@ -34,7 +34,11 @@ pub async fn table_ddl(
     let ddl = match ctx.pool_for(conn, Some(database))? {
         DbPool::Pg(p) => pg_ddl(&p, schema.unwrap_or("public"), table).await?.ddl,
         DbPool::MySql(p) => mysql_ddl(&p, database, table).await?.ddl,
-        DbPool::Sqlite(p) => sqlite_ddl(&p, table).await?.ddl,
+        DbPool::Sqlite(p) => {
+            let mut schema = sqlite_ddl(&p, table).await?;
+            schema.definitions.extend(schema.triggers);
+            schema.definitions.join("\n")
+        }
     };
     Ok(ddl)
 }
@@ -161,6 +165,19 @@ fn push_sqlite_value(buf: &mut String, v: SqliteRaw<'_>) {
         }
         SqliteRaw::Real(f) => {
             let _ = write!(buf, "{f:?}");
+        }
+        // SQL literals cannot contain NUL. Use one replacement regardless of the
+        // number of NULs, and keep TEXT independent of the destination's encoding.
+        SqliteRaw::Text(s) if s.contains('\0') => {
+            let mut marker = "#NUL".to_owned();
+            while s.contains(&marker) {
+                marker = format!("#{}", uuid::Uuid::new_v4().simple());
+            }
+            buf.push_str("replace(");
+            push_quoted(buf, &s.replace('\0', &marker));
+            buf.push_str(", ");
+            push_quoted(buf, &marker);
+            buf.push_str(", char(0))");
         }
         SqliteRaw::Text(s) => push_quoted(buf, s),
         SqliteRaw::Blob(b) => push_hex(buf, b),
@@ -706,7 +723,13 @@ pub(crate) fn push_mysql_cell(buf: &mut String, row: &MySqlRow, i: usize) -> Res
     Ok(())
 }
 
-async fn sqlite_ddl(p: &SqlitePool, table: &str) -> Result<Target, AppError> {
+struct SqliteSchema {
+    definitions: Vec<String>,
+    triggers: Vec<String>,
+    view: bool,
+}
+
+async fn sqlite_ddl(p: &SqlitePool, table: &str) -> Result<SqliteSchema, AppError> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT type, sql FROM sqlite_master WHERE tbl_name = ? AND sql IS NOT NULL \
          ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'view' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, \
@@ -720,15 +743,19 @@ async fn sqlite_ddl(p: &SqlitePool, table: &str) -> Result<Target, AppError> {
         Some((t, _)) if t == "view" => true,
         _ => return Err(not_found_table(table)),
     };
-    let ddl = rows
-        .iter()
-        .map(|(_, sql)| statement(sql))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(Target {
-        ddl,
+    let mut definitions = Vec::new();
+    let mut triggers = Vec::new();
+    for (kind, sql) in rows {
+        if kind == "trigger" {
+            triggers.push(statement(&sql));
+        } else {
+            definitions.push(statement(&sql));
+        }
+    }
+    Ok(SqliteSchema {
+        definitions,
+        triggers,
         view,
-        qualified: SqlEngine::Sqlite.quote(table),
     })
 }
 
@@ -739,15 +766,35 @@ async fn sqlite_export<W: AsyncWrite + Unpin>(
     req: &TableExportRequest,
     out: &mut W,
 ) -> Result<u64, AppError> {
-    let t = sqlite_ddl(p, &req.table).await?;
-    write_ddl(out, &header(conn, engine, &req.table), &t.ddl).await?;
-    if !req.data || t.view {
-        return Ok(0);
+    let schema = sqlite_ddl(p, &req.table).await?;
+    write_ddl(
+        out,
+        &header(conn, engine, &req.table),
+        &schema.definitions.join("\n"),
+    )
+    .await?;
+    let rows = if req.data && !schema.view {
+        sqlite_export_rows(p, &req.table, out).await?
+    } else {
+        0
+    };
+    // The exported rows already include any changes made by the source triggers.
+    for trigger in schema.triggers {
+        out.write_all(trigger.as_bytes()).await?;
+        out.write_all(b"\n").await?;
     }
+    Ok(rows)
+}
+
+async fn sqlite_export_rows<W: AsyncWrite + Unpin>(
+    p: &SqlitePool,
+    table: &str,
+    out: &mut W,
+) -> Result<u64, AppError> {
     // `table_info` leaves out generated (hidden) columns.
     let names: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
-            .bind(&req.table)
+            .bind(table)
             .fetch_all(p)
             .await?;
     if names.is_empty() {
@@ -758,9 +805,10 @@ async fn sqlite_export<W: AsyncWrite + Unpin>(
         .map(|n| SqlEngine::Sqlite.quote(n))
         .collect::<Vec<_>>()
         .join(", ");
-    let select = format!("SELECT {list} FROM {}", t.qualified);
+    let qualified = SqlEngine::Sqlite.quote(table);
+    let select = format!("SELECT {list} FROM {qualified}");
     out.write_all(b"\n").await?;
-    let mut ins = Inserts::new(out, format!("INSERT INTO {} ({list}) VALUES", t.qualified));
+    let mut ins = Inserts::new(out, format!("INSERT INTO {qualified} ({list}) VALUES"));
     let mut c = p.acquire().await?;
     let mut rows = sqlx::raw_sql(&select).fetch(&mut *c);
     let mut buf = String::new();
@@ -1038,7 +1086,8 @@ mod tests {
         CREATE TABLE \"it's\" (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL, \
           data BLOB, twice INTEGER GENERATED ALWAYS AS (id * 2) STORED); \
         CREATE INDEX its_name ON \"it's\" (name); \
-        CREATE TRIGGER its_trg AFTER INSERT ON \"it's\" BEGIN SELECT 1; END; \
+        CREATE TRIGGER its_trg AFTER INSERT ON \"it's\" BEGIN \
+          UPDATE \"it's\" SET name = name || '!' WHERE id = new.id; END; \
         CREATE VIEW v AS SELECT id, name FROM \"it's\"; \
         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 150) \
         INSERT INTO \"it's\" (id, name, score, data) SELECT i, 'n' || i, i / 4.0, NULL FROM n; \
@@ -1092,13 +1141,13 @@ mod tests {
         assert!(!r.cancelled);
         let sql = std::fs::read_to_string(&path).unwrap();
         assert!(sql.starts_with("-- sandb SQL export\n-- Table: it's\n-- Engine: SQLite"));
-        assert!(sql.contains(&ddl));
+        assert!(lines.iter().all(|line| sql.contains(line)));
         let head = "INSERT INTO \"it's\" (\"id\", \"name\", \"score\", \"data\") VALUES\n";
         assert_eq!(sql.matches(head).count(), 2);
         assert!(sql.contains(&format!(
-            "{head}(1, 'o''k \\ \"q\"', NULL, X'00FF'),\n(2, 'n2', 0.5, NULL),"
+            "{head}(1, 'o''k \\ \"q\"', NULL, X'00FF'),\n(2, 'n2!', 0.5, NULL),"
         )));
-        assert!(sql.ends_with("(150, 'n150', 37.5, NULL);\n"));
+        assert!(sql.contains("(150, 'n150!', 37.5, NULL);\n"));
         // Only the final file remains: the temp file was renamed.
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -1116,8 +1165,18 @@ mod tests {
         let p = st.pool_for(&conn, Some("main")).unwrap();
         let DbPool::Sqlite(p) = p else { unreachable!() };
         let want: Vec<R> = sqlx::query_as(q).fetch_all(&p).await.unwrap();
+        assert_eq!(got[1].1, "n2!", "restore must not fire the trigger again");
         assert_eq!(got, want);
         assert_eq!(got[0].4, 2, "generated column recomputed");
+        sqlx::query("INSERT INTO \"it's\" (id, name) VALUES (151, 'next')")
+            .execute(&mut fresh)
+            .await
+            .unwrap();
+        let next: String = sqlx::query_scalar("SELECT name FROM \"it's\" WHERE id = 151")
+            .fetch_one(&mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(next, "next!", "new inserts still fire the trigger");
 
         // DDL only, and a view never exports rows.
         let r = export_table_sql(&st, req("it's", false), &path)
