@@ -53,7 +53,7 @@ sandb is a light desktop database client with an AI assistant. You use your own 
 
 - Ask questions about your data in a chat. The assistant can use up to 8 sources in one chat, with SQL, MongoDB and Redis together.
 - The assistant reads the schema first. Then it runs read-only queries through a read guard. On MongoDB it reads with one mongosh statement that the same parser and read guard check as in the editor.
-- Before a write runs, you must approve it in the chat. That covers MongoDB statements too: an approved write runs as one statement, so a change of many documents is not one transaction.
+- The assistant can propose a write only for a source that allows AI writes and has write mode on in the chat. For other sources it can draft the change without running it. Before a write runs, you must approve it in the chat. That covers MongoDB statements too: an approved write runs as one statement, so a change of many documents is not one transaction.
 - For Redis, the assistant and MCP share the same read guard. It refuses writes, `KEYS`, blocking commands, and some commands that show private server details. A Redis write that the assistant proposes needs your approval.
   The editor and user-written query schedules can read those server details if the Redis account has permission.
 - The assistant makes bar, line, area, pie and scatter charts.
@@ -72,6 +72,10 @@ sandb supports two AI server formats:
 | Anthropic-compatible | Anthropic |
 
 In Settings > AI, set the provider, the base URL, the model and the API key.
+
+### MCP clients
+
+MCP tools are read-only. Start with `list_connections` and pass the returned id as `connection`, not a chat `source` id. If you select a non-default database, pass its name on every call (for Redis, use a string such as `"1"`). Omit `database` only when you want the saved default. Unexpected arguments or malformed targets return an error instead of silently reading the default.
 
 ### Schedules
 
