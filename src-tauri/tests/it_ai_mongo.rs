@@ -198,14 +198,10 @@ async fn mongo_read_runs_and_sends_documents() {
             "{privacy:?}: one call, then one after the tool"
         );
         let offered = offered_tools(&bodies);
-        for t in [
-            "run_mongo_read",
-            "render_mongo_chart",
-            "propose_mongo_write",
-        ] {
+        for t in ["run_mongo_read", "render_mongo_chart"] {
             assert!(offered.iter().any(|x| x == t), "{t}: {offered:?}");
         }
-        for t in ["run_read_query", "render_chart", "propose_write"] {
+        for t in ["run_read_query", "render_chart", "propose_write", "propose_mongo_write"] {
             assert!(!offered.iter().any(|x| x == t), "{t}: {offered:?}");
         }
         let contents = tool_contents(&bodies);
