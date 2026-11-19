@@ -43,8 +43,8 @@ jobs:
       - name: Frontend type-check
         run: pnpm check
 
-      - name: Frontend build
-        run: pnpm build
+      - name: Frontend build and bundle checks
+        run: pnpm test:bundle
 
       - name: Rust lints
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-features --all-targets -- -D warnings
