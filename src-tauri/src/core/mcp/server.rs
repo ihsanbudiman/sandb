@@ -78,7 +78,9 @@ impl<H: StateHandle> ServerHandler for Handler<H> {
                  environment. Ask if the target is unclear. Pass its id as connection.\n\
                  2. Use the default database unless the user wants another. Use list_databases \
                  when you need a name or a MongoDB connection has no default. Pass that name \
-                 as database.\n\
+                 as database on every later call for that target. Use strings for connection \
+                 and database, including Redis database numbers. Never change the target to \
+                 recover from a failed call.\n\
                  3. Use list_tables to find tables, collections or keys. Use describe_table to \
                  check columns or fields. In PostgreSQL, pass schema for objects outside public.\n\
                  4. Use run_read_query for SQL, run_mongo_read for MongoDB, or run_redis_read \
@@ -99,10 +101,10 @@ impl<H: StateHandle> ServerHandler for Handler<H> {
     ) -> Result<ListToolsResult, ErrorData> {
         Ok(ListToolsResult::with_all_items(
             tools::list()
-                .into_iter()
+                .iter()
                 .map(|t| {
                     let schema = Arc::new(t.schema.as_object().cloned().unwrap_or_default());
-                    Tool::new(t.name, t.description, schema)
+                    Tool::new(t.name, t.description.clone(), schema)
                         .with_annotations(ToolAnnotations::new().read_only(true))
                 })
                 .collect(),
