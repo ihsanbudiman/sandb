@@ -358,8 +358,10 @@
       return;
     }
     // A label-only edit must neither settle pending work nor send form defaults as target changes.
-    const labelOnly = envLabel !== cur.envLabel && !passwordDirty && !tested && settingsWithoutLabel() === originalSettings;
-    const next = labelOnly ? { ...cur, envLabel } : payload();
+    const draft = payload();
+    const metadataChanged = (draft.version ?? cur.version) !== cur.version || (draft.topology ?? cur.topology) !== cur.topology;
+    const labelOnly = envLabel !== cur.envLabel && !passwordDirty && !metadataChanged && settingsWithoutLabel() === originalSettings;
+    const next = labelOnly ? { ...cur, envLabel } : draft;
     const target = typedTarget();
     const nextDb = redisEngine ? target.database : defaultDb(next);
     // Only a change of target or database touches the open result; name, env and AI access do not.
