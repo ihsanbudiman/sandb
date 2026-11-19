@@ -1760,6 +1760,7 @@ mod tests {
                 engine: Engine::Pg,
                 version: String::new(),
                 env: Env::Local,
+                env_label: String::new(),
                 host: "h".into(),
                 port: 5432,
                 database: "shop".into(),

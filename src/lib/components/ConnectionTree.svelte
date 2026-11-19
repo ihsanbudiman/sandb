@@ -1,9 +1,10 @@
 <script lang="ts">
+  import EnvironmentBadge from './EnvironmentBadge.svelte';
   import { ChevronRight, Table2, Plus, Layers, KeyRound, Columns2, Database, Pencil, Copy, Trash, Ellipsis, LoaderCircle, RotateCw, Eye, ScanEye, ListTree, Lock, Hash, FileCode, FileSearch, FilePlus, Download, Sheet, Eraser, Clock } from '@lucide/svelte';
   import { onDestroy, untrack } from 'svelte';
   import { api, type TableInfo, type TableKind } from '../api';
   import { catalog, databases, forget as forgetCatalog, listKey, loadColumns, loadDatabases, loadRedisKeys, loadSchemas, loadTables, redisKeys, reloadLists, schemas, tables, type Loaded } from '../catalog.svelte';
-  import { db, envDot, envTag, canWrite, defaultDb, isMongo, isRedis, isSql, sameTarget, type Conn } from '../connections.svelte';
+  import { db, environmentLabel, canWrite, defaultDb, isMongo, isRedis, isSql, sameTarget, type Conn } from '../connections.svelte';
   import { active, activeTab, tabs } from '../tabs.svelte';
   import { Pref } from '../persist.svelte';
   import { displayName, kindLabel, type TableAction, type TableRef } from '../tableActions';
@@ -498,7 +499,7 @@
     <button
       class="nav-item {isActive ? 'font-medium text-ink' : ''} {menuOn ? 'bg-active hover:bg-active' : ''} {drag?.on ? 'cursor-grabbing' : ''}"
       style={pad(0)}
-      title="{c.name} · {c.version} · Environment: {c.env}{canWrite(c) ? '' : ' · read-only'} · Drag or Alt+↑/↓ to reorder"
+      title="{c.name} · {c.version} · Environment: {environmentLabel(c)}{canWrite(c) ? '' : ' · read-only'} · Drag or Alt+↑/↓ to reorder"
       aria-expanded={!!open[c.id]}
       onclick={(e) => { menu = null; if (e.detail > 1 || dragged) { dragged = false; return; } open[c.id] ? (open[c.id] = false) : expandReal(c); }}
       oncontextmenu={(e) => openMenu(e, c)}
@@ -508,11 +509,11 @@
       <ChevronRight size={12} class="shrink-0 text-faint motion-safe:transition-transform {open[c.id] ? 'rotate-90' : ''}" />
       <EngineBadge engine={c.engine} />
       <span class="min-w-0 flex-1 truncate">{c.name}</span>
-      <span class="sr-only">{c.env}{canWrite(c) ? '' : ', read-only'}</span>
+      <span class="sr-only">{environmentLabel(c)}{c.env === 'production' ? ', protected writes' : ''}{canWrite(c) ? '' : ', read-only'}</span>
       <!-- Hidden on hover: the actions button covers that corner. The row title and the sr-only text above carry the same facts. -->
-      <span class="flex shrink-0 items-center gap-2 {menuOn ? 'invisible' : 'group-focus-within:invisible group-hover:invisible'}">
+      <span aria-hidden="true" class="flex shrink-0 items-center gap-2 {menuOn ? 'invisible' : 'group-focus-within:invisible group-hover:invisible'}">
         {#if !canWrite(c)}<Lock size={12} class="text-faint" aria-hidden="true" />{/if}
-        {#if c.env === 'production'}<span class="tag {envTag.production}" aria-hidden="true">production</span>{:else}<span class="size-1.5 rounded-full {envDot[c.env]}" aria-hidden="true"></span>{/if}
+        <EnvironmentBadge conn={c} compact />
       </span>
     </button>
     <button

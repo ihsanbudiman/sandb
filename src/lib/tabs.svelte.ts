@@ -33,7 +33,7 @@ export interface Tab {
 }
 
 // A tab's connection and the first tab on the app's first connection while none is loaded.
-const placeholder: Conn = { id: '', name: '', engine: 'pg', version: '', env: 'local', host: '', port: 0, database: '', user: '', ssl: 'prefer', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null };
+const placeholder: Conn = { id: '', name: '', engine: 'pg', version: '', env: 'local', envLabel: '', host: '', port: 0, database: '', user: '', ssl: 'prefer', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null };
 
 export const tabs = $state({ list: [] as Tab[], activeId: '' });
 

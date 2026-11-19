@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Database, LoaderCircle, KeyRound } from '@lucide/svelte';
   import { untrack } from 'svelte';
-  import { db, defaultDb, engines, envDot, sameTarget, type Conn, type Engine, type Env } from '../connections.svelte';
+  import { db, defaultDb, engines, environmentLabel, sameTarget, type Conn, type Engine, type Env } from '../connections.svelte';
   import { active } from '../tabs.svelte';
   import { activeTab, setTabConn } from '../tabs.svelte';
   import { api, errorText, type Connection, type ConnectionInput, type MongoUriParts, type RedisMode, type RedisSettings, type RedisUriParts, type SslMode, type Topology } from '../api';
@@ -41,7 +41,11 @@
   let password = $state('');
   let ssl = $state<SslMode>('prefer');
   let file = $state('~/data/app.db');
-  let env = $state<Env>('local');
+  let label = $state('');
+  let standardEnv = $state<Exclude<Env, 'production'>>('local');
+  let protectedWrites = $state(false);
+  const env: Env = $derived(protectedWrites ? 'production' : standardEnv);
+  const envLabel = $derived(label.trim() === env ? '' : label.trim());
   let aiWrite = $state(false);
   let readOnly = $state(false);
   // MongoDB and standalone Redis accept a connection string (`uri`, sent as typed, password included).
@@ -59,6 +63,7 @@
   let saveError = $state('');
   // A newer test or reset invalidates an in-flight test.
   let run = 0;
+  let originalSettings = '';
   // The backend's split of the typed string, without its password: the saved one is compared with it.
   let uriPreview = $state<{ engine: Engine; text: string; parts: MongoUriParts | RedisUriParts | null } | null>(null);
 
@@ -102,7 +107,7 @@
   async function toggleAi(next: boolean) {
     if (!next) return (aiWrite = false);
     if (readOnly) return;
-    if (await ask<boolean>(SafeguardDialog, { conn: { engine, name: name.trim() || 'new connection', env, readOnly } })) aiWrite = true;
+    if (await ask<boolean>(SafeguardDialog, { conn: { engine, name: name.trim() || 'new connection', env, envLabel, readOnly } })) aiWrite = true;
   }
 
   function fill(c: Conn | null) {
@@ -113,7 +118,9 @@
       host = 'localhost';
       ssl = 'prefer';
       file = '~/data/app.db';
-      env = 'local';
+      label = '';
+      standardEnv = 'local';
+      protectedWrites = false;
       aiWrite = false;
       readOnly = false;
       mode = 'fields';
@@ -132,7 +139,9 @@
     password = '';
     ssl = c.ssl;
     file = c.file || '~/data/app.db';
-    env = c.env;
+    label = environmentLabel(c);
+    standardEnv = c.env === 'staging' ? 'staging' : 'local';
+    protectedWrites = c.env === 'production';
     aiWrite = c.aiWrite;
     readOnly = c.readOnly;
     // The saved string has no password; the stored one is kept unless the user types one into it.
@@ -141,6 +150,7 @@
     if (multiHost) mode = 'fields';
     authSource = c.authSource;
     resetStatus();
+    originalSettings = settingsWithoutLabel();
   }
 
   function resetStatus() {
@@ -160,7 +170,6 @@
   }
 
   const engineList: Engine[] = ['pg', 'mysql', 'sqlite', 'mongo', 'redis'];
-  const envs: Env[] = ['local', 'staging', 'production'];
   const sslModes = [
     { value: 'disable', label: 'Disable' },
     { value: 'prefer', label: 'Prefer' },
@@ -220,7 +229,11 @@
   }
 
   function input(): ConnectionInput & Pick<Connection, 'uri' | 'authSource'> {
-    return { name: name.trim(), engine, env, host: host.trim(), port: Number(port) || 0, database: redisEngine ? redisDatabase() : database.trim(), user: user.trim(), ssl, file: file.trim(), aiWrite, readOnly, uri: useUri ? uri.trim() : '', authSource: mongo && !useUri ? authSource.trim() : '', redis: redisSettings() };
+    return { name: name.trim(), engine, env, envLabel, host: host.trim(), port: Number(port) || 0, database: redisEngine ? redisDatabase() : database.trim(), user: user.trim(), ssl, file: file.trim(), aiWrite, readOnly, uri: useUri ? uri.trim() : '', authSource: mongo && !useUri ? authSource.trim() : '', redis: redisSettings() };
+  }
+
+  function settingsWithoutLabel(): string {
+    return JSON.stringify({ ...input(), envLabel: undefined });
   }
 
   // Fields that decide where the connection goes; a test result is stale once any of them changes.
@@ -344,17 +357,21 @@
       adopt(saved);
       return;
     }
-    const next = payload();
+    // A label-only edit must neither settle pending work nor send form defaults as target changes.
+    const draft = payload();
+    const metadataChanged = (draft.version ?? cur.version) !== cur.version || (draft.topology ?? cur.topology) !== cur.topology;
+    const labelOnly = envLabel !== cur.envLabel && !passwordDirty && !metadataChanged && settingsWithoutLabel() === originalSettings;
+    const next = labelOnly ? { ...cur, envLabel } : draft;
     const target = typedTarget();
     const nextDb = redisEngine ? target.database : defaultDb(next);
     // Only a change of target or database touches the open result; name, env and AI access do not.
-    const dbChanged = cur.database !== nextDb || !sameTarget(cur, target);
+    const dbChanged = !labelOnly && (cur.database !== nextDb || !sameTarget(cur, target));
     if (dbChanged && cur.id === active().id && !(await canswitch())) return;
-    if (!(await canupdate(cur, dbChanged))) return;
+    if (!labelOnly && !(await canupdate(cur, dbChanged))) return;
     saving = true;
     saveError = '';
     try {
-      const saved = await api.updateConnection({ id: cur.id, input: next, password: passwordArg() });
+      const saved = await api.updateConnection({ id: cur.id, input: next, password: labelOnly ? null : passwordArg() });
       Object.assign(cur, saved);
     } catch (e) {
       saveError = errorText(e);
@@ -403,15 +420,17 @@
 
         <!-- Above the target fields so Environment and Read-only stay in view on short windows; the body still scrolls. -->
         <div class="space-y-2">
-          <div>
-            {@render field('Environment')}
-            <div class="seg flex">
-              {#each envs as e}
-                <button class="seg-item flex flex-1 items-center justify-center gap-1.5 capitalize {env === e ? 'seg-on' : ''}" onclick={() => (env = e)}>
-                  <span class="size-1.5 rounded-full {envDot[e]}"></span>{e}
-                </button>
-              {/each}
+          <label class="block">
+            {@render field('Environment label')}
+            <input class="input input-sm" bind:value={label} maxlength="48" placeholder={env} aria-describedby="env-label-hint" />
+          </label>
+          <p id="env-label-hint" class="text-xs text-muted">For example, Finance EU or QA. The label does not set permissions.</p>
+          <div class="flex items-center gap-3 pt-1">
+            <div class="flex-1">
+              <div class="font-medium">Protect writes</div>
+              <div class="text-sm text-muted">{mongo || redisEngine ? 'Ask before running editor writes.' : 'Use manual commit in SQL editor tabs.'} Confirm dangerous changes.</div>
             </div>
+            <Switch checked={protectedWrites} aria-label="Protect writes" onchange={(next) => (protectedWrites = next)} />
           </div>
           <div class="flex items-center gap-3 pt-1">
             <div class="flex-1">

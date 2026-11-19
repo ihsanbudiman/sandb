@@ -20,9 +20,9 @@ export function add(c: Connection) {
   list.push(c);
 }
 
-export function replace(c: Connection) {
+export function replace(c: Connection, reconnect: boolean) {
   list = list.map((x) => (x.id === c.id ? c : x));
-  dropSessionsOf(c.id);
+  if (reconnect) dropSessionsOf(c.id);
 }
 
 export function remove(id: string) {

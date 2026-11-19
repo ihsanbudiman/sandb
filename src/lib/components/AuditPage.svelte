@@ -1,6 +1,6 @@
 <script lang="ts">
   import { Search, Copy, Check, ChevronRight } from '@lucide/svelte';
-  import { db, envDot } from '../connections.svelte';
+  import { environmentLabel, db, envDot } from '../connections.svelte';
   import { ui } from '../state.svelte';
   import { audit, type AuditEntry } from '../audit.svelte';
   import { Flash } from '../flash.svelte';
@@ -127,7 +127,7 @@
                 </button>
               </td>
               <td class="truncate border-b border-line/60 px-2">
-                <span class="mr-2 inline-block size-1.5 rounded-full align-middle {c ? envDot[c.env] : 'bg-faint'}" title={c?.env}></span><span>{c?.name ?? e.connId}</span>{#if c}<span class="sr-only">, {c.env}</span>{/if}
+                <span class="mr-2 inline-block size-1.5 rounded-full align-middle {c ? envDot[c.env] : 'bg-faint'}" title={c && environmentLabel(c)}></span><span>{c?.name ?? e.connId}</span>{#if c}<span class="sr-only">, {environmentLabel(c)}</span>{/if}
               </td>
               <td class="border-b border-line/60 px-2">
                 <span class="sentence text-sm font-medium {e.kind === 'WRITE' ? 'text-warn' : 'text-muted'}">{e.kind}</span>

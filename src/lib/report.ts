@@ -1,9 +1,7 @@
 // One assistant reply as a PDF: its Markdown text and its charts, in order. Tool steps stay out.
 import { marked, type Token, type Tokens } from 'marked';
 import { jsPDF } from 'jspdf';
-import { svg2pdf } from 'svg2pdf.js';
 import { api } from './api';
-import { chartSvg } from './charts';
 import type { ChartPart, Part } from './chatModel';
 
 const PAGE_MARGIN = 50;
@@ -273,7 +271,10 @@ class Writer {
     this.y += 10;
   }
 
-  async chart(svg: string, height: number, title?: string) {
+  async chart(part: ChartPart) {
+    const [{ chartSvg }, { svg2pdf }] = await Promise.all([import('./charts'), import('svg2pdf.js')]);
+    const height = this.width * 0.5;
+    const title = part.spec.title;
     this.doc.setFont('helvetica', 'bold');
     this.doc.setFontSize(12);
     const lines: string[] = title ? this.doc.splitTextToSize(pdfText(title), this.width) : [];
@@ -289,7 +290,8 @@ class Writer {
     // svg2pdf reads styles of a node in the document.
     const host = document.createElement('div');
     host.style.cssText = 'position:fixed;left:-10000px;top:0;';
-    host.innerHTML = svg;
+    // Drawn larger than the page and scaled down, so the labels come out small and sharp.
+    host.innerHTML = chartSvg(printable(part), 720, 360);
     document.body.append(host);
     try {
       await svg2pdf(host.firstElementChild as Element, this.doc, { x: PAGE_MARGIN, y: this.y, width: this.width, height });
@@ -338,9 +340,7 @@ export async function replyPdf({ title, meta, parts }: ReportInput): Promise<{ b
     if (p.kind === 'text') {
       for (const t of docs[i]!) if (t !== own) w.block(t);
     } else if (p.kind === 'chart') {
-      const height = w.width * 0.5;
-      // Drawn larger than the page and scaled down, so the labels come out small and sharp.
-      await w.chart(chartSvg(printable(p), 720, 360), height, p.spec.title);
+      await w.chart(p);
     }
   }
 

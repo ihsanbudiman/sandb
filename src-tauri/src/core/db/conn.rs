@@ -348,15 +348,20 @@ impl Conn {
             Conn::Sqlite(o) => {
                 let mut h = o.connection().lock_handle().await.ok()?;
                 // SAFETY: the locked handle gives exclusive access to the live connection.
-                let state = unsafe {
-                    libsqlite3_sys::sqlite3_txn_state(h.as_raw_handle().as_ptr(), std::ptr::null())
+                let (autocommit, state) = unsafe {
+                    let db = h.as_raw_handle().as_ptr();
+                    (
+                        libsqlite3_sys::sqlite3_get_autocommit(db) != 0,
+                        libsqlite3_sys::sqlite3_txn_state(db, std::ptr::null()),
+                    )
                 };
                 if state < 0 {
                     return None;
                 }
                 Some(Tx {
                     engine: SqlEngine::Sqlite,
-                    open: state != libsqlite3_sys::SQLITE_TXN_NONE,
+                    // A deferred BEGIN has disabled autocommit even before its first read.
+                    open: !autocommit || state != libsqlite3_sys::SQLITE_TXN_NONE,
                     aborted: false,
                     changed: Some(state == libsqlite3_sys::SQLITE_TXN_WRITE),
                 })

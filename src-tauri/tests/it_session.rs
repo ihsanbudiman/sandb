@@ -269,17 +269,12 @@ async fn mysql_ddl_commits_implicitly() {
     {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
-            run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
-            let s = status(c, "tab").await.unwrap();
-            assert!(s.pending, "{l}: insert not pending before DDL");
-
             let t2 = format!("{t}_ddl");
             let r = run_tab_ok(c, &format!("CREATE TABLE {t2} (a int)"), "tab").await;
             assert!(
                 r.notices
                     .iter()
-                    .any(|n| n.contains("MySQL committed this DDL immediately")
-                        && n.contains("including the uncommitted changes")),
+                    .any(|n| n.contains("MySQL committed this DDL immediately")),
                 "{l}: notices {:?}",
                 r.notices
             );
@@ -288,9 +283,7 @@ async fn mysql_ddl_commits_implicitly() {
                 None,
                 "{l}: the implicit commit still looks open"
             );
-            // The insert before the DDL was committed with it.
-            let other = run_other(c, &format!("SELECT count(*) AS n FROM {t}")).await;
-            assert_eq!(cell(&other, 0, 0), json!(1), "{l}");
+            run_other(c, &format!("SELECT a FROM {t2}")).await;
             run_other(c, &format!("DROP TABLE {t2}")).await;
         })
         .await;
@@ -350,18 +343,14 @@ async fn user_typed_commit_inside_a_run_is_seen() {
     }
 }
 
-/// A run without pending changes leaves no transaction behind: a plain read never opens one,
-/// and a transaction that wrote nothing ends with the run — otherwise the tab would sit idle
-/// in a transaction the user cannot end (Commit / Rollback need pending work).
+/// A plain read never opens a transaction, and clean automatic transactions end with the run.
 #[tokio::test]
 async fn clean_runs_leave_no_transaction() {
     for c in prod_all() {
         let l = &c.label;
         let not_plain = match c.conn.engine {
             Engine::Pg => "SET LOCAL statement_timeout = 5000; SELECT 1",
-            // MySQL: `innodb_trx` needs PROCESS, which the test user lacks, so any
-            // write-capable statement (even `SET @x`) counts as pending there.
-            Engine::Mysql => "START TRANSACTION; SELECT 1",
+            Engine::Mysql => "START TRANSACTION; SELECT 1; ROLLBACK",
             Engine::Sqlite => "PRAGMA user_version; SELECT 1",
             Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
@@ -378,6 +367,32 @@ async fn clean_runs_leave_no_transaction() {
             rollback(c, "tab").await.unwrap();
         })
         .await;
+    }
+}
+
+#[tokio::test]
+async fn explicit_transactions_survive_runs_and_reject_nested_starts() {
+    for c in prod_all() {
+        with_scratch(&c, async |c: &Ctx, t: &str| {
+            let begin = if c.conn.engine == Engine::Mysql { "START TRANSACTION" } else { "BEGIN" };
+            run_tab_ok(c, begin, "tab").await;
+            assert!(status(c, "tab").await.is_some_and(|s| s.tx_open && !s.pending), "{}", c.label);
+            run_tab_ok(c, "SELECT 1", "tab").await;
+            assert!(status(c, "tab").await.is_some_and(|s| s.tx_open), "{}", c.label);
+            run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
+            let err = run_tab(c, begin, "tab").await.unwrap_err();
+            assert!(err.message.contains("already has an open transaction"), "{err:?}");
+            assert!(status(c, "tab").await.is_some_and(|s| s.pending && !s.aborted));
+            let count = format!("SELECT count(*) FROM {t}");
+            assert_eq!(cell(&run_tab_ok(c, &count, "tab").await, 0, 0), json!(1));
+            assert_eq!(cell(&run_other(c, &count).await, 0, 0), json!(0));
+            rollback(c, "tab").await.unwrap();
+            assert_eq!(cell(&run_other(c, &count).await, 0, 0), json!(0));
+
+            run_tab_ok(c, &format!("{begin}; INSERT INTO {t} VALUES (2, 2); COMMIT"), "tab").await;
+            assert_eq!(status(c, "tab").await, None);
+            assert_eq!(cell(&run_other(c, &count).await, 0, 0), json!(1));
+        }).await;
     }
 }
 
@@ -465,6 +480,36 @@ async fn tabs_on_one_connection_have_separate_sessions() {
         );
     })
     .await;
+}
+
+/// A display label does not choose write permissions or reconnect an open transaction.
+#[tokio::test]
+async fn custom_label_is_independent_of_sqlite_write_protection() {
+    let (dir, st) = common::state();
+    let file = dir.path().join("labels.db");
+    std::fs::File::create(&file).unwrap();
+    let mut i = common::sqlite_input(&file, false);
+    i.env = Env::Production;
+    i.env_label = "Finance EU".into();
+    let c = common::ctx_in(dir, st, "custom", i.clone(), None);
+    run_other(&c, "CREATE TABLE t (n INTEGER)").await;
+    run_tab_ok(&c, "INSERT INTO t VALUES (1)", "tab").await;
+    i.env_label = "QA".into();
+    c.st.update_connection(&c.conn.id, i.clone(), None).await.unwrap();
+    assert!(status(&c, "tab").await.is_some());
+    assert_eq!(cell(&run_other(&c, "SELECT COUNT(*) FROM t").await, 0, 0), json!(0));
+    rollback(&c, "tab").await.unwrap();
+
+    i.env = Env::Local;
+    c.st.update_connection(&c.conn.id, i.clone(), None).await.unwrap();
+    run_tab_ok(&c, "INSERT INTO t VALUES (2)", "tab").await;
+    assert_eq!(cell(&run_other(&c, "SELECT n FROM t").await, 0, 0), json!(2));
+    assert_eq!(status(&c, "tab").await, None);
+
+    i.read_only = true;
+    c.st.update_connection(&c.conn.id, i, None).await.unwrap();
+    let err = run_tab(&c, "INSERT INTO t VALUES (3)", "tab").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::ConnectionReadOnly);
 }
 
 /// Non-Production connections keep phase-2 autocommit behaviour even when a run names a tab.
@@ -805,9 +850,8 @@ async fn write_after_a_typed_commit_stays_pending() {
     }
 }
 
-/// MySQL `ALTER …; UPDATE …` in one run: the ALTER commits implicitly (sweeping the earlier
-/// pending insert, which the notice says), and the UPDATE after it runs in a new transaction
-/// instead of autocommitting.
+/// MySQL must not sweep pending work into a DDL commit, even in the middle of one run.
+/// After the user resolves that work, DDL can run and later DML is transactional again.
 #[tokio::test]
 async fn mysql_write_after_implicit_commit_stays_pending() {
     for c in prod(Engine::Mysql, common::mysql())
@@ -817,10 +861,22 @@ async fn mysql_write_after_implicit_commit_stays_pending() {
         let l = &c.label;
         with_scratch(&c, async |c: &Ctx, t: &str| {
             run_other(c, &format!("INSERT INTO {t} VALUES (1, 1)")).await;
-            run_tab_ok(c, &format!("INSERT INTO {t} VALUES (2, 2)"), "tab").await;
+            let alter = format!("ALTER TABLE {t} ADD COLUMN w int");
+            let e = run_tab(c, &format!("INSERT INTO {t} VALUES (2, 2); {alter}"), "tab")
+                .await.unwrap_err();
+            assert!(e.message.contains("Statement 2 of 2 was not run"), "{e:?}");
+            let e = run_tab(c, &alter, "tab").await.unwrap_err();
+            assert!(e.message.contains("may implicitly commit"), "{e:?}");
+            let e = run_tab(c, &format!("OPTIMIZE TABLE {t}"), "tab").await.unwrap_err();
+            assert!(e.message.contains("may implicitly commit"), "{e:?}");
+            assert!(status(c, "tab").await.is_some_and(|s| s.pending));
+            let count = format!("SELECT count(*) FROM {t}");
+            assert_eq!(cell(&run_tab_ok(c, &count, "tab").await, 0, 0), json!(2));
+            assert_eq!(cell(&run_other(c, &count).await, 0, 0), json!(1));
+            rollback(c, "tab").await.unwrap();
             let r = run_tab_ok(
                 c,
-                &format!("ALTER TABLE {t} ADD COLUMN w int; UPDATE {t} SET v = 99 WHERE id = 1"),
+                &format!("{alter}; UPDATE {t} SET v = 99 WHERE id = 1"),
                 "tab",
             )
             .await;
@@ -828,7 +884,6 @@ async fn mysql_write_after_implicit_commit_stays_pending() {
                 r.notices
                     .iter()
                     .any(|n| n.contains("MySQL committed this DDL immediately")
-                        && n.contains("including the uncommitted changes")
                         && n.contains("new transaction")),
                 "{l}: notices {:?}",
                 r.notices
@@ -840,8 +895,8 @@ async fn mysql_write_after_implicit_commit_stays_pending() {
             );
             let other = run_other(c, &format!("SELECT v FROM {t} ORDER BY id")).await;
             assert_eq!(
-                other.statements[0].row_count, 2,
-                "{l}: the insert was swept"
+                other.statements[0].row_count, 1,
+                "{l}: the rolled-back insert was visible"
             );
             assert_eq!(
                 cell(&other, 0, 0),
@@ -853,6 +908,37 @@ async fn mysql_write_after_implicit_commit_stays_pending() {
             assert_eq!(cell(&other, 0, 0), json!(1), "{l}");
         })
         .await;
+    }
+}
+
+#[tokio::test]
+async fn mysql_comment_markers_in_literals_do_not_block_tab_queries() {
+    for c in prod(Engine::Mysql, 0) {
+        with_scratch(&c, async |c: &Ctx, t: &str| {
+            for marker in ["/*! text */", "/*M! text */"] {
+                let select = format!("SELECT '{marker}'");
+                assert_eq!(cell(&run_tab_ok(c, &select, "tab").await, 0, 0), json!(marker));
+                run_tab_ok(c, "START TRANSACTION", "tab").await;
+                let insert = format!("INSERT INTO {t} VALUES (1, LENGTH('{marker}'))");
+                run_tab_ok(c, &insert, "tab").await;
+                assert!(status(c, "tab").await.is_some_and(|s| s.pending));
+                rollback(c, "tab").await.unwrap();
+            }
+        }).await;
+    }
+}
+
+#[tokio::test]
+async fn mysql_does_not_send_an_opaque_batch_to_an_empty_tab() {
+    for c in prod(Engine::Mysql, 0) {
+        with_scratch(&c, async |c: &Ctx, t: &str| {
+            let sql = format!("INSERT INTO {t} VALUES (1, 1); OPTIMIZE TABLE {t}");
+            let e = run_tab(c, &sql, "tab").await.unwrap_err();
+            assert!(e.message.contains("Run its statements separately"), "{e:?}");
+            assert_eq!(status(c, "tab").await, None);
+            let other = run_other(c, &format!("SELECT count(*) FROM {t}")).await;
+            assert_eq!(cell(&other, 0, 0), json!(0));
+        }).await;
     }
 }
 
