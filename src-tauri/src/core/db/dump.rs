@@ -7,7 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::TryStreamExt;
 use sqlx::mysql::MySqlRow;
 use sqlx::postgres::PgRow;
-use sqlx::{Decode, MySql, MySqlPool, PgPool, Row, Sqlite, SqlitePool, TypeInfo, ValueRef};
+use sqlx::{
+    Decode, MySql, MySqlPool, PgPool, Row, Sqlite, SqliteConnection, SqlitePool, TypeInfo, ValueRef,
+};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::core::connections::Connection;
@@ -35,7 +37,7 @@ pub async fn table_ddl(
         DbPool::Pg(p) => pg_ddl(&p, schema.unwrap_or("public"), table).await?.ddl,
         DbPool::MySql(p) => mysql_ddl(&p, database, table).await?.ddl,
         DbPool::Sqlite(p) => {
-            let mut schema = sqlite_ddl(&p, table).await?;
+            let mut schema = sqlite_ddl(&mut *p.acquire().await?, table).await?;
             schema.definitions.extend(schema.triggers);
             schema.definitions.join("\n")
         }
@@ -729,14 +731,14 @@ struct SqliteSchema {
     view: bool,
 }
 
-async fn sqlite_ddl(p: &SqlitePool, table: &str) -> Result<SqliteSchema, AppError> {
+async fn sqlite_ddl(c: &mut SqliteConnection, table: &str) -> Result<SqliteSchema, AppError> {
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT type, sql FROM sqlite_master WHERE tbl_name = ? AND sql IS NOT NULL \
          ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'view' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, \
            name",
     )
     .bind(table)
-    .fetch_all(p)
+    .fetch_all(c)
     .await?;
     let view = match rows.first() {
         Some((t, _)) if t == "table" => false,
@@ -766,7 +768,8 @@ async fn sqlite_export<W: AsyncWrite + Unpin>(
     req: &TableExportRequest,
     out: &mut W,
 ) -> Result<u64, AppError> {
-    let schema = sqlite_ddl(p, &req.table).await?;
+    let mut tx = p.begin().await?;
+    let schema = sqlite_ddl(&mut tx, &req.table).await?;
     write_ddl(
         out,
         &header(conn, engine, &req.table),
@@ -774,10 +777,11 @@ async fn sqlite_export<W: AsyncWrite + Unpin>(
     )
     .await?;
     let rows = if req.data && !schema.view {
-        sqlite_export_rows(p, &req.table, out).await?
+        sqlite_export_rows(&mut tx, &req.table, out).await?
     } else {
         0
     };
+    tx.commit().await?;
     // The exported rows already include any changes made by the source triggers.
     for trigger in schema.triggers {
         out.write_all(trigger.as_bytes()).await?;
@@ -787,7 +791,7 @@ async fn sqlite_export<W: AsyncWrite + Unpin>(
 }
 
 async fn sqlite_export_rows<W: AsyncWrite + Unpin>(
-    p: &SqlitePool,
+    c: &mut SqliteConnection,
     table: &str,
     out: &mut W,
 ) -> Result<u64, AppError> {
@@ -795,7 +799,7 @@ async fn sqlite_export_rows<W: AsyncWrite + Unpin>(
     let names: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
             .bind(table)
-            .fetch_all(p)
+            .fetch_all(&mut *c)
             .await?;
     if names.is_empty() {
         return Ok(0);
@@ -809,7 +813,6 @@ async fn sqlite_export_rows<W: AsyncWrite + Unpin>(
     let select = format!("SELECT {list} FROM {qualified}");
     out.write_all(b"\n").await?;
     let mut ins = Inserts::new(out, format!("INSERT INTO {qualified} ({list}) VALUES"));
-    let mut c = p.acquire().await?;
     let mut rows = sqlx::raw_sql(&select).fetch(&mut *c);
     let mut buf = String::new();
     while let Some(row) = rows.try_next().await? {
@@ -824,7 +827,31 @@ async fn sqlite_export_rows<W: AsyncWrite + Unpin>(
         buf.push(')');
         ins.row(&buf).await?;
     }
-    ins.finish().await
+    drop(rows);
+    let count = ins.finish().await?;
+    // Restored rows alone cannot recover AUTOINCREMENT IDs that were deleted.
+    let has_sequences: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence')",
+    )
+    .fetch_one(&mut *c)
+    .await?;
+    if has_sequences
+        && let Some(seq) = sqlx::query_scalar::<_, i64>(
+            "SELECT seq FROM sqlite_sequence WHERE name = ? AND typeof(seq) = 'integer'",
+        )
+        .bind(table)
+        .fetch_optional(&mut *c)
+        .await?
+    {
+        let mut name = String::new();
+        push_quoted(&mut name, table);
+        let sql = format!(
+            "DELETE FROM sqlite_sequence WHERE name = {name};\n\
+             INSERT INTO sqlite_sequence (name, seq) VALUES ({name}, {seq});\n"
+        );
+        out.write_all(sql.as_bytes()).await?;
+    }
+    Ok(count)
 }
 
 pub(crate) fn push_sqlite_cell(
@@ -1082,6 +1109,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn sqlite_export_preserves_autoincrement_after_deletions() {
+        const TABLE: &str = "CREATE TABLE \"log's\" (id INTEGER PRIMARY KEY AUTOINCREMENT);";
+        let mut src = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        src.execute(TABLE).await.unwrap();
+        src.execute("INSERT INTO \"log's\" VALUES (1), (50)")
+            .await
+            .unwrap();
+        src.execute("DELETE FROM \"log's\" WHERE id = 50")
+            .await
+            .unwrap();
+        for remaining in [1, 0] {
+            let mut data = Vec::new();
+            assert_eq!(
+                sqlite_export_rows(&mut src, "log's", &mut data)
+                    .await
+                    .unwrap(),
+                remaining
+            );
+            let mut dst = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            dst.execute(TABLE).await.unwrap();
+            dst.execute(sqlx::raw_sql(std::str::from_utf8(&data).unwrap()))
+                .await
+                .unwrap();
+            let next: i64 = sqlx::query_scalar("INSERT INTO \"log's\" DEFAULT VALUES RETURNING id")
+                .fetch_one(&mut dst)
+                .await
+                .unwrap();
+            assert_eq!(next, 51, "restoring {remaining} rows must not recycle IDs");
+            src.execute("DELETE FROM \"log's\"").await.unwrap();
+        }
+    }
+
     const SETUP: &str = "\
         CREATE TABLE \"it's\" (id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL, \
           data BLOB, twice INTEGER GENERATED ALWAYS AS (id * 2) STORED); \
@@ -1107,7 +1167,9 @@ mod tests {
         .unwrap();
         (&mut c).execute(sqlx::raw_sql(SETUP)).await.unwrap();
         c.close().await.unwrap();
-        let conn = st.create_connection(input(&file.to_string_lossy()), None).unwrap();
+        let conn = st
+            .create_connection(input(&file.to_string_lossy()), None)
+            .unwrap();
 
         let ddl = table_ddl(&st, &conn.id, "main", None, "it's")
             .await
