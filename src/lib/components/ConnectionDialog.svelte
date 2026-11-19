@@ -63,6 +63,7 @@
   let saveError = $state('');
   // A newer test or reset invalidates an in-flight test.
   let run = 0;
+  let originalSettings = '';
   // The backend's split of the typed string, without its password: the saved one is compared with it.
   let uriPreview = $state<{ engine: Engine; text: string; parts: MongoUriParts | RedisUriParts | null } | null>(null);
 
@@ -149,6 +150,7 @@
     if (multiHost) mode = 'fields';
     authSource = c.authSource;
     resetStatus();
+    originalSettings = settingsWithoutLabel();
   }
 
   function resetStatus() {
@@ -228,6 +230,10 @@
 
   function input(): ConnectionInput & Pick<Connection, 'uri' | 'authSource'> {
     return { name: name.trim(), engine, env, envLabel, host: host.trim(), port: Number(port) || 0, database: redisEngine ? redisDatabase() : database.trim(), user: user.trim(), ssl, file: file.trim(), aiWrite, readOnly, uri: useUri ? uri.trim() : '', authSource: mongo && !useUri ? authSource.trim() : '', redis: redisSettings() };
+  }
+
+  function settingsWithoutLabel(): string {
+    return JSON.stringify({ ...input(), envLabel: undefined });
   }
 
   // Fields that decide where the connection goes; a test result is stale once any of them changes.
@@ -351,17 +357,19 @@
       adopt(saved);
       return;
     }
-    const next = payload();
+    // A label-only edit must neither settle pending work nor send form defaults as target changes.
+    const labelOnly = envLabel !== cur.envLabel && !passwordDirty && !tested && settingsWithoutLabel() === originalSettings;
+    const next = labelOnly ? { ...cur, envLabel } : payload();
     const target = typedTarget();
     const nextDb = redisEngine ? target.database : defaultDb(next);
     // Only a change of target or database touches the open result; name, env and AI access do not.
-    const dbChanged = cur.database !== nextDb || !sameTarget(cur, target);
+    const dbChanged = !labelOnly && (cur.database !== nextDb || !sameTarget(cur, target));
     if (dbChanged && cur.id === active().id && !(await canswitch())) return;
-    if (!(await canupdate(cur, dbChanged))) return;
+    if (!labelOnly && !(await canupdate(cur, dbChanged))) return;
     saving = true;
     saveError = '';
     try {
-      const saved = await api.updateConnection({ id: cur.id, input: next, password: passwordArg() });
+      const saved = await api.updateConnection({ id: cur.id, input: next, password: labelOnly ? null : passwordArg() });
       Object.assign(cur, saved);
     } catch (e) {
       saveError = errorText(e);

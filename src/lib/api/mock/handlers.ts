@@ -237,7 +237,9 @@ export async function updateConnection(args: UpdateConnectionArgs) {
   const cur = find(args.id);
   const i = normalize(args.input);
   const c = build(cur.id, i, cur.version, cur.topology);
-  replace(c);
+  const changed = (Object.keys(cur) as (keyof Connection)[]).some((k) =>
+    k !== 'envLabel' && k !== 'name' && k !== 'aiWrite' && JSON.stringify(cur[k]) !== JSON.stringify(c[k]));
+  replace(c, args.password != null || changed);
   return viewOf(c);
 }
 
