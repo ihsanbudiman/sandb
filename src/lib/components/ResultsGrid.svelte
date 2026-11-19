@@ -39,7 +39,7 @@
   import { loadRedisCell, redisCellProblem, redisDeleteProblem, redisEditProblem, redisOriginal } from '../redisEdit';
   import { cellText, copyValue, csvCell, formatCell, isBytes, isCutOff, moreRows } from '../results';
   import { isBooleanType, isNow, isTemporalType, NOW_VALUE } from '../sql/value';
-  import { KEYS } from '../keys';
+  import { KEYS, shortcutHint } from '../keys';
   import { exportCsv as runExportCsv, exportDocuments as runExportDocuments, exportSql as runExportSql, type ExportMessage } from '../gridExport';
   import { isPlan, reviewPlan } from '../planReview';
   import type { Tab } from '../tabs.svelte';
@@ -876,7 +876,7 @@
               <th class="group/th relative h-8 border-b border-l border-line bg-surface px-2.5 py-0 text-left font-normal" title={result.types?.[ci]}>
                 {#if pickedCols[c]}<span class="pointer-events-none absolute inset-0 bg-accent/10"></span>{/if}
                 <div class="relative flex w-full items-center gap-1.5">
-                  <button class="focus-ring flex min-w-0 flex-1 items-baseline gap-1.5 rounded text-left whitespace-nowrap select-none" title="Select column (⌘ add, ⇧ range)" onclick={(e) => pickColumn(ci, e)}>
+                  <button class="focus-ring flex min-w-0 flex-1 items-baseline gap-1.5 rounded text-left whitespace-nowrap select-none" title={`Select column (${shortcutHint('Mod')} add, Shift range)`} onclick={(e) => pickColumn(ci, e)}>
                     <span class="font-sans text-sm font-semibold {pickedCols[c] || sort?.column === c ? 'text-accent' : 'text-ink'}">{c}</span>
                     {#if result.types?.[ci]}<span class="th max-w-72 min-w-0 truncate">{result.types?.[ci]}</span>{/if}
                   </button>

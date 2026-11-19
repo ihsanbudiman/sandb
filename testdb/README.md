@@ -1,5 +1,19 @@
 # sandb test databases
 
+## Interface regression tests
+
+The UI suite uses the browser mock; it does not connect to a database or an AI provider.
+
+```sh
+pnpm test:unit
+pnpm exec playwright install chromium
+pnpm test:ui
+```
+
+Node.js 22.18+ is required for the TypeScript unit tests. Playwright starts Vite automatically (or reuses a running dev server locally).
+
+## Database fixtures
+
 Throwaway databases and a mock LLM for sandb tests. Compose project: `sandb-test`.
 
 The host ports are keys in `.env.test` (bound to 127.0.0.1); compose, the scripts and the

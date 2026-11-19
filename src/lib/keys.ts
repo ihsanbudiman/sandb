@@ -3,18 +3,37 @@
  * entries, so a binding and its label cannot drift apart. `combo` is a CodeMirror key string; `hint`
  * is the text the UI shows.
  */
+export function shortcutHint(combo: string, platform = typeof navigator === 'undefined' ? '' : navigator.platform): string {
+  const mac = /Mac|iPhone|iPad|iPod/i.test(platform);
+  const parts = combo.split('-');
+  const key = ['Mod', 'Ctrl', 'Alt', 'Shift'].includes(parts.at(-1)!) ? '' : parts.pop()!;
+  if (mac) {
+    return `${parts.includes('Ctrl') ? '⌃' : ''}${parts.includes('Alt') ? '⌥' : ''}${parts.includes('Shift') ? '⇧' : ''}${parts.includes('Mod') ? '⌘' : ''}${key === 'Enter' ? '↵' : key.toUpperCase()}`;
+  }
+  return [
+    ...(parts.includes('Mod') || parts.includes('Ctrl') ? ['Ctrl'] : []),
+    ...(parts.includes('Alt') ? ['Alt'] : []),
+    ...(parts.includes('Shift') ? ['Shift'] : []),
+    key === 'Enter' ? 'Enter' : key.toUpperCase(),
+  ].filter(Boolean).join('+');
+}
+
+function shortcut<const T extends string>(combo: T) {
+  return { combo, hint: shortcutHint(combo) };
+}
+
 export const KEYS = {
-  run: { combo: 'Mod-Enter', hint: '⌘↵' },
-  runNew: { combo: 'Mod-Shift-Enter', hint: '⇧⌘↵' },
-  runAll: { combo: 'Alt-x', hint: '⌥X' },
-  format: { combo: 'Mod-Shift-f', hint: '⇧⌘F' },
-  save: { combo: 'Mod-s', hint: '⌘S' },
-  saveAs: { combo: 'Mod-Shift-s', hint: '⇧⌘S' },
-  palette: { combo: 'Mod-k', hint: '⌘K' },
-  toggleSteps: { combo: 'Mod-Shift-h', hint: '⇧⌘H' },
-  foldStatement: { combo: 'Mod-Alt-[', hint: '' },
-  foldAll: { combo: 'Ctrl-Alt-[', hint: '' },
-  unfoldAll: { combo: 'Ctrl-Alt-]', hint: '' },
+  run: shortcut('Mod-Enter'),
+  runNew: shortcut('Mod-Shift-Enter'),
+  runAll: shortcut('Alt-x'),
+  format: shortcut('Mod-Shift-f'),
+  save: shortcut('Mod-s'),
+  saveAs: shortcut('Mod-Shift-s'),
+  palette: shortcut('Mod-k'),
+  toggleSteps: shortcut('Mod-Shift-h'),
+  foldStatement: shortcut('Mod-Alt-['),
+  foldAll: shortcut('Ctrl-Alt-['),
+  unfoldAll: shortcut('Ctrl-Alt-]'),
 } as const;
 
 const MODIFIERS = ['Mod', 'Shift', 'Alt', 'Ctrl'] as const;

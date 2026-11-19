@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +45,15 @@ jobs:
 
       - name: Frontend build and bundle checks
         run: pnpm test:bundle
+
+      - name: Frontend unit tests
+        run: pnpm test:unit
+
+      - name: Browser dependencies
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Interface regression tests
+        run: pnpm test:ui
 
       - name: Rust lints
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-features --all-targets -- -D warnings

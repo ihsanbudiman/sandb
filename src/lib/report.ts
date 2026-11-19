@@ -274,6 +274,18 @@ class Writer {
   async chart(part: ChartPart) {
     const [{ chartSvg }, { svg2pdf }] = await Promise.all([import('./charts'), import('svg2pdf.js')]);
     const height = this.width * 0.5;
+    const title = part.spec.title;
+    this.doc.setFont('helvetica', 'bold');
+    this.doc.setFontSize(12);
+    const lines: string[] = title ? this.doc.splitTextToSize(pdfText(title), this.width) : [];
+    const lineHeight = 18;
+    this.room(height + lines.length * lineHeight + 10);
+    this.doc.setTextColor(INK);
+    for (const line of lines) {
+      this.room(lineHeight);
+      this.doc.text(line, PAGE_MARGIN, this.y + 12);
+      this.y += lineHeight;
+    }
     this.room(height + 10);
     // svg2pdf reads styles of a node in the document.
     const host = document.createElement('div');
