@@ -140,7 +140,9 @@ services:
           until redis-cli -p "$$p" PING >/dev/null 2>&1; do sleep 0.1; done
         done
         redis-cli --cluster create "127.0.0.1:$$REDIS_CLUSTER_PORT_1" "127.0.0.1:$$REDIS_CLUSTER_PORT_2" "127.0.0.1:$$REDIS_CLUSTER_PORT_3" --cluster-replicas 0 --cluster-yes
-        until redis-cli -p "$$REDIS_CLUSTER_PORT_1" CLUSTER INFO | grep -q '^cluster_state:ok'; do sleep 0.1; done
+        for p in "$${ports[@]}"; do
+          until redis-cli -p "$$p" CLUSTER INFO | grep -q '^cluster_state:ok'; do sleep 0.1; done
+        done
         redis-cli -c -e -p "$$REDIS_CLUSTER_PORT_1" < /seed/03_cluster.redis
         for p in "$${ports[@]}"; do
           redis-cli -e -p "$$p" < /seed/02_users.redis
