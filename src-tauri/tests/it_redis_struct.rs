@@ -112,10 +112,10 @@ async fn large_hash_refuses_preview_but_exports_every_field_in_bounded_lines() {
         assert_eq!(stmt.args[1], b"big:hash");
         assert_eq!(stmt.args.len(), 2_002);
         batches += 1;
-        for pair in stmt.args[2..].chunks_exact(2) {
-            let field = std::str::from_utf8(&pair[0]).unwrap();
+        for [field, value] in stmt.args[2..].as_chunks::<2>().0 {
+            let field = std::str::from_utf8(field).unwrap();
             let number = field.strip_prefix("field:").unwrap();
-            assert_eq!(pair[1], format!("value:{number}").as_bytes());
+            assert_eq!(value, format!("value:{number}").as_bytes());
             fields[number.parse::<usize>().unwrap() - 1] = true;
         }
     }
