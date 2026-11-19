@@ -235,20 +235,18 @@ pub fn catalog() -> impl Iterator<Item = (&'static str, ToolKind)> {
 }
 
 /// OpenAI function tool definitions for the engines of `sources`. The schema tools serve every
-/// source; statement tools are offered for each family present. Every database tool takes
+/// source; write tools only serve sources where proposals are enabled. Every database tool takes
 /// `source`, an enum of the ids it serves; it is required when the chat has more than one
 /// source. `load_skill` takes the skill names that fit the chat's engines instead.
 pub fn definitions(sources: &[Source], engines: Engines) -> Value {
-    let ids = |serves: Serves| -> Vec<&str> {
-        sources
-            .iter()
-            .filter(|s| serves.matches(s.conn.engine))
-            .map(|s| s.id.as_str())
-            .collect()
-    };
     let mut defs = Vec::new();
     for t in &TOOLS {
-        let ids = ids(t.serves);
+        let ids: Vec<_> = sources
+            .iter()
+            .filter(|s| t.serves.matches(s.conn.engine))
+            .filter(|s| t.kind != ToolKind::Write || s.write_mode().is_none())
+            .map(|s| s.id.as_str())
+            .collect();
         if ids.is_empty() {
             continue;
         }
@@ -285,9 +283,10 @@ pub fn definitions(sources: &[Source], engines: Engines) -> Value {
     Value::Array(defs)
 }
 
-/// A mixed chat's engine-specific tools name the corresponding tool for each other family.
+/// A mixed chat's read and chart tools name the corresponding tool for each other family.
 fn description(t: &Tool, base: Cow<'static, str>, engines: Engines) -> Cow<'static, str> {
-    if !engines.is_mixed() {
+    // A write on a different source is not an alternative to the requested change.
+    if !engines.is_mixed() || t.kind == ToolKind::Write {
         return base;
     }
     let family = match t.serves {
@@ -618,7 +617,7 @@ impl ToolContext<'_> {
                     ids()
                 ))
             }),
-            None if self.sources.len() == 1 => Ok(&self.sources[0]),
+            None if self.sources.len() == 1 && !args.contains_key("source") => Ok(&self.sources[0]),
             None => Err(AppError::invalid(format!(
                 "The tool needs \"source\", one of: {}",
                 ids()
@@ -852,6 +851,9 @@ fn statement<'a>(
     args: &'a Map<String, Value>,
 ) -> Result<(&'a Source, &'a str), AppError> {
     let src = ctx.source(args)?;
+    if t.kind == ToolKind::Write {
+        writes_allowed(src)?;
+    }
     if !t.serves.matches(src.conn.engine) {
         return Err(wrong_engine(src, t));
     }
@@ -1266,7 +1268,6 @@ async fn write_tool(
     args: &Map<String, Value>,
 ) -> Result<Done, AppError> {
     let (src, text) = statement(ctx, t, args)?;
-    writes_allowed(src)?;
     // Parsed here so the preview never shows text that does not parse; the write parses again
     // when it runs.
     let info = ops::write_preview(text, src.conn.engine, &src.database)?;
@@ -1421,6 +1422,48 @@ mod tests {
             .unwrap()
     }
 
+    fn writable(mut source: Source) -> Source {
+        source.allow_writes = true;
+        source
+    }
+
+    #[test]
+    fn write_tools_only_offer_sources_that_allow_proposals() {
+        let mut read_only = writable(source("db2", "archive"));
+        read_only.conn.read_only = true;
+        let mut ai_off = writable(redis_source("db3", "cache"));
+        ai_off.conn.ai_write = false;
+        let sources = [
+            writable(source("db1", "staging")),
+            read_only,
+            ai_off,
+            mongo_source("db4", "shop"),
+        ];
+        let defs = definitions(&sources, Engines::of(&sources));
+        let write = &tool(&defs, "propose_write")["function"]["parameters"];
+        assert_eq!(write["properties"]["source"]["enum"], json!(["db1"]));
+        assert!(
+            write["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("source"))
+        );
+        assert_eq!(
+            tool(&defs, "run_read_query")["function"]["parameters"]["properties"]["source"]["enum"],
+            json!(["db1", "db2"])
+        );
+        // Neither the catalog nor its routing hints suggest a blocked proposal.
+        for unavailable in ["propose_mongo_write", "propose_redis_write"] {
+            assert!(!defs.to_string().contains(unavailable));
+        }
+        let blocked = &sources[1..];
+        assert!(
+            !definitions(blocked, Engines::of(blocked))
+                .to_string()
+                .contains("propose_")
+        );
+    }
+
     /// The table is the one list: the definitions, the catalog and the dispatch agree, and each
     /// kind has one tool per engine it serves.
     #[test]
@@ -1429,7 +1472,8 @@ mod tests {
             source("db1", "a"),
             mongo_source("db2", "m"),
             redis_source("db3", "r"),
-        ];
+        ]
+        .map(writable);
         let defs = definitions(&sources, Engines::of(&sources));
         let defined = names(&defs);
         let catalogued: Vec<&str> = catalog().map(|(name, _)| name).collect();
@@ -1468,7 +1512,7 @@ mod tests {
 
     #[test]
     fn sql_only_chats_get_only_sql_and_shared_tools() {
-        let sources = [source("db1", "a")];
+        let sources = [writable(source("db1", "a"))];
         let defs = definitions(&sources, Engines::of(&sources));
         assert_eq!(
             names(&defs),
@@ -1488,7 +1532,7 @@ mod tests {
 
     #[test]
     fn mongo_only_chats_get_no_sql_tools() {
-        let sources = [mongo_source("db1", "m")];
+        let sources = [writable(mongo_source("db1", "m"))];
         let defs = definitions(&sources, Engines::of(&sources));
         assert_eq!(
             names(&defs),
@@ -1509,7 +1553,7 @@ mod tests {
 
     #[test]
     fn redis_only_chats_get_only_redis_and_shared_tools() {
-        let sources = [redis_source("db1", "r")];
+        let sources = [writable(redis_source("db1", "r"))];
         let defs = definitions(&sources, Engines::of(&sources));
         assert_eq!(
             names(&defs),
@@ -1542,7 +1586,7 @@ mod tests {
 
     #[test]
     fn mixed_chats_split_the_source_enum_per_engine() {
-        let sources = [source("db1", "pg"), mongo_source("db2", "m")];
+        let sources = [source("db1", "pg"), mongo_source("db2", "m")].map(writable);
         let defs = definitions(&sources, Engines::of(&sources));
         assert_eq!(defs.as_array().unwrap().len(), 9);
         let ids = |name: &str| {
@@ -1599,7 +1643,7 @@ mod tests {
 
     #[test]
     fn sql_and_redis_chats_name_only_the_other_present_family() {
-        let sources = [source("db1", "pg"), redis_source("db2", "r")];
+        let sources = [source("db1", "pg"), redis_source("db2", "r")].map(writable);
         let defs = definitions(&sources, Engines::of(&sources));
         assert_eq!(defs.as_array().unwrap().len(), 9);
         assert!(!defs.to_string().contains("Mongo"), "{defs}");
@@ -1775,7 +1819,8 @@ mod tests {
             source("db1", "pg"),
             mongo_source("db2", "m"),
             redis_source("db3", "r"),
-        ];
+        ]
+        .map(writable);
         let ctx = ToolContext {
             state: &state,
             sources: &sources,
@@ -2158,6 +2203,9 @@ mod tests {
             settings: &settings,
         };
         assert_eq!(ctx.source(&args(json!({}))).unwrap().id, "db1");
+        for bad in [Value::Null, json!(1), json!(" ")] {
+            assert!(ctx.source(&args(json!({"source": bad}))).is_err());
+        }
 
         let two = [source("db1", "a"), source("db2", "b")];
         let ctx = ToolContext {

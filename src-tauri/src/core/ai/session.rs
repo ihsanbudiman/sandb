@@ -659,7 +659,7 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"run_read_query"), "{names:?}");
-        assert!(names.contains(&"propose_write"), "{names:?}");
+        assert!(!names.contains(&"propose_write"), "{names:?}");
         assert!(!names.iter().any(|n| n.contains("mongo")), "{names:?}");
     }
 

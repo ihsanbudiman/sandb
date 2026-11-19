@@ -517,7 +517,8 @@ mod tests {
             "{TABLE} \
              WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 250) \
              INSERT INTO \"it's\" SELECT i, 'n' || i, i / 3.0, NULL FROM n; \
-             UPDATE \"it's\" SET name = 'o''k \\ \"q\"', score = NULL, data = X'00FF' WHERE id = 2;"
+             UPDATE \"it's\" SET name = 'o''k \\ \"q\" #NUL' || char(0, 0) || '終', \
+                 score = NULL, data = X'00FF' WHERE id = 2;"
         );
         (&mut c).execute(sqlx::raw_sql(&setup)).await.unwrap();
         c.close().await.unwrap();
@@ -569,6 +570,7 @@ mod tests {
         );
 
         let mut other = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        other.execute("PRAGMA encoding = 'UTF-16le'").await.unwrap();
         (&mut other).execute(sqlx::raw_sql(TABLE)).await.unwrap();
         (&mut other).execute(sqlx::raw_sql(&sql)).await.unwrap();
         let q = "SELECT id, name, score, hex(data) FROM \"it's\" ORDER BY id";
@@ -584,7 +586,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got, want);
-        assert_eq!(got[0].1.as_deref(), Some("o'k \\ \"q\""));
+        assert_eq!(got[0].1.as_deref(), Some("o'k \\ \"q\" #NUL\0\0終"));
 
         // An empty result writes the header only; a write or a missing table name writes nothing.
         let r = export_sql(&st, req("SELECT * FROM \"it's\" WHERE 0", "it's"), &path)

@@ -4,6 +4,8 @@
 //! tool takes a `connection` id and then runs the chat's own tool, so a read obeys the same
 //! guard, read-only session, privacy, row cap and time limit as a chat. Nothing here writes.
 
+use std::sync::LazyLock;
+
 use serde_json::{Map, Value, json};
 
 use crate::core::ai;
@@ -41,7 +43,12 @@ pub struct McpCall {
 }
 
 /// Every tool, in the order the client sees them.
-pub fn list() -> Vec<McpTool> {
+pub fn list() -> &'static [McpTool] {
+    static TOOLS: LazyLock<Vec<McpTool>> = LazyLock::new(build_tools);
+    &TOOLS
+}
+
+fn build_tools() -> Vec<McpTool> {
     let mut tools = vec![
         McpTool {
             name: "list_connections",
@@ -83,6 +90,9 @@ pub fn list() -> Vec<McpTool> {
             schema,
         });
     }
+    for tool in &mut tools {
+        tool.schema["additionalProperties"] = json!(false);
+    }
     tools
 }
 
@@ -102,15 +112,37 @@ fn database_param() -> Value {
 /// Runs one tool. A failure before the chat tool runs is the `{"error": …}` text too, so a
 /// client always sees why the call failed.
 pub async fn call(state: &AppState, name: &str, mut args: Map<String, Value>) -> McpCall {
+    let Some(tool) = list().iter().find(|t| t.name == name) else {
+        return failed(AppError::not_found(format!("Unknown tool {name}")));
+    };
+    // Never treat a misspelled or malformed target as permission to use the default.
+    let properties = tool.schema["properties"]
+        .as_object()
+        .expect("object schema");
+    for (key, value) in &args {
+        if !properties.contains_key(key) {
+            let allowed = properties.keys().cloned().collect::<Vec<_>>().join(", ");
+            let hint = if allowed.is_empty() {
+                "This tool takes no arguments.".into()
+            } else {
+                format!("Use only: {allowed}.")
+            };
+            return failed(AppError::invalid(format!(
+                "Unknown argument {key:?}. {hint}"
+            )));
+        }
+        if value.as_str().is_none_or(|s| s.trim().is_empty()) {
+            return failed(AppError::invalid(format!(
+                "Pass {key:?} as a non-empty string"
+            )));
+        }
+    }
     let mcp = match settings::load(state) {
         Ok(s) => s,
         Err(e) => return failed(e),
     };
     if name == "list_connections" {
         return shared(state, &mcp);
-    }
-    if name != "list_databases" && !DB_TOOLS.contains(&name) {
-        return failed(AppError::not_found(format!("Unknown tool {name}")));
     }
     let Some(id) = args
         .get("connection")
@@ -138,7 +170,16 @@ pub async fn call(state: &AppState, name: &str, mut args: Map<String, Value>) ->
             Err(e) => failed(e),
         };
     }
-    let database = target_database(&conn, args.get("database").and_then(Value::as_str));
+    let requested = args.get("database").and_then(Value::as_str);
+    if conn.engine == Engine::Sqlite && requested.is_some_and(|db| db.trim() != "main") {
+        return failed(AppError::invalid("SQLite only supports database \"main\""));
+    }
+    if conn.engine != Engine::Pg && args.contains_key("schema") {
+        return failed(AppError::invalid(
+            "Only PostgreSQL accepts a \"schema\" argument",
+        ));
+    }
+    let database = target_database(&conn, requested);
     if conn.engine == Engine::Mongo && database.is_empty() {
         return failed(AppError::invalid(format!(
             "Pass \"database\" for {}: the connection has no default database. Call list_databases",
@@ -152,10 +193,8 @@ pub async fn call(state: &AppState, name: &str, mut args: Map<String, Value>) ->
     };
     args.remove("connection");
     args.remove("database");
-    // The chat tool picks its source by `source`; here there is one, and MCP chose it.
-    args.remove("source");
     let source = Source {
-        id: "db1".into(),
+        id,
         conn,
         database,
         schema: None,
@@ -302,6 +341,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_targets_never_fall_back_to_the_default() {
+        let (dir, st) = state();
+        let id = sqlite_conn(&st, dir.path(), "db", 3).await;
+        share(&st, &[&id]);
+        let mut args = read_args(&id, "SELECT count(*) AS n FROM t");
+        for (key, value) in [
+            ("database", json!(1)),
+            ("database", Value::Null),
+            ("database", json!(" ")),
+            ("database", json!("another")),
+            ("databse", json!("another")),
+            ("source", json!("db2")),
+        ] {
+            let mut bad = args.clone();
+            bad.insert(key.into(), value);
+            let out = call(&st, "run_read_query", bad).await;
+            let result: Value = serde_json::from_str(&out.text).unwrap();
+            assert!(out.is_error, "{result}");
+            assert_eq!(result["error"]["code"], "invalid_input");
+            assert!(result["error"]["message"].as_str().unwrap().contains(key));
+        }
+        let list = Map::from_iter([
+            ("connection".into(), json!(id)),
+            ("schema".into(), json!("other")),
+        ]);
+        assert!(call(&st, "list_tables", list).await.is_error);
+        for main in [None, Some(json!("main"))] {
+            args.extend(main.map(|db| ("database".into(), db)));
+            let out = call(&st, "run_read_query", args.clone()).await;
+            assert!(!out.is_error, "{}", out.text);
+            let result: Value = serde_json::from_str(&out.text).unwrap();
+            assert_eq!(result["rows"], json!([[3]]));
+        }
+    }
+
+    #[tokio::test]
     async fn redis_read_dispatch_requires_sharing_and_uses_the_guard() {
         let (_dir, st) = state();
         let redis = st
@@ -374,6 +449,11 @@ mod tests {
                 "run_mongo_read",
                 "run_redis_read",
             ]
+        );
+        assert!(
+            tools
+                .iter()
+                .all(|t| t.schema["additionalProperties"] == false)
         );
         for tool in &tools[1..] {
             let required = tool.schema["required"].as_array().unwrap();
