@@ -11,7 +11,7 @@
   import { confirm } from '../ask.svelte';
   import { ago, duration, sourceLabel } from '../chatParts';
   import { describeCadence, formatWhen } from '../cadence';
-  import { connOf, db, defaultDb, engines, envDot, type Conn } from '../connections.svelte';
+  import { environmentLabel, connOf, db, defaultDb, engines, envDot, type Conn } from '../connections.svelte';
   import { sqlHtml } from '../highlight';
   import {
     deleteSchedule,
@@ -258,11 +258,11 @@
                       {#if conn}
                         {@const engine = engines[conn.engine]}
                         {@const database = conn.engine === 'sqlite' ? '' : s.task.database || defaultDb(conn)}
-                        <div class="flex items-center gap-1.5" title={`${engine.label} · ${conn.name}${database ? ` / ${database}` : ''} · ${conn.env}`}>
+                        <div class="flex items-center gap-1.5" title={`${engine.label} · ${conn.name}${database ? ` / ${database}` : ''} · ${environmentLabel(conn)}`}>
                           <EngineBadge engine={conn.engine} />
                           <span class="truncate font-medium">{conn.name}{#if database}<span class="ml-1 font-mono font-normal text-muted">/ {database}</span>{/if}</span>
                           <span class="size-1.5 shrink-0 rounded-full {envDot[conn.env]}" aria-hidden="true"></span>
-                          <span class="sr-only">, {conn.env}</span>
+                          <span class="sr-only">, {environmentLabel(conn)}</span>
                         </div>
                       {:else}
                         <span class="block truncate text-faint italic" title="Deleted connection">Deleted connection</span>

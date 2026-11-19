@@ -7,7 +7,7 @@
   import { ShieldAlert } from '@lucide/svelte';
   import type { Snippet } from 'svelte';
 
-  /** The production acknowledgement; `children` completes the sentence after "This is a production connection. ". */
+  /** The production acknowledgement; `children` completes the sentence after the protection notice. */
   let {
     checked = $bindable(false),
     disabled = false,
@@ -18,5 +18,5 @@
 
 <label class="flex cursor-pointer items-start gap-2.5 rounded-lg bg-danger-soft px-3 py-2.5 text-sm {cls}">
   <input type="checkbox" class="mt-0.5 accent-danger" bind:checked {disabled} />
-  <span><ShieldAlert size={13} class="mr-0.5 inline text-danger" /> This is a <b>production</b> connection. {@render children()}</span>
+  <span><ShieldAlert size={13} class="mr-0.5 inline text-danger" /> <b>Write protection</b> is on for this connection. {@render children()}</span>
 </label>

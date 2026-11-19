@@ -73,6 +73,9 @@ pub struct Connection {
     pub version: String,
     #[serde(default)]
     pub env: Env,
+    /// Display only. Empty on older connections, which show the environment name.
+    #[serde(default)]
+    pub env_label: String,
     #[serde(default)]
     pub host: String,
     #[serde(default)]
@@ -142,6 +145,9 @@ pub struct ConnectionInput {
     pub env: Env,
     #[serde(default)]
     #[cfg_attr(test, ts(optional = nullable))]
+    pub env_label: String,
+    #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
     pub host: String,
     #[serde(default)]
     #[cfg_attr(test, ts(optional = nullable))]
@@ -209,6 +215,7 @@ pub(crate) fn build(
         engine: i.engine,
         version: i.version.unwrap_or_else(|| prev_version.to_string()),
         env: i.env,
+        env_label: i.env_label,
         host: i.host,
         port: i.port,
         database: i.database,
@@ -236,6 +243,7 @@ pub(crate) fn input_of(c: &Connection) -> ConnectionInput {
         name: c.name.clone(),
         engine: c.engine,
         env: c.env,
+        env_label: c.env_label.clone(),
         host: c.host.clone(),
         port: c.port,
         database: c.database.clone(),
@@ -301,6 +309,7 @@ mod tests {
             engine,
             version: String::new(),
             env: Env::Local,
+            env_label: String::new(),
             host: String::new(),
             port: 0,
             database: database.into(),
@@ -347,6 +356,22 @@ mod tests {
         let c = build("id".into(), i, "PostgreSQL 16", Some(prev));
         assert_eq!(c.version, "PostgreSQL 16");
         assert_eq!(c.topology, None);
+    }
+
+    #[test]
+    fn legacy_connections_keep_their_environment_without_a_custom_label() {
+        for (value, env) in [
+            ("local", Env::Local),
+            ("staging", Env::Staging),
+            ("production", Env::Production),
+        ] {
+            let c: Connection = serde_json::from_value(serde_json::json!({
+                "id": "old", "name": "old", "engine": "pg", "env": value
+            }))
+            .unwrap();
+            assert!(c.env_label.is_empty());
+            assert_eq!(c.env, env);
+        }
     }
 
     #[test]

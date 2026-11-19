@@ -4,11 +4,11 @@ import type { Row, Schema } from '../types';
 export const versions: Record<Engine, string> = { pg: 'PostgreSQL 16.4', mysql: 'MySQL 8.4', sqlite: 'SQLite 3.46', mongo: 'MongoDB 8.0.3', redis: 'Redis 7.4.1' };
 
 export const seedConnections: Connection[] = [
-  { id: 'prod', name: 'prod-analytics', engine: 'pg', version: 'PostgreSQL 16.4', env: 'production', host: 'prod-analytics.db.internal', port: 5432, database: 'analytics_prod', user: 'analyst', ssl: 'require', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
-  { id: 'shop', name: 'shop-staging', engine: 'mysql', version: 'MySQL 8.4', env: 'staging', host: 'shop-staging.db.internal', port: 3306, database: 'shop', user: 'app', ssl: 'prefer', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
-  { id: 'notes', name: 'notes.db', engine: 'sqlite', version: 'SQLite 3.46', env: 'local', host: '', port: 0, database: 'main', user: '', ssl: 'prefer', file: '~/data/notes.db', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
-  { id: 'mongo', name: 'local mongo', engine: 'mongo', version: 'MongoDB 8.0.3', env: 'local', host: '127.0.0.1', port: 57017, database: 'shop_staging', user: 'sandb', ssl: 'disable', file: '', aiWrite: false, readOnly: false, uri: '', authSource: 'admin', topology: 'replica_set', redis: null },
-  { id: 'redis', name: 'Local Redis', engine: 'redis', version: 'Redis 7.4.1', env: 'local', host: '127.0.0.1', port: 6379, database: '0', user: '', ssl: 'disable', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: { mode: 'standalone', sentinelMaster: '', sentinelAuth: false } },
+  { id: 'prod', name: 'prod-analytics', engine: 'pg', version: 'PostgreSQL 16.4', env: 'production', envLabel: '', host: 'prod-analytics.db.internal', port: 5432, database: 'analytics_prod', user: 'analyst', ssl: 'require', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
+  { id: 'shop', name: 'shop-staging', engine: 'mysql', version: 'MySQL 8.4', env: 'staging', envLabel: '', host: 'shop-staging.db.internal', port: 3306, database: 'shop', user: 'app', ssl: 'prefer', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
+  { id: 'notes', name: 'notes.db', engine: 'sqlite', version: 'SQLite 3.46', env: 'local', envLabel: '', host: '', port: 0, database: 'main', user: '', ssl: 'prefer', file: '~/data/notes.db', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
+  { id: 'mongo', name: 'local mongo', engine: 'mongo', version: 'MongoDB 8.0.3', env: 'local', envLabel: '', host: '127.0.0.1', port: 57017, database: 'shop_staging', user: 'sandb', ssl: 'disable', file: '', aiWrite: false, readOnly: false, uri: '', authSource: 'admin', topology: 'replica_set', redis: null },
+  { id: 'redis', name: 'Local Redis', engine: 'redis', version: 'Redis 7.4.1', env: 'local', envLabel: '', host: '127.0.0.1', port: 6379, database: '0', user: '', ssl: 'disable', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: { mode: 'standalone', sentinelMaster: '', sentinelAuth: false } },
 ];
 
 export const schemas: Record<string, Schema> = {

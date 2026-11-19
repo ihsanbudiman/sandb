@@ -1093,6 +1093,7 @@ mod tests {
             name: "t".into(),
             engine: crate::core::engine::Engine::Sqlite,
             env: Env::Local,
+            env_label: String::new(),
             host: String::new(),
             port: 0,
             database: "main".into(),

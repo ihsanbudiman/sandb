@@ -271,7 +271,7 @@ async function runQueryTask(s: Schedule): Promise<RunOutcome> {
   const c = db.connections.find((x) => x.id === task.connId);
   if (!c) return { status: 'error', message: 'The connection no longer exists.' };
   if (task.allowWrites && c.env === 'production' && !task.prodAck) {
-    return { status: 'blocked', message: 'The connection is now production. Edit the schedule and confirm scheduled writes on production.' };
+    return { status: 'blocked', message: 'Write protection is on. Edit the schedule and confirm scheduled writes on this connection.' };
   }
   const began = Date.now();
   let kind: 'READ' | 'WRITE' = 'READ';

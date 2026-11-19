@@ -220,7 +220,11 @@ export type Connection = { id: string, name: string, engine: Engine,
 /**
  * Server version from the last successful test, e.g. `PostgreSQL 16.4`. Empty if never tested.
  */
-version: string, env: Env, host: string, port: number, 
+version: string, env: Env, 
+/**
+ * Display only. Empty on older connections, which show the environment name.
+ */
+envLabel: string, host: string, port: number, 
 /**
  * `main` for SQLite.
  */
@@ -252,7 +256,7 @@ topology: Topology | null,
  */
 redis: RedisSettings | null, };
 
-export type ConnectionInput = { name: string, engine: Engine, env?: Env, host?: string, port?: number, database?: string, user?: string, ssl?: SslMode, file?: string, aiWrite?: boolean, readOnly?: boolean, 
+export type ConnectionInput = { name: string, engine: Engine, env?: Env, envLabel?: string, host?: string, port?: number, database?: string, user?: string, ssl?: SslMode, file?: string, aiWrite?: boolean, readOnly?: boolean, 
 /**
  * MongoDB or Redis connection string as typed, password included: `catalog::normalize`
  * takes the password out.

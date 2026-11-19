@@ -7,7 +7,7 @@
   import { Search, FileCode, Play, PanelRight, PanelLeft, Settings, ScrollText, SunMoon, Plus, Table2, Database, Save, CalendarClock, CalendarPlus } from '@lucide/svelte';
   import { scrollOn } from '../actions';
   import Modal from './Modal.svelte';
-  import { db, envDot, type Conn } from '../connections.svelte';
+  import { environmentLabel, db, envDot, type Conn } from '../connections.svelte';
   import { KEYS } from '../keys';
   import { active } from '../tabs.svelte';
   import { saved, type SavedQuery } from '../saved.svelte';
@@ -68,8 +68,8 @@
       label: c.name,
       icon: Database,
       dot: envDot[c.env],
-      env: c.env,
-      hint: c.id === active().id ? 'active' : c.env,
+      env: environmentLabel(c),
+      hint: c.id === active().id ? 'active' : environmentLabel(c),
       run: () => onswitch(c),
     })),
   ]);

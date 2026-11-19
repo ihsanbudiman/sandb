@@ -482,6 +482,36 @@ async fn tabs_on_one_connection_have_separate_sessions() {
     .await;
 }
 
+/// A display label does not choose write permissions or reconnect an open transaction.
+#[tokio::test]
+async fn custom_label_is_independent_of_sqlite_write_protection() {
+    let (dir, st) = common::state();
+    let file = dir.path().join("labels.db");
+    std::fs::File::create(&file).unwrap();
+    let mut i = common::sqlite_input(&file, false);
+    i.env = Env::Production;
+    i.env_label = "Finance EU".into();
+    let c = common::ctx_in(dir, st, "custom", i.clone(), None);
+    run_other(&c, "CREATE TABLE t (n INTEGER)").await;
+    run_tab_ok(&c, "INSERT INTO t VALUES (1)", "tab").await;
+    i.env_label = "QA".into();
+    c.st.update_connection(&c.conn.id, i.clone(), None).await.unwrap();
+    assert!(status(&c, "tab").await.is_some());
+    assert_eq!(cell(&run_other(&c, "SELECT COUNT(*) FROM t").await, 0, 0), json!(0));
+    rollback(&c, "tab").await.unwrap();
+
+    i.env = Env::Local;
+    c.st.update_connection(&c.conn.id, i.clone(), None).await.unwrap();
+    run_tab_ok(&c, "INSERT INTO t VALUES (2)", "tab").await;
+    assert_eq!(cell(&run_other(&c, "SELECT n FROM t").await, 0, 0), json!(2));
+    assert_eq!(status(&c, "tab").await, None);
+
+    i.read_only = true;
+    c.st.update_connection(&c.conn.id, i, None).await.unwrap();
+    let err = run_tab(&c, "INSERT INTO t VALUES (3)", "tab").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::ConnectionReadOnly);
+}
+
 /// Non-Production connections keep phase-2 autocommit behaviour even when a run names a tab.
 #[tokio::test]
 async fn non_production_runs_stay_autocommit() {

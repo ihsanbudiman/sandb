@@ -1,10 +1,11 @@
 <script lang="ts">
+  import EnvironmentBadge from './EnvironmentBadge.svelte';
   import { ShieldOff, Check } from '@lucide/svelte';
-  import { canWrite, envTag, type Conn } from '../connections.svelte';
+  import { canWrite, type Conn } from '../connections.svelte';
   import Modal from './Modal.svelte';
 
   /** The connection the assistant would get writes for; no stored `Conn` is needed, only what the texts name. */
-  let { conn, answer }: { conn: Pick<Conn, 'name' | 'engine' | 'env' | 'readOnly'>; answer: (ok: boolean) => void } = $props();
+  let { conn, answer }: { conn: Pick<Conn, 'name' | 'engine' | 'env' | 'envLabel' | 'readOnly'>; answer: (ok: boolean) => void } = $props();
   const readOnly = $derived(!canWrite(conn));
 </script>
 
@@ -28,7 +29,7 @@
         The assistant can then suggest INSERT, UPDATE, DELETE and DDL statements on
       {/if}
       <b class="font-medium text-ink">{conn.name}</b>
-      <span class="tag {envTag[conn.env]}">{conn.env}</span>
+      <EnvironmentBadge conn={conn} />
     </p>
     <ul class="mt-3 space-y-1.5 text-sm">
       <li class="flex gap-2"><Check size={13} class="mt-px shrink-0 text-ok" /> Every write opens a preview. Nothing runs until you approve it.</li>

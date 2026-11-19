@@ -2,7 +2,7 @@
   import type { Snippet } from 'svelte';
   import { Plus, X, Check, ChevronRight, LoaderCircle } from '@lucide/svelte';
   import { catalog, loadDatabases } from '../catalog.svelte';
-  import { db, defaultDb, envDot, connOf, dbOf, sameSource, type Conn, type Source } from '../connections.svelte';
+  import { environmentLabel, db, defaultDb, envDot, connOf, dbOf, sameSource, type Conn, type Source } from '../connections.svelte';
   import { chatDatabaseLabel } from '../chatParts';
   import { ui } from '../state.svelte';
   import { MAX_SOURCES } from '../api/generated/constants';
@@ -129,9 +129,9 @@
   {#each sources as s, i (i)}
     {@const c = connOf(s)}
     {@const database = chatDatabaseLabel(c, dbOf(s, c))}
-    <span class="chip min-w-0 pr-0.5" title={c ? `${c.name}${c.engine === 'sqlite' ? '' : ` / ${database}`} (${c.env})` : 'This connection was deleted'}>
+    <span class="chip min-w-0 pr-0.5" title={c ? `${c.name}${c.engine === 'sqlite' ? '' : ` / ${database}`} (${environmentLabel(c)})` : 'This connection was deleted'}>
       {#if c}
-        <span class="size-1.5 shrink-0 rounded-full {envDot[c.env]}" title={c.env}></span><span class="sr-only">{c.env}</span>
+        <span class="size-1.5 shrink-0 rounded-full {envDot[c.env]}" title={environmentLabel(c)}></span><span class="sr-only">{environmentLabel(c)}</span>
         <span class="min-w-0 truncate text-ink">{c.name}</span>
         {#if c.engine !== 'sqlite'}<span class="text-faint">/</span><span class="min-w-0 truncate font-mono text-muted">{database}</span>{/if}
       {:else}

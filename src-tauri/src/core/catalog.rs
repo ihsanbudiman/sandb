@@ -30,6 +30,12 @@ fn normalize(
 ) -> Result<(ConnectionInput, Option<String>), AppError> {
     let mut i = input;
     i.name = i.name.trim().to_string();
+    i.env_label = i.env_label.trim().to_string();
+    if i.env_label.chars().count() > 48 || i.env_label.chars().any(char::is_control) {
+        return Err(AppError::invalid(
+            "Use a single line of up to 48 characters for the environment label",
+        ));
+    }
     i.host = i.host.trim().to_string();
     i.database = i.database.trim().to_string();
     i.user = i.user.trim().to_string();
@@ -193,11 +199,12 @@ impl AppState {
                 ));
             }
             let updated = build(id.to_string(), i, &list[pos].version, list[pos].topology);
-            // The name and the AI-write flag reach no session or pool, so changing only them
+            // Display labels, the name and the AI-write flag reach no session or pool, so editing them
             // keeps open transactions alive.
             let reconnect = password.is_some()
                 || Connection {
                     name: list[pos].name.clone(),
+                    env_label: list[pos].env_label.clone(),
                     ai_write: list[pos].ai_write,
                     ..updated.clone()
                 } != list[pos];
@@ -462,6 +469,7 @@ mod tests {
             name: name.into(),
             engine: Engine::Pg,
             env: Env::Staging,
+            env_label: String::new(),
             host: " 127.0.0.1 ".into(),
             port: 0,
             database: "shop".into(),
@@ -483,6 +491,7 @@ mod tests {
             name: "local".into(),
             engine: Engine::Sqlite,
             env: Env::Local,
+            env_label: String::new(),
             host: "ignored".into(),
             port: 99,
             database: "ignored".into(),
@@ -568,6 +577,48 @@ mod tests {
         assert_eq!(c.port, 5432, "port 0 means the engine default");
         let reloaded = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
         assert_eq!(reloaded.list_connections(), vec![c]);
+    }
+
+    #[tokio::test]
+    async fn custom_labels_survive_edit_duplicate_and_reload_without_setting_permissions() {
+        let (dir, st) = state();
+        let mut i = pg_input("reporting");
+        i.env = Env::Production;
+        i.read_only = true;
+        i.ai_write = true;
+        i.env_label = "  Finance EU  ".into();
+        let c = st.create_connection(i, None).unwrap();
+        assert_eq!(c.env_label, "Finance EU");
+        assert_eq!(c.env, Env::Production);
+        assert!(!c.may_write() && !c.ai_write);
+
+        let copy = st.duplicate_connection(&c.id, None, None).unwrap();
+        assert_eq!(copy.env_label, c.env_label);
+        assert_eq!(copy.env, Env::Production);
+        assert!(!copy.may_write());
+
+        let mut i = input_of(&c);
+        i.env_label = "local".into();
+        let renamed = st.update_connection(&c.id, i, None).await.unwrap();
+        let reloaded = AppState::new(dir.path(), Box::new(MemoryStore::new())).unwrap();
+        assert_eq!(reloaded.connection(&c.id).unwrap(), renamed);
+        assert_eq!(renamed.env_label, "local");
+        assert_eq!(renamed.env, Env::Production);
+        assert!(!renamed.may_write());
+    }
+
+    #[test]
+    fn labels_are_short_single_lines_and_blank_means_use_the_preset() {
+        let mut i = pg_input("reporting");
+        i.env_label = " ".into();
+        assert!(normalize(i.clone(), true).unwrap().0.env_label.is_empty());
+        for label in ["é".repeat(49), "two\nlines".into()] {
+            i.env_label = label;
+            assert_eq!(
+                normalize(i.clone(), true).unwrap_err().code,
+                ErrorCode::InvalidInput
+            );
+        }
     }
 
     #[test]
@@ -1186,6 +1237,7 @@ mod tests {
                 "database",
                 "engine",
                 "env",
+                "envLabel",
                 "file",
                 "host",
                 "id",

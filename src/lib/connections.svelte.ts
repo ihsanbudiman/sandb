@@ -23,6 +23,8 @@ export const isSql = (c: { engine: Engine }): c is { engine: SqlEngine } => c.en
 export const isMongo = (c: { engine: Engine }) => c.engine === 'mongo';
 export const isRedis = (c: { engine: Engine }) => c.engine === 'redis';
 
+export const environmentLabel = (c: Pick<Conn, 'env' | 'envLabel'>) => c.envLabel || c.env;
+
 export const envDot: Record<Env, string> = {
   // The ring tells production from staging without relying on hue.
   production: 'bg-danger ring-2 ring-danger/35',

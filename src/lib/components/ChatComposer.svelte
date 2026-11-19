@@ -1,4 +1,5 @@
 <script lang="ts">
+  import EnvironmentBadge from './EnvironmentBadge.svelte';
   import { tick } from 'svelte';
   import { ArrowUp, BookOpen, Info, ShieldCheck, ShieldOff, Square, X } from '@lucide/svelte';
   import ChatScope from './ChatScope.svelte';
@@ -9,7 +10,7 @@
   import { focusOnMount, scrollOn } from '../actions';
   import { SKILLS } from '../api/generated/constants';
   import { chat, setScope } from '../chat.svelte';
-  import { envTag, setAiWrite, type Conn, type Source } from '../connections.svelte';
+  import { setAiWrite, type Conn, type Source } from '../connections.svelte';
   import { KEYS } from '../keys';
   import { ui } from '../state.svelte';
   import { appliesTo, skillTitle } from '../skills';
@@ -235,7 +236,7 @@
           <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => onenablewrites(c)}>
             <EngineBadge engine={c.engine} class="w-5" />
             <span class="min-w-0 flex-1 truncate text-ink">{c.name}</span>
-            <span class="tag {envTag[c.env]}">{c.env}</span>
+            <EnvironmentBadge conn={c} />
           </button>
         {/each}
       </Menu>
