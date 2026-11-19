@@ -1,7 +1,6 @@
 <script lang="ts">
   import { Ban, BookOpen, Braces, Check, ChartColumn, ChevronDown, ChevronRight, Clock, Copy, FileCode, FileDown, FileSpreadsheet, LoaderCircle, ListTree, RotateCw, Sparkles, Table2, TriangleAlert, X } from '@lucide/svelte';
   import Markdown from './Markdown.svelte';
-  import ChartView from './ChartView.svelte';
   import TargetBadge from './TargetBadge.svelte';
   import { ApiError, type Row } from '../api';
   import { chat, decide, rerun } from '../chat.svelte';
@@ -10,7 +9,6 @@
   import { afterStep, argsOf, blocks, busy, chatDatabaseLabel, duration, fenceSource, lastQuery, mongoInReply, numeric, processPart, replyMs, replyText, sourceLabel, stepTarget, toolMs, workEnd, workSteps } from '../chatParts';
   import { connOf, dbOf, type Conn, type Source } from '../connections.svelte';
   import { Flash } from '../flash.svelte';
-  import { exportReply } from '../report';
   import { csvCell, formatCell } from '../results';
   import { skillTitle } from '../skills';
   import { sqlHtml } from '../highlight';
@@ -98,7 +96,9 @@
     exported = null;
     try {
       const meta = [...scope.map(sourceLabel), new Date().toLocaleString()].join(' · ');
-      const text = await exportReply(messages[mi].parts, question, meta);
+      const parts = messages[mi].parts;
+      const { exportReply } = await import('../report');
+      const text = await exportReply(parts, question, meta);
       if (text) exported = { mi, ok: true, text };
     } catch (e) {
       exported = { mi, ok: false, text: `The PDF was not saved: ${ApiError.from(e).message}` };
@@ -209,7 +209,13 @@
                 if (source || !redisEditor) onrunmenu(sql, anchor, source);
               }} />
             {:else if p.kind === 'chart'}
-              <ChartView part={p} />
+              {#await import('./ChartView.svelte')}
+                <p class="grid h-72 place-items-center text-muted" role="status">Loading chart…</p>
+              {:then { default: ChartView }}
+                <ChartView part={p} />
+              {:catch e}
+                <p class="text-danger" role="alert">Could not load the chart: {ApiError.from(e).message}</p>
+              {/await}
             {:else if p.kind === 'error'}
               <p class="flex items-start gap-2 leading-relaxed text-danger"><TriangleAlert size={13} class="mt-1 shrink-0" /><span class="min-w-0 break-words">{p.text}</span></p>
             {/if}
