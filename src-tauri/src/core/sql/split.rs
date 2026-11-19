@@ -18,10 +18,34 @@ pub(crate) fn dialect(engine: SqlEngine) -> Box<dyn Dialect> {
 
 /// MySQL runs the body of `/*! … */` (MariaDB also `/*M! … */`) as SQL. sqlparser's MySQL
 /// tokenizer expands `/*!` bodies with spans that point at the comment start, and keeps `/*M!`
-/// as a comment, so neither can be split or analysed reliably. Matches inside string literals
-/// too, which only costs a false "not a plain read".
+/// as a comment, so neither can be split or analysed reliably.
 pub(crate) fn has_executable_comment(engine: SqlEngine, sql: &str) -> bool {
-    engine == SqlEngine::Mysql && (sql.contains("/*!") || sql.contains("/*M!"))
+    if engine != SqlEngine::Mysql || !(sql.contains("/*!") || sql.contains("/*M!")) {
+        return false;
+    }
+    // Only discount markers in unambiguous quoted text. Backslash escapes depend on
+    // the server's SQL mode; comment bodies cannot be scanned as quoted SQL either.
+    let mut quote = None;
+    let mut bytes = sql.bytes().peekable();
+    while let Some(b) = bytes.next() {
+        if let Some(q) = quote {
+            if b == b'\\' {
+                return true;
+            }
+            if b == q && bytes.next_if_eq(&q).is_none() {
+                quote = None;
+            }
+        } else {
+            match b {
+                b'\'' | b'"' | b'`' => quote = Some(b),
+                b'#' => return true,
+                b'-' if bytes.peek() == Some(&b'-') => return true,
+                b'/' if bytes.peek() == Some(&b'*') => return true,
+                _ => {}
+            }
+        }
+    }
+    quote.is_some()
 }
 
 /// A fallback chunk the server could execute as multiple commands without the editor
@@ -161,6 +185,21 @@ mod tests {
             split(SqlEngine::Mysql, sql),
             vec!["SELECT `a;b` FROM t", "# one; two\nSELECT \"x;y\""]
         );
+    }
+
+    #[test]
+    fn mysql_quoted_markers_are_not_executable_comments() {
+        let select = "SELECT 'it''s /*! text */' AS `/*M! alias */`";
+        let second = "SELECT \"/*M! text */\"";
+        assert_eq!(
+            split(SqlEngine::Mysql, &format!("{select}; {second}")),
+            vec![select, second]
+        );
+        assert!(!may_contain_batch(SqlEngine::Mysql, select));
+        assert!(has_executable_comment(
+            SqlEngine::Mysql,
+            &format!("{select} /*!50000 LIMIT 1 */")
+        ));
     }
 
     #[test]

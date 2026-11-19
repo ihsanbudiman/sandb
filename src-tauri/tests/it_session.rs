@@ -882,6 +882,23 @@ async fn mysql_write_after_implicit_commit_stays_pending() {
 }
 
 #[tokio::test]
+async fn mysql_comment_markers_in_literals_do_not_block_tab_queries() {
+    for c in prod(Engine::Mysql, 0) {
+        with_scratch(&c, async |c: &Ctx, t: &str| {
+            for marker in ["/*! text */", "/*M! text */"] {
+                let select = format!("SELECT '{marker}'");
+                assert_eq!(cell(&run_tab_ok(c, &select, "tab").await, 0, 0), json!(marker));
+                run_tab_ok(c, "START TRANSACTION", "tab").await;
+                let insert = format!("INSERT INTO {t} VALUES (1, LENGTH('{marker}'))");
+                run_tab_ok(c, &insert, "tab").await;
+                assert!(status(c, "tab").await.is_some_and(|s| s.pending));
+                rollback(c, "tab").await.unwrap();
+            }
+        }).await;
+    }
+}
+
+#[tokio::test]
 async fn mysql_does_not_send_an_opaque_batch_to_an_empty_tab() {
     for c in prod(Engine::Mysql, 0) {
         with_scratch(&c, async |c: &Ctx, t: &str| {
