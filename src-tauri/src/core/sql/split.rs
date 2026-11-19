@@ -24,6 +24,14 @@ pub(crate) fn has_executable_comment(engine: SqlEngine, sql: &str) -> bool {
     engine == SqlEngine::Mysql && (sql.contains("/*!") || sql.contains("/*M!"))
 }
 
+/// A fallback chunk the server could execute as multiple commands without the editor
+/// getting a chance to check a transaction boundary between them.
+pub(crate) fn may_contain_batch(engine: SqlEngine, sql: &str) -> bool {
+    has_executable_comment(engine, sql)
+        || (sql.contains(';')
+            && split_by_tokens(&*dialect(engine), sql).is_none_or(|parts| parts.len() > 1))
+}
+
 /// Statements in order, without the separating semicolons. Empty if there is nothing to run.
 pub fn split(engine: SqlEngine, sql: &str) -> Vec<String> {
     let d = dialect(engine);

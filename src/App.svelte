@@ -892,7 +892,7 @@
               <button class="flex h-full items-center gap-2 rounded-md pl-2.5" id="query-tab-{t.id}" role="tab" aria-selected={on} aria-controls={on ? 'workspace-panel' : undefined} tabindex={on ? 0 : -1} aria-haspopup="menu" onclick={() => pickTab(t.id)} ondblclick={() => (renaming = t.id)} onkeydown={(e) => tabKey(e, t)} oncontextmenu={(e) => openTabMenu(e, t)} title="{prodT ? 'Production · ' : ''}Double-click to rename">
                 {#if t.table}<Table2 size={13} class={on ? 'text-accent' : 'text-faint'} />{:else}<FileCode size={13} class={on ? 'text-accent' : 'text-faint'} />{/if} <span class="max-w-40 truncate">{t.title}</span>{#if prodT}<span class="sr-only">, production</span>{/if}
                 {#if runs[t.id] && (!on || ui.page !== 'query')}<LoaderCircle size={12} class="text-faint motion-safe:animate-spin" />{/if}
-                {#if t.status?.pending}<span class="size-1.5 rounded-full bg-warn" title="Transaction open"></span>{/if}
+                {#if t.status?.txOpen}<span class="size-1.5 rounded-full bg-warn" title="Transaction open"></span>{/if}
               </button>
             {/if}
             <!-- Unsaved changes to a saved query: a dot, as in code editors; it turns into the X on hover. -->
@@ -1027,10 +1027,10 @@
         {@const st = tab.status}
         <!-- An aborted transaction counts as pending; Rollback is the way out of it. Disabled buttons do not show tooltips reliably, so the wrappers carry the title. -->
         <div class="flex w-18 shrink-0 items-center gap-1 border-l border-line pl-1.5 xl:w-41">
-          <span class="flex-1" title="Commit the tab's open transaction"><button class="btn btn-ghost w-full px-1.5" onclick={() => endActive(true)} disabled={!st?.pending || st.aborted || !!busy || txButtons.busy || !!switching} title="Commit the tab's open transaction" aria-label="Commit"><Check size={13} /> <span class="hidden xl:inline">Commit</span></button></span>
-          <span class="flex-1" title="Roll back the tab's open transaction"><button class="btn btn-ghost w-full px-1.5" onclick={() => endActive(false)} disabled={!(st?.pending || st?.aborted) || !!busy || txButtons.busy || !!switching} title="Roll back the tab's open transaction" aria-label="Rollback"><Undo2 size={13} /> <span class="hidden xl:inline">Rollback</span></button></span>
+          <span class="flex-1" title="Commit the tab's open transaction"><button class="btn btn-ghost w-full px-1.5" onclick={() => endActive(true)} disabled={!st?.txOpen || st.aborted || !!busy || txButtons.busy || !!switching} title="Commit the tab's open transaction" aria-label="Commit"><Check size={13} /> <span class="hidden xl:inline">Commit</span></button></span>
+          <span class="flex-1" title="Roll back the tab's open transaction"><button class="btn btn-ghost w-full px-1.5" onclick={() => endActive(false)} disabled={!st?.txOpen || !!busy || txButtons.busy || !!switching} title="Roll back the tab's open transaction" aria-label="Rollback"><Undo2 size={13} /> <span class="hidden xl:inline">Rollback</span></button></span>
         </div>
-        {#if st?.pending}
+        {#if st?.txOpen}
           <span class="flex min-w-0 items-center gap-1.5 text-sm font-medium text-warn" role="status" title="Transaction open"><span class="size-1.5 shrink-0 rounded-full bg-warn"></span> <span class="truncate">Transaction open</span></span>
         {/if}
         {#if txButtons.error?.tab === tab.id}<span class="min-w-0 truncate text-sm text-danger" role="alert">{txButtons.error.text}</span>{/if}
