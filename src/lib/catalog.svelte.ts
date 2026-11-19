@@ -1,4 +1,4 @@
-import { api, ApiError, type ColumnInfo, type SchemaSnapshot, type TableInfo, type TableProperties, type WriteInfo } from './api';
+import { api, ApiError, type ColumnInfo, type KeyList, type SchemaSnapshot, type TableInfo, type TableProperties, type WriteInfo } from './api';
 import { db, dbOf, type Conn, type Source } from './connections.svelte';
 import { tableKey, type TableId } from './tableId';
 import type { TableRef } from './tableActions';
@@ -14,8 +14,8 @@ export interface Loaded<T> {
 }
 
 /**
- * Everything the app has loaded about schemas: databases, schemas, table lists, snapshots, columns,
- * table properties and DDL, each once per key and shared by the tree, the editor, the palette, the
+ * Everything the app has loaded about schemas: databases, schemas, table and key lists, snapshots,
+ * columns, table properties and DDL, each once per key and shared by the tree, the editor, the palette, the
  * properties view and the ER diagram. `rev` marks a structure change.
  */
 export const catalog = $state({
@@ -23,6 +23,7 @@ export const catalog = $state({
   databases: {} as Record<string, Loaded<string[]>>,
   schemas: {} as Record<string, Loaded<string[]>>,
   tables: {} as Record<string, Loaded<TableInfo[]>>,
+  redisKeys: {} as Record<string, Loaded<KeyList>>,
   snapshots: {} as Record<string, Loaded<SchemaSnapshot | null>>,
   columns: {} as Record<string, Loaded<ColumnInfo[]>>,
   properties: {} as Record<string, Loaded<TableProperties | null>>,
@@ -39,6 +40,9 @@ export const listKey = (connId: string, database: string, schema: string | null)
 
 /** The table list descriptor of each `<conn>/<db>[/<schema>]` key; reactive so the palette sees a new list. */
 const lists = $state<Record<string, { connId: string; database: string; schema: string | null }>>({});
+
+/** The last submitted pattern for each Redis database, including searches still in flight. */
+const keySearches = $state<Record<string, { connId: string; database: string; pattern: string }>>({});
 
 async function load<T>(box: Record<string, Loaded<T>>, store: string, key: string, empty: T, fn: () => Promise<T>): Promise<T> {
   const token = store + ':' + key;
@@ -85,6 +89,20 @@ export async function loadTables(connId: string, database: string, schema: strin
   lists[key] = { connId, database, schema };
   if (!force && ready(catalog.tables[key])) return catalog.tables[key].items;
   return load(catalog.tables, 'tables', key, [], () => api.listTables({ connId, database, schema }));
+}
+
+export function redisKeys(connId: string, database: string) {
+  return catalog.redisKeys[dbKey(connId, database)];
+}
+
+export async function loadRedisKeys(connId: string, database: string, pattern?: string, force = false) {
+  const key = dbKey(connId, database);
+  const previous = keySearches[key]?.pattern;
+  const match = pattern ?? previous ?? '*';
+  if (previous !== match) delete catalog.redisKeys[key];
+  else if (!force && ready(catalog.redisKeys[key])) return catalog.redisKeys[key].items;
+  keySearches[key] = { connId, database, pattern: match };
+  return load(catalog.redisKeys, 'keys', key, { keys: [], truncated: false }, () => api.listKeys({ connId, database, pattern: match, limit: null }));
 }
 
 export function snapshot(connId: string, database: string) {
@@ -138,7 +156,7 @@ export async function loadDdl(connId: string, database: string, schema: string |
   return load(catalog.ddl, 'ddl', key, '', () => api.tableDdl({ connId, database, schema, table }));
 }
 
-/** Every table the app has loaded, hidden partitions included, for the palette search. Partitions come last. */
+/** Every loaded table and Redis key for the palette search, with hidden partitions last. */
 export function loadedTables(): { c: Conn; t: TableRef; partition: boolean }[] {
   const out: { c: Conn; t: TableRef; partition: boolean }[] = [];
   for (const [key, l] of Object.entries(lists)) {
@@ -147,6 +165,13 @@ export function loadedTables(): { c: Conn; t: TableRef; partition: boolean }[] {
     const c = db.connections.find((x) => x.id === l.connId);
     if (!c) continue;
     for (const t of loaded.items) out.push({ c, t: { database: l.database, schema: l.schema, name: t.name, kind: t.kind }, partition: !!t.partitionOf });
+  }
+  for (const { connId, database } of Object.values(keySearches)) {
+    const loaded = redisKeys(connId, database);
+    if (loaded?.status !== 'ok') continue;
+    const c = db.connections.find((x) => x.id === connId);
+    if (!c) continue;
+    for (const t of loaded.items.keys) out.push({ c, t: { database, schema: null, name: t.name, kind: t.kind, redisType: t.redisType, rowEstimate: t.rowEstimate }, partition: false });
   }
   return out.sort((a, b) => +a.partition - +b.partition);
 }
@@ -188,6 +213,7 @@ export function reloadLists(connId: string) {
   for (const key of Object.keys(catalog.databases)) if (key === connId) void loadDatabases(connId, true);
   for (const key of Object.keys(catalog.schemas)) if (key.startsWith(connId + '/')) void loadSchemas(connId, key.slice(connId.length + 1), true);
   for (const [key, l] of Object.entries(lists)) if (key.startsWith(connId + '/')) void loadTables(l.connId, l.database, l.schema, true);
+  for (const search of Object.values(keySearches)) if (search.connId === connId) void loadRedisKeys(connId, search.database, search.pattern, true);
   for (const key of Object.keys(catalog.snapshots)) if (key.startsWith(connId + '/')) void loadSnapshot(connId, key.slice(connId.length + 1), true);
 }
 
@@ -215,18 +241,33 @@ export function forget(c: Conn) {
   // The revision moves so views that watch it reload against the new target.
   catalog.rev++;
   const mine = (k: string) => k === id || k.startsWith(id + '/');
-  for (const box of [catalog.databases, catalog.schemas, catalog.tables, catalog.snapshots, catalog.columns, catalog.properties, catalog.ddl]) {
+  for (const box of [catalog.databases, catalog.schemas, catalog.tables, catalog.redisKeys, catalog.snapshots, catalog.columns, catalog.properties, catalog.ddl]) {
     for (const k of Object.keys(box)) if (mine(k)) delete box[k];
   }
   for (const k of Object.keys(lists)) if (k === id || k.startsWith(id + '/')) delete lists[k];
+  for (const k of Object.keys(keySearches)) if (mine(k)) delete keySearches[k];
   for (const k of Object.keys(known)) if (mine(k)) delete known[k];
   // A request already in flight must not write its answer into the cleared entries.
-  for (const k of Object.keys(seq)) seq[k]++;
+  for (const k of Object.keys(seq)) if (mine(k.slice(k.indexOf(':') + 1))) seq[k]++;
 }
 
 export function afterRun(c: Conn, cls: Classification, fallback: string) {
   // A structure change, or text no classifier could read (it may hide any write): reload.
   if (cls.structure || !cls.info) return structureChanged(c);
+  if (c.engine === 'redis') {
+    if (!cls.write) return;
+    const databases = new Set(cls.info.statements.filter((s) => s.read === false).map((s) => s.database ?? fallback));
+    for (const database of databases) {
+      if (redisKeys(c.id, database)) void loadRedisKeys(c.id, database, undefined, true);
+      if (snapshot(c.id, database)) void loadSnapshot(c.id, database, true);
+    }
+    for (const [key, t] of Object.entries(known)) {
+      if (t.connId !== c.id || !databases.has(t.database)) continue;
+      if (catalog.columns[key]) void loadColumns(t.connId, t.database, t.schema, t.name, true);
+      if (catalog.properties[key]) void loadProperties(t.connId, t.database, t.schema, t.name, true);
+    }
+    return;
+  }
   if (c.engine !== 'mongo') return;
   // A Mongo write into a collection the tree does not list may have created it. A write with no
   // collection (`dropDatabase`) changed the database list, which its `structure` flag already covers.

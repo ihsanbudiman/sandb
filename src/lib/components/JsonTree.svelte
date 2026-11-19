@@ -66,7 +66,7 @@
     doc !== null && typeof doc === 'object' && !Array.isArray(doc) ? (doc as Record<string, unknown>)._id : undefined;
 </script>
 
-<div class="min-w-0 p-2 font-mono text-[12px] leading-5">
+<div class="min-w-0 p-2 font-mono text-sm leading-5 select-text">
   {#if documents.length}
     {#each documents as doc, i (i)}
       <div class="border-b border-line/70 py-0.5 last:border-b-0">
@@ -78,8 +78,8 @@
   {/if}
   {#if more && onloadmore}
     <div class="pt-1 pl-0.5">
-      <button class="btn btn-ghost h-7 px-2 text-[12px]" disabled={loading} onclick={() => onloadmore?.()}>
-        {#if loading}<LoaderCircle size={13} class="animate-spin" /> Loading more…{:else}<ChevronDown size={13} /> Load more{/if}
+      <button class="btn btn-sm btn-ghost" disabled={loading} onclick={() => onloadmore?.()}>
+        {#if loading}<LoaderCircle size={12} class="motion-safe:animate-spin" /> Loading more…{:else}<ChevronDown size={12} /> Load more{/if}
       </button>
     </div>
   {/if}
@@ -95,26 +95,26 @@
   <div class="group/n flex items-start gap-0.5 rounded px-0.5 hover:bg-hover">
     {#if isBranch(value)}
       <button
-        class="flex size-5 shrink-0 items-center justify-center rounded text-faint hover:bg-active hover:text-ink"
+        class="focus-ring flex size-5 shrink-0 items-center justify-center rounded text-faint hover:bg-active hover:text-ink"
         aria-expanded={isOpen(path)}
         aria-label={isOpen(path) ? `Collapse ${label}` : `Expand ${label}`}
         onclick={() => toggle(path)}
       >
         {#if isOpen(path)}<ChevronDown size={13} />{:else}<ChevronRight size={13} />{/if}
       </button>
-      <button class="flex min-w-0 flex-1 items-baseline gap-2 truncate text-left" onclick={() => toggle(path)}>
+      <button class="focus-ring flex min-w-0 flex-1 items-baseline gap-2 truncate rounded text-left" onclick={() => toggle(path)}>
         <span class="shrink-0 {doc ? 'min-w-[2ch] text-faint tabular-nums' : 'font-medium text-ink'}">{label}</span>
         {#if doc && hint && !isOpen(path)}
           <span class="truncate"><span class="mr-1.5 text-faint">_id:</span>{@render val(idValue(value), hint)}</span>
         {/if}
-        <span class="shrink-0 rounded bg-sunken px-1.5 text-[10.5px] leading-4 text-faint shadow-[inset_0_0_0_1px_var(--c-line)]">{sizeOf(value)}</span>
+        <span class="shrink-0 rounded bg-sunken px-1.5 text-2xs leading-4 text-faint shadow-[inset_0_0_0_1px_var(--c-line)]">{sizeOf(value)}</span>
       </button>
     {:else}
       <span class="w-5 shrink-0"></span>
       <span class="shrink-0 font-medium text-ink">{label}<span class="text-faint">:</span></span>
       {#if typeof value === 'string' && value.length > 80}
         <button
-          class="tok-str ml-1.5 min-w-0 flex-1 cursor-pointer text-left break-all whitespace-pre-wrap hover:underline"
+          class="focus-ring tok-str ml-1.5 min-w-0 flex-1 cursor-pointer rounded text-left break-all whitespace-pre-wrap hover:underline"
           title={full[path] ? undefined : 'Show full value'}
           onclick={() => (full[path] = !full[path])}
         >{full[path] ? JSON.stringify(value) : JSON.stringify(value).slice(0, 81) + '…'}</button>
@@ -123,14 +123,14 @@
       {/if}
     {/if}
     <button
-      class="shrink-0 rounded p-0.5 text-faint opacity-0 group-hover/n:opacity-100 focus-visible:opacity-100 hover:bg-active hover:text-ink"
+      class="focus-ring shrink-0 rounded p-0.5 text-faint opacity-0 group-hover/n:opacity-100 focus-visible:opacity-100 hover:bg-active hover:text-ink"
       title={doc ? 'Copy document' : 'Copy value'}
       aria-label={doc ? 'Copy document' : `Copy value of ${label}`}
       onclick={() => copyNode(value)}
     ><Copy size={12} /></button>
   </div>
   {#if isOpen(path) && isBranch(value)}
-    <div class="ml-[12px] border-l border-line pl-1.5">
+    <div class="ml-3 border-l border-line pl-1.5">
       {#each kidsOf(value, path) as k (k.path)}
         {@render node(k.path, k.label, k.value, depth + 1, '')}
       {/each}

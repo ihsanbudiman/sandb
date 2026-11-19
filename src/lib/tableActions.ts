@@ -1,15 +1,16 @@
-import type { ColumnInfo, ConstraintInfo, Engine, ForeignKeyInfo, IndexInfo, TableKind } from './api';
+import type { ColumnInfo, ConstraintInfo, Engine, ForeignKeyInfo, IndexInfo, TableInfo, TableKind } from './api';
+import { REDIS_VIEW_MAX_ELEMENTS } from './api/generated/constants';
 import type { Conn } from './connections.svelte';
 import { mongoValueText } from './mongo/value';
 import type { SqlEngine } from './sql/text';
 import { quoteIdent, sqlLiteral } from './sql/value';
 
-/** A table, view or materialized view from the connection tree. `schema` is null on MySQL and SQLite. */
-export type TableRef = { database: string; schema: string | null; name: string; kind: TableKind };
+/** A table, view or Redis key from the connection tree. Redis names are canonical argument tokens. */
+export type TableRef = { database: string; schema: string | null; name: string; kind: TableKind } & Pick<TableInfo, 'redisType' | 'rowEstimate'>;
 
 export const kindLabel: Record<TableKind, string> = { table: 'table', view: 'view', matview: 'materialized view' };
 
-export type TableAction = 'view' | 'count' | 'ddl' | 'select' | 'insert' | 'exportDdl' | 'exportSql' | 'exportCsv' | 'exportDocuments' | 'truncate' | 'drop';
+export type TableAction = 'view' | 'properties' | 'count' | 'ddl' | 'select' | 'insert' | 'exportDdl' | 'exportSql' | 'exportCsv' | 'exportDocuments' | 'truncate' | 'drop' | 'renameKey' | 'ttlKey' | 'deleteKey';
 
 export type Danger = { action: 'truncate' | 'drop'; c: Conn; t: TableRef };
 
@@ -60,8 +61,9 @@ export const filterOperator = (value: TableFilterOperator) => OPERATORS[value];
 /** A column whose cells are text, so a pattern operator applies. */
 export const isTextType = (dataType: string) => /char|text|uuid|json|xml|citext|string/i.test(dataType || 'text');
 
-/** SQL for one table Data view run. Values are literals because the existing query API accepts SQL text. */
+/** The command for one Data view run. Values are literals because the query API accepts text. */
 export function tableDataSql(engine: Engine, table: TableRef, filters: TableFilter[], columns: string[] = [], types: string[] = []) {
+  if (engine === 'redis') return redisViewCommand(table.name, table.redisType, table.rowEstimate);
   if (engine === 'mongo') {
     // mongosh: db.<collection>.find({ ... }). Fields with several filters cannot share one key,
     // so their conditions go through $and; the others merge into one document.
@@ -79,6 +81,20 @@ export function tableDataSql(engine: Engine, table: TableRef, filters: TableFilt
   }
   const where = filters.map((f) => filterOperator(f.operator).sql(quoteIdent(engine, f.column), f.value, engine, types[columns.indexOf(f.column)] ?? ''));
   return `SELECT *\nFROM ${qualified(engine, table)}${where.length ? `\nWHERE ${where.join(' AND ')}` : ''}`;
+}
+
+function redisViewCommand(key: string, type: string | undefined, size: number | undefined) {
+  const limit = REDIS_VIEW_MAX_ELEMENTS;
+  const large = size === undefined || size > limit;
+  switch (type) {
+    case 'string': return `GET ${key}`;
+    case 'hash': return large ? `HSCAN ${key} 0 COUNT ${limit}` : `HGETALL ${key}`;
+    case 'list': return `LRANGE ${key} 0 ${large ? limit - 1 : -1}`;
+    case 'set': return large ? `SSCAN ${key} 0 COUNT ${limit}` : `SMEMBERS ${key}`;
+    case 'zset': return `ZRANGE ${key} 0 ${large ? limit - 1 : -1} WITHSCORES`;
+    case 'stream': return `XRANGE ${key} - + COUNT ${limit}`;
+    default: return `TYPE ${key}`;
+  }
 }
 
 export const PLAIN_IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;

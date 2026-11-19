@@ -13,6 +13,7 @@ use crate::core::error::AppError;
 use crate::core::mcp::server::McpServer;
 use crate::core::mongo::client::MongoClients;
 use crate::core::query_registry::QueryRegistry;
+use crate::core::redis::client::RedisClients;
 use crate::core::secrets::SecretStore;
 use crate::core::store::Store;
 
@@ -23,6 +24,7 @@ pub struct AppState {
     pub(in crate::core) connections: Mutex<Vec<Connection>>,
     pub(in crate::core) pools: PoolCache,
     pub(in crate::core) mongo: MongoClients,
+    pub(in crate::core) redis: RedisClients,
     /// Running editor queries, for `cancel_query`.
     pub(in crate::core) queries: QueryRegistry,
     /// Per-tab sessions on production connections (manual commit), keyed by tab id.
@@ -50,6 +52,7 @@ impl AppState {
             connections: Mutex::new(connections),
             pools: PoolCache::default(),
             mongo: MongoClients::default(),
+            redis: RedisClients::default(),
             queries: QueryRegistry::default(),
             sessions: SessionRegistry::default(),
             chats: ChatRegistry::default(),
@@ -126,6 +129,24 @@ impl crate::core::mongo::client::Access for AppState {
 
     fn mongo(&self) -> &MongoClients {
         &self.mongo
+    }
+
+    fn secrets(&self) -> &dyn SecretStore {
+        self.secrets.as_ref()
+    }
+
+    fn queries(&self) -> &QueryRegistry {
+        &self.queries
+    }
+}
+
+impl crate::core::redis::client::Access for AppState {
+    fn connection(&self, id: &str) -> Result<Connection, AppError> {
+        Self::connection(self, id)
+    }
+
+    fn redis(&self) -> &RedisClients {
+        &self.redis
     }
 
     fn secrets(&self) -> &dyn SecretStore {

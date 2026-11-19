@@ -11,6 +11,7 @@
     "core:window:allow-internal-toggle-maximize",
     "core:window:allow-set-effects",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "notification:default"
   ]
 }

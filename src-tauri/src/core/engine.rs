@@ -1,8 +1,8 @@
-//! Engine identity, the connection settings both engines share, and the dialect facts every
+//! Engine identity, shared connection settings, and the dialect facts every
 //! caller must agree on.
 //!
 //! `Engine` is the value a saved connection carries on the wire. SQL modules never take it: the
-//! routing layer resolves it once per operation into a `SqlEngine`, which has no MongoDB variant.
+//! routing layer resolves it once per operation into a `SqlEngine`, which describes only SQL.
 //! Everything a dialect decides (label, quoting, placeholders, the MySQL system schemas, the
 //! SQLite pragmas a read may run) is a method here, so a caller cannot hold its own copy.
 
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// Bound for opening any database connection, SQL pool or MongoDB client.
+/// Bound for opening a database connection, pool or client.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pooled connections per SQL connection and database.
 pub const MAX_CONNECTIONS: u32 = 5;
@@ -24,6 +24,15 @@ pub enum Engine {
     Mysql,
     Sqlite,
     Mongo,
+    Redis,
+}
+
+/// How the operation routers dispatch a saved connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Sql(SqlEngine),
+    Mongo,
+    Redis,
 }
 
 impl Engine {
@@ -33,31 +42,40 @@ impl Engine {
             Engine::Mysql => 3306,
             Engine::Sqlite => 0,
             Engine::Mongo => 27017,
+            Engine::Redis => 6379,
         }
     }
 
-    /// The SQL engine behind this connection. `None` for MongoDB: its operations are entered
-    /// through the routing layer, never by a SQL module.
+    /// The SQL engine behind this connection, if it has one.
     pub fn sql(self) -> Option<SqlEngine> {
-        match self {
-            Engine::Pg => Some(SqlEngine::Pg),
-            Engine::Mysql => Some(SqlEngine::Mysql),
-            Engine::Sqlite => Some(SqlEngine::Sqlite),
-            Engine::Mongo => None,
+        match self.family() {
+            Family::Sql(engine) => Some(engine),
+            Family::Mongo | Family::Redis => None,
         }
     }
 
-    /// The name shown to the user and the model. The SQL engines answer through the descriptor;
-    /// MongoDB's is here because no SQL module may name it.
-    pub fn label(self) -> &'static str {
-        self.sql().map_or("MongoDB", SqlEngine::label)
+    pub fn family(self) -> Family {
+        match self {
+            Engine::Pg => Family::Sql(SqlEngine::Pg),
+            Engine::Mysql => Family::Sql(SqlEngine::Mysql),
+            Engine::Sqlite => Family::Sql(SqlEngine::Sqlite),
+            Engine::Mongo => Family::Mongo,
+            Engine::Redis => Family::Redis,
+        }
     }
 
-    /// The engine's rows can hold a number as text. MongoDB has no JSON form for an int64
-    /// beyond 2^53 or a Decimal128, so its grid and chart rows carry them as text; a chart
-    /// converts the finite ones before it draws them. The SQL drivers send JSON numbers.
+    /// The name shown to the user and the model.
+    pub fn label(self) -> &'static str {
+        match self.family() {
+            Family::Sql(engine) => engine.label(),
+            Family::Mongo => "MongoDB",
+            Family::Redis => "Redis",
+        }
+    }
+
+    /// Whether numeric cells can be text to preserve their precision.
     pub fn numbers_as_text(self) -> bool {
-        self == Engine::Mongo
+        matches!(self, Engine::Mongo | Engine::Redis)
     }
 }
 
@@ -266,6 +284,7 @@ mod tests {
         assert_eq!(SqlEngine::Mysql.label(), "MySQL/MariaDB");
         assert_eq!(SqlEngine::Sqlite.label(), "SQLite");
         assert_eq!(Engine::Mongo.label(), "MongoDB");
+        assert_eq!(Engine::Redis.label(), "Redis");
         assert_eq!(SqlEngine::Pg.quote("a\"b"), "\"a\"\"b\"");
         assert_eq!(SqlEngine::Sqlite.quote("plain"), "\"plain\"");
         assert_eq!(SqlEngine::Mysql.quote("a`b"), "`a``b`");

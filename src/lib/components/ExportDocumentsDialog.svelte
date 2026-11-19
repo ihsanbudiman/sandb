@@ -59,10 +59,10 @@
       <span class="label">Format</span>
       <div class="seg w-fit" role="radiogroup" aria-label="Format">
         {#each formats as f (f.value)}
-          <button type="button" class="seg-item {format === f.value ? 'seg-on' : ''}" role="radio" aria-checked={format === f.value} onclick={() => (format = f.value)}>{f.label}</button>
+          <button type="button" class="seg-item {format === f.value ? 'seg-on' : ''}" role="radio" aria-checked={format === f.value} data-autofocus={format === f.value ? '' : undefined} onclick={() => (format = f.value)}>{f.label}</button>
         {/each}
       </div>
-      <p class="text-[12px] leading-relaxed text-faint">
+      <p class="text-sm leading-relaxed text-faint">
         {#if format === 'csv'}
           One row for each field path of the documents; arrays and nested documents become JSON text.
         {:else if format === 'json'}
@@ -81,13 +81,13 @@
             <button type="button" class="seg-item {ejson === o.value ? 'seg-on' : ''}" role="radio" aria-checked={ejson === o.value} onclick={() => (ejson = o.value)}>{o.label}</button>
           {/each}
         </div>
-        <p class="text-[12px] leading-relaxed text-faint">Canonical keeps every type, for example int64 and decimal; relaxed is easier to read.</p>
+        <p class="text-sm leading-relaxed text-faint">Canonical keeps every type, for example int64 and decimal; relaxed is easier to read.</p>
       </div>
     {/if}
   </div>
 
   {#snippet footer()}
-    <button class="btn btn-secondary" onclick={() => answer(null)} disabled={busy}>Cancel</button>
-    <button class="btn btn-primary" disabled={busy} onclick={submit}>Export...</button>
+    <button class="btn btn-sm btn-secondary" onclick={() => answer(null)} disabled={busy}>Cancel</button>
+    <button class="btn btn-sm btn-primary" disabled={busy} onclick={submit}>Export...</button>
   {/snippet}
 </Modal>

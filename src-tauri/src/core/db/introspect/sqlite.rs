@@ -46,6 +46,7 @@ pub async fn tables(p: &SqlitePool) -> Result<Vec<TableInfo>, AppError> {
                     k == TableKind::Table && !without_rowid(sql.as_deref().unwrap_or("")),
                 ),
                 partition_of: None,
+                redis_type: None,
             }
         })
         .collect())
@@ -320,6 +321,7 @@ pub async fn properties(p: &SqlitePool, table: &str) -> Result<Option<TablePrope
         foreign_keys: group_foreign_keys(foreign_keys),
         references: group_foreign_keys(references),
         mongo: None,
+        redis: None,
     }))
 }
 

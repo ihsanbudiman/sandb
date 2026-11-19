@@ -171,6 +171,7 @@ pub(crate) async fn sqlite_conn(
             uri: String::new(),
             auth_source: String::new(),
             topology: None,
+            redis: None,
         },
         None,
     )

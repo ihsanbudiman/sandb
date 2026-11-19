@@ -37,21 +37,22 @@
 <Modal
   title={drop ? `Drop this ${what}?` : 'Truncate this table?'}
   role="alertdialog"
+  describedBy="table-danger-help"
   {busy}
   {error}
   errorLabel={drop ? 'Drop failed:' : 'Truncate failed:'}
   onclose={() => answer(false)}
 >
   {#snippet head()}
-    {#if drop}<Trash size={15} class="text-red-600 dark:text-red-400" />{:else}<Eraser size={15} class="text-red-600 dark:text-red-400" />{/if}
+    {#if drop}<Trash size={15} class="text-danger" />{:else}<Eraser size={15} class="text-danger" />{/if}
   {/snippet}
 
   <TargetBadge conn={d.c} target={d.t} />
-  <p class="mt-3 leading-relaxed text-muted">
+  <p id="table-danger-help" class="mt-3 leading-relaxed text-muted">
     {drop ? `This removes the ${what} and all its data from the database.` : 'This deletes every row of the table.'}
     The statement runs immediately and commits. You cannot undo it.
   </p>
-  <pre class="mt-3 overflow-x-auto rounded-lg bg-sunken px-3 py-2 font-mono text-[12px] text-ink">{sql}</pre>
+  <pre class="mt-3 overflow-x-auto rounded-lg bg-sunken px-3 py-2 font-mono text-sm text-ink">{sql}</pre>
 
   {#if prod}
     <ProdAck class="mt-3" bind:checked={ack}>
@@ -60,9 +61,9 @@
   {/if}
 
   {#snippet footer()}
-    <button class="btn btn-secondary" disabled={busy} onclick={() => answer(false)}>Cancel</button>
-    <button class="btn bg-red-600 text-white enabled:hover:bg-red-500" disabled={ackBlocked(prod, ack, busy)} onclick={go}>
-      {#if busy}<LoaderCircle size={13} class="animate-spin" />{/if} {drop ? `Drop ${what}` : 'Truncate table'}
+    <button class="btn btn-sm btn-secondary" data-autofocus disabled={busy} onclick={() => answer(false)}>Cancel</button>
+    <button class="btn btn-sm btn-danger" disabled={ackBlocked(prod, ack, busy)} onclick={go}>
+      {#if busy}<LoaderCircle size={12} class="motion-safe:animate-spin" />{/if} {drop ? `Drop ${what}` : 'Truncate table'}
     </button>
   {/snippet}
 </Modal>

@@ -247,6 +247,7 @@ mod tests {
             uri: String::new(),
             auth_source: String::new(),
             topology: None,
+            redis: None,
         }
     }
 

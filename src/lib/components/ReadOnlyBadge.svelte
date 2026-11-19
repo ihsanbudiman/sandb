@@ -1,4 +1,4 @@
 <script lang="ts">
 </script>
 
-<span class="tag shrink-0 text-faint" title="Read-only connection: all writes are refused">Read-only</span>
+<span class="tag shrink-0 whitespace-nowrap text-faint" title="Read-only connection: all writes are refused">Read-only</span>

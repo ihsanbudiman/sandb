@@ -1,13 +1,13 @@
-import { api, ApiError, type DocumentExportFormat, type EjsonFlavor, type ExportResult, type QueryResult, type RunSort, type StatementResult } from './api';
+import { api, ApiError, errorText, type DocumentExportFormat, type EjsonFlavor, type ExportResult, type QueryResult, type RunSort, type StatementResult } from './api';
 import { DEFAULT_LIMIT } from './api/generated/constants';
 import { logQuery } from './audit.svelte';
-import { afterRun, loadProperties, structureChanged } from './catalog.svelte';
-import { canWrite, db, type Conn } from './connections.svelte';
+import { afterRun, loadProperties, redisKeys, structureChanged } from './catalog.svelte';
+import { canWrite, db, isRedis, isSql, type Conn } from './connections.svelte';
 import { confirmDiscard } from './edits';
 import { notify } from './notice.svelte';
 import { moreRows, toResult, toResults } from './results';
 import { ui } from './state.svelte';
-import { activeTab, replaceActiveResult, replaceResult, setResults, tabDatabase, type Tab } from './tabs.svelte';
+import { activeTab, replaceActiveResult, replaceResult, setResults, tabDatabase, tabs, type Tab } from './tabs.svelte';
 import { displayName, mongoCollection, qualified, tableDataSql, type Danger, type TableRef } from './tableActions';
 import { tableIdOf } from './tableId';
 import { refreshStatus } from './tx.svelte';
@@ -52,40 +52,41 @@ const lastParams: Record<string, string> = {};
  * `known`: the caller's classification of the same text, so the guard is asked once.
  */
 export async function run(pick: { sql: string; script?: string; sort?: RunSort; append?: boolean }, t = activeTab(), known?: Classification): Promise<void> {
-  if (!t || runs[t.id] || !confirmDiscard(t.edits)) return;
+  if (!t || runs[t.id]) return;
   const c = connOfTab(t);
   if (!c) return;
+  const { database, result } = t;
+  const stillValid = () => tabs.list.includes(t) && connOfTab(t) === c && t.database === database && t.result === result && !runs[t.id];
+  if (!await confirmDiscard(t.edits) || !stillValid()) return;
   // `$1`, `$2`… in SQL ask for their values first, as in DBeaver. A file run is sent as it is.
   let sql = pick.sql;
-  const dialect = c.engine === 'mongo' || pick.script ? null : c.engine;
+  const dialect = isSql(c) && !pick.script ? c.engine : null;
   const names = dialect ? placeholders(sql, dialect) : [];
   if (dialect && names.length) {
     const values = await ask<Record<string, string> | null>(QueryParamsDialog, { names, values: lastParams });
-    // Another run of the tab may have started while the dialog was open.
-    if (!values || runs[t.id]) return;
+    if (!values || !stillValid()) return;
     Object.assign(lastParams, values);
     sql = fillPlaceholders(sql, dialect, values);
     known = undefined;
   }
-  const cls = known ?? (await classify(c.engine, sql, t.database));
-  if (cls.empty) return;
-  // A production Mongo write asks first, like the table danger dialogs; text the backend could not
-  // parse is a write too, so it cannot slip past the guard.
-  if (c.engine === 'mongo' && c.env === 'production' && canWrite(c) && cls.write) {
+  const cls = known ?? (await classify(c.engine, sql, database));
+  if (cls.empty || !stillValid()) return;
+  // Production writes outside SQL ask first. Unparsable text counts as a write too.
+  if (!isSql(c) && c.env === 'production' && canWrite(c) && cls.write) {
     const info = cls.info ?? { statements: [], warnings: [{ code: 'unparsable' as const, message: 'The text could not be parsed, so it is treated as a write.' }] };
     if (!(await ask<boolean>(MongoWriteDialog, { info, conn: c }))) return;
   }
-  await execute(t, c, sql, t.database, cls, pick);
+  if (stillValid()) await execute(t, c, sql, database, cls, pick);
 }
 
 /** Re-runs the shown result with a higher limit, the grid's sort, or on Refresh; it never asks for a target. */
 export async function rerun(t: Tab, again: { sql: string; limit: number; sort?: RunSort }): Promise<void> {
   if (runs[t.id]) return;
   const c = t.resultConn;
-  // A re-run goes to the database the result came from: a Mongo `use` may have changed it.
+  // A re-run goes to the database the result came from: Mongo `use` or Redis `SELECT` may have changed it.
   const database = t.result?.database || tabDatabase(t, c);
   const cls = await classify(c.engine, again.sql, database);
-  if (cls.empty) return;
+  if (cls.empty || (isRedis(c) && cls.write)) return;
   await execute(t, c, again.sql, database, cls, { sql: again.sql, sort: again.sort, again });
 }
 
@@ -106,8 +107,8 @@ async function execute(
   const started = Date.now();
   runs[t.id] = { id, started, again: !!opts.again, script: opts.script ? { name: opts.script, done: 0, total: 0 } : undefined };
   clock.now = started;
-  // A run should show its result, so it opens a hidden grid.
-  ui.resultsOpen = true;
+  // A first run opens the pane; later runs respect the user's visibility choice.
+  if (!t.result && t === activeTab()) ui.resultsOpen = true;
   // Polls until the run ends; a poll that fails only leaves the count where it was.
   const poll = opts.script
     ? setInterval(() => {
@@ -128,11 +129,12 @@ async function execute(
       const converted = toResults(queryRun, dbName);
       all = converted.results;
       activeIndex = converted.active;
-      r = all[activeIndex] ?? { columns: [], rows: [], ms: queryRun.elapsedMs, note: 'Statement ran.' };
+      r = all[activeIndex] ?? { columns: [], rows: [], ms: queryRun.elapsedMs, note: 'Statement ran.', notices: queryRun.notices };
     }
   } catch (e) {
     const err = ApiError.from(e);
-    r = { columns: [], rows: [], ms: Date.now() - started, error: err.code === 'cancelled' ? (err.detail ? `Query cancelled. ${err.detail}` : 'Query cancelled') : err.message };
+    const message = err.code === 'cancelled' ? (err.detail ? `Query cancelled. ${err.detail}` : 'Query cancelled') : isRedis(c) ? errorText(err) : err.message;
+    r = { columns: [], rows: [], ms: Date.now() - started, error: message };
   } finally {
     clearInterval(poll);
     delete runs[t.id];
@@ -157,7 +159,8 @@ async function execute(
     ms: r.ms,
     conn: c,
   });
-  if (!r.error) afterRun(c, cls, dbName);
+  // A failed or cancelled Redis run can still have changed keys.
+  if (!r.error || (isRedis(c) && cls.write && !cls.unparsable)) afterRun(c, cls, dbName);
 }
 
 export function cancel() {
@@ -179,7 +182,8 @@ export function loadTableData(t: Tab) {
   // the read cannot hold as typed stops here, so nothing malformed reaches the server.
   let sql: string;
   try {
-    sql = tableDataSql(c.engine, ref, t.filters, t.result?.columns ?? [], t.result?.types ?? []);
+    const key = isRedis(c) ? redisKeys(c.id, ref.database)?.items.keys.find((k) => k.name === ref.name) : undefined;
+    sql = tableDataSql(c.engine, key ? { ...ref, redisType: key.redisType, rowEstimate: key.rowEstimate } : ref, t.filters, t.result?.columns ?? [], t.result?.types ?? []);
   } catch (e) {
     notify(false, e instanceof Error ? e.message : String(e));
     return;
@@ -187,8 +191,8 @@ export function loadTableData(t: Tab) {
   t.query = sql;
   t.opened = { id: tableIdOf(c.id, ref), sql };
   // The grid's foreign key links come from the catalog, loaded once per table.
-  void loadProperties(c.id, ref.database, ref.schema, ref.name);
-  void run({ sql, sort: t.sort }, t);
+  if (!isRedis(c)) void loadProperties(c.id, ref.database, ref.schema, ref.name);
+  return run({ sql, sort: t.sort }, t);
 }
 
 /** The sort the grid shows: a table tab keeps it on the tab, any other result on the result itself. */
@@ -199,9 +203,10 @@ export function loadMore(t: Tab) {
   if (r?.sql && r.limit && moreRows(r)) void rerun(t, { sql: r.sql, limit: r.limit * 2, sort: sortOf(t, r) });
 }
 
-export function sortResult(t: Tab, sort: RunSort) {
+export async function sortResult(t: Tab, sort: RunSort) {
   const r = t.result;
-  if (!r?.sql || !r.sortable || r.summary || runs[t.id] || !confirmDiscard(t.edits)) return;
+  if (!r?.sql || !r.sortable || r.summary || runs[t.id]) return;
+  if (!await confirmDiscard(t.edits) || t.result !== r || runs[t.id] || !tabs.list.includes(t)) return;
   if (t.table) t.sort = sort;
   else r.sort = sort;
   void rerun(t, { sql: r.sql, limit: r.limit ?? DEFAULT_LIMIT, sort });
@@ -227,7 +232,7 @@ export async function exportTable(c: Conn, t: TableRef, a: 'exportDdl' | 'export
   try {
     const out = a === 'exportCsv' ? await api.exportCsv({ connId: c.id, database: t.database, sql: `SELECT * FROM ${qualified(c.engine, t)}` }) : await api.exportTableSql({ connId: c.id, database: t.database, schema: t.schema, table: t.name, data: a === 'exportSql' });
     if (out.cancelled) return;
-    const what = c.engine === 'mongo' ? 'script' : 'DDL';
+    const what = isRedis(c) ? 'Redis script' : c.engine === 'mongo' ? 'script' : 'DDL';
     if (a === 'exportCsv') notify(true, `Exported ${out.rows} rows to ${out.path}`);
     else notify(true, a === 'exportSql' && t.kind === 'table' ? `Exported the ${what} and ${out.rows} rows to ${out.path}` : `Exported the ${what} to ${out.path}`);
   } catch (err) {

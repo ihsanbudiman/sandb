@@ -43,29 +43,29 @@
   }
 </script>
 
-<Modal title="Uncommitted changes" role="alertdialog" {busy} {error} onclose={() => answer(false)}>
-  {#snippet head()}<GitCommitHorizontal size={15} class="text-amber-600 dark:text-amber-400" />{/snippet}
+<Modal title="Uncommitted changes" role="alertdialog" describedBy="pending-tx-help" {busy} {error} onclose={() => answer(false)}>
+  {#snippet head()}<GitCommitHorizontal size={15} class="text-warn" />{/snippet}
 
-  <p class="leading-relaxed text-muted">{action} ends the open transaction of {left.length === 1 ? 'this tab' : 'these tabs'}. Commit the changes or roll them back first.</p>
+  <p id="pending-tx-help" class="leading-relaxed text-muted">{action} ends the open transaction of {left.length === 1 ? 'this tab' : 'these tabs'}. Commit the changes or roll them back first.</p>
   <ul class="mt-3 divide-y divide-line rounded-lg border border-line">
     {#each left as t (t.id)}
       <li class="flex items-center gap-2 px-3 py-2">
-        <span class="size-1.5 shrink-0 rounded-full bg-amber-500"></span>
+        <span class="size-1.5 shrink-0 rounded-full bg-warn"></span>
         <b class="truncate font-medium">{t.title}</b>
-        <span class="truncate text-[12.5px] text-muted">{connName(t.connId)}</span>
-        {#if t.status?.aborted}<span class="tag ml-auto text-red-700 dark:text-red-400">aborted</span>{/if}
+        <span class="truncate text-sm text-muted">{connName(t.connId)}</span>
+        {#if t.status?.aborted}<span class="tag ml-auto text-danger">aborted</span>{/if}
       </li>
     {/each}
   </ul>
   {#if aborted}
-    <p class="mt-2.5 text-[12.5px] text-muted">A failed statement aborted a transaction; it can only be rolled back.</p>
+    <p class="mt-2.5 text-sm text-muted">A failed statement aborted a transaction; it can only be rolled back.</p>
   {/if}
 
   {#snippet footer()}
-    <button class="btn btn-secondary" disabled={busy} onclick={() => answer(false)}>Cancel</button>
-    <button class="btn btn-secondary" disabled={busy} onclick={() => finish(false)}>Rollback</button>
-    <button class="btn btn-primary" disabled={busy || aborted} onclick={() => finish(true)}>
-      {#if busy}<LoaderCircle size={13} class="animate-spin" />{/if} Commit
+    <button class="btn btn-sm btn-secondary" data-autofocus disabled={busy} onclick={() => answer(false)}>Cancel</button>
+    <button class="btn btn-sm btn-secondary" disabled={busy} onclick={() => finish(false)}>Rollback</button>
+    <button class="btn btn-sm btn-primary" disabled={busy || aborted} onclick={() => finish(true)}>
+      {#if busy}<LoaderCircle size={12} class="motion-safe:animate-spin" />{/if} Commit
     </button>
   {/snippet}
 </Modal>

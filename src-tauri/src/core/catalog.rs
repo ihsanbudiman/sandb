@@ -6,13 +6,15 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::core::connections::{
-    Connection, ConnectionInput, SslMode, TestResult, build, input_of, require, same_target,
+    Connection, ConnectionInput, RedisMode, RedisSettings, SslMode, TestResult, build, input_of,
+    require, same_target,
 };
 use crate::core::db::pool::{self, DbPool};
-use crate::core::engine::{CONNECT_TIMEOUT, Engine};
+use crate::core::engine::{CONNECT_TIMEOUT, Engine, Family};
 use crate::core::error::AppError;
 use crate::core::mongo;
-use crate::core::secrets::{self, password_account, AI_KEY_ACCOUNT};
+use crate::core::redis;
+use crate::core::secrets::{self, AI_KEY_ACCOUNT, password_account};
 use crate::core::state::AppState;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -20,7 +22,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Trims fields and fills engine defaults. `require_name` is off for a test run from an unnamed
-/// form. The second value is the password of a MongoDB connection string; it overrides the
+/// form. The second value is the password from a connection string; it overrides the
 /// password argument of the caller.
 fn normalize(
     input: ConnectionInput,
@@ -85,11 +87,64 @@ fn normalize(
                 i.port = i.engine.default_port();
             }
         }
+        Engine::Redis => {
+            i.file.clear();
+            let mut settings = i.redis.take().unwrap_or_default();
+            if !i.uri.is_empty() {
+                let (parts, password) = redis::conn::parse_uri(&i.uri)?;
+                i.uri = parts.redacted;
+                i.host = parts.host;
+                i.port = parts.port;
+                i.user = parts.user;
+                i.database = parts.database;
+                i.ssl = parts.ssl;
+                uri_password = password;
+                settings = RedisSettings::default();
+            } else {
+                require(&i.host, "Host is required")?;
+                if settings.mode == RedisMode::Standalone && i.host.contains(',') {
+                    return Err(AppError::invalid(
+                        "Standalone takes one host. Choose Cluster or Sentinel for a host list.",
+                    ));
+                }
+                if i.port == 0 {
+                    i.port = if settings.mode == RedisMode::Sentinel {
+                        26379
+                    } else {
+                        Engine::Redis.default_port()
+                    };
+                }
+                redis::conn::parse_nodes(&i.host, i.port)?;
+                if settings.mode == RedisMode::Sentinel {
+                    settings.sentinel_master = settings.sentinel_master.trim().to_string();
+                    require(&settings.sentinel_master, "Master name is required")?;
+                } else {
+                    settings.sentinel_master.clear();
+                    settings.sentinel_auth = false;
+                }
+                if i.ssl == SslMode::Prefer {
+                    return Err(AppError::invalid(
+                        "Redis has no Prefer TLS mode. Choose Disable or Require.",
+                    ));
+                }
+            }
+            let database = redis::conn::parse_database(&i.database)?;
+            if settings.mode == RedisMode::Cluster && database != 0 {
+                return Err(AppError::invalid("Redis Cluster has only database 0"));
+            }
+            i.database = database.to_string();
+            i.redis = Some(settings);
+        }
+    }
+    if !matches!(i.engine, Engine::Mongo | Engine::Redis) {
+        i.uri.clear();
     }
     if i.engine != Engine::Mongo {
-        i.uri.clear();
         i.auth_source.clear();
         i.topology = None;
+    }
+    if i.engine != Engine::Redis {
+        i.redis = None;
     }
     Ok((i, uri_password))
 }
@@ -167,6 +222,7 @@ impl AppState {
             (updated, reconnect)
         };
         if reconnect {
+            self.redis.close(id);
             // Production tabs keep their own session: drop it too, so the next run reconnects
             // with the new settings instead of continuing a transaction on the old target.
             // Sessions first: a pool close waits for every connection it lent out.
@@ -234,6 +290,7 @@ impl AppState {
             self.store.save_connections(&next)?;
             *list = next;
         }
+        self.redis.close(id);
         self.sessions.close_conn(id).await;
         self.pools.close(id).await;
         self.mongo.close(id).await;
@@ -286,9 +343,9 @@ impl AppState {
     ) -> Result<TestResult, AppError> {
         let (conn, password) = self.test_target(input, password, id)?;
         let started = Instant::now();
-        let info = match conn.engine.sql() {
-            Some(engine) => pool::probe(&conn, engine, password.as_deref()).await?,
-            None => {
+        let info = match conn.engine.family() {
+            Family::Sql(engine) => pool::probe(&conn, engine, password.as_deref()).await?,
+            Family::Mongo => {
                 let work = mongo::conn::probe(&conn, password.as_deref());
                 match tokio::time::timeout(CONNECT_TIMEOUT, work).await {
                     Ok(Ok((version, topology))) => pool::ServerInfo {
@@ -299,6 +356,15 @@ impl AppState {
                     Err(_) => return Err(AppError::connect_timeout()),
                 }
             }
+            Family::Redis => pool::ServerInfo {
+                version: tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    redis::conn::probe(&conn, password.as_deref()),
+                )
+                .await
+                .map_err(|_| AppError::connect_timeout())??,
+                topology: None,
+            },
         };
         Ok(TestResult {
             server_version: info.version,
@@ -408,6 +474,7 @@ mod tests {
             uri: String::new(),
             auth_source: String::new(),
             topology: None,
+            redis: None,
         }
     }
 
@@ -428,6 +495,7 @@ mod tests {
             uri: String::new(),
             auth_source: String::new(),
             topology: None,
+            redis: None,
         }
     }
 
@@ -818,6 +886,111 @@ mod tests {
         }
     }
 
+    fn redis_input(mode: RedisMode) -> ConnectionInput {
+        ConnectionInput {
+            engine: Engine::Redis,
+            database: String::new(),
+            ssl: SslMode::Disable,
+            redis: Some(RedisSettings {
+                mode,
+                ..RedisSettings::default()
+            }),
+            ..pg_input("redis")
+        }
+    }
+
+    #[test]
+    fn redis_normalizes_deployment_fields() {
+        let standalone = redis_input(RedisMode::Standalone);
+        let (normalized, _) = normalize(standalone.clone(), true).unwrap();
+        assert_eq!((normalized.port, normalized.database.as_str()), (6379, "0"));
+        for (host, database, ssl, message) in [
+            ("", "0", SslMode::Disable, "Host is required"),
+            (
+                "redis1,redis2",
+                "0",
+                SslMode::Disable,
+                "Standalone takes one host",
+            ),
+            (
+                "redis1:abc",
+                "0",
+                SslMode::Disable,
+                "is not host or host:port",
+            ),
+            (
+                "redis1",
+                "-1",
+                SslMode::Disable,
+                "Database must be a number",
+            ),
+            (
+                "redis1",
+                "0",
+                SslMode::Prefer,
+                "Redis has no Prefer TLS mode",
+            ),
+        ] {
+            let input = ConnectionInput {
+                host: host.into(),
+                database: database.into(),
+                ssl,
+                ..standalone.clone()
+            };
+            let error = normalize(input, true).unwrap_err();
+            assert!(error.message.contains(message), "{error:?}");
+        }
+        let mut cluster = redis_input(RedisMode::Cluster);
+        cluster.database = "1".into();
+        assert_eq!(
+            normalize(cluster, true).unwrap_err().message,
+            "Redis Cluster has only database 0"
+        );
+        let mut sentinel = redis_input(RedisMode::Sentinel);
+        assert_eq!(
+            normalize(sentinel.clone(), true).unwrap_err().message,
+            "Master name is required"
+        );
+        sentinel.redis.as_mut().unwrap().sentinel_master = " mymaster ".into();
+        let (sentinel, _) = normalize(sentinel, true).unwrap();
+        assert_eq!(sentinel.port, 26379);
+        assert_eq!(sentinel.redis.unwrap().sentinel_master, "mymaster");
+    }
+
+    #[test]
+    fn redis_mode_change_does_not_reuse_secret_for_test_or_duplicate() {
+        let (_dir, st) = state();
+        let saved = st
+            .create_connection(redis_input(RedisMode::Standalone), Some(PW.into()))
+            .unwrap();
+        let mut target = input_of(&saved);
+        target.redis.as_mut().unwrap().mode = RedisMode::Cluster;
+        assert!(!same_target(&saved, &target));
+        let error = st
+            .test_target(target.clone(), None, Some(&saved.id))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        let error = st
+            .duplicate_connection(&saved.id, Some(target), None)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn redis_uri_password_stays_in_secret_store() {
+        let (dir, st) = state();
+        let input = ConnectionInput {
+            uri: format!("rediss://alice:{PW}@redis.example.test/3"),
+            ..redis_input(RedisMode::Sentinel)
+        };
+        let connection = st.create_connection(input, None).unwrap();
+        assert_eq!(connection.uri, "rediss://alice@redis.example.test/3");
+        assert_eq!(connection.redis.unwrap().mode, RedisMode::Standalone);
+        assert_eq!(secret(&st, &connection.id).as_deref(), Some(PW));
+        let raw = std::fs::read_to_string(dir.path().join(CONNECTIONS_FILE)).unwrap();
+        assert!(!raw.contains(PW));
+    }
+
     #[tokio::test]
     async fn mongo_string_password_lives_in_the_secret_store_only() {
         let (dir, st) = state();
@@ -1019,6 +1192,7 @@ mod tests {
                 "name",
                 "port",
                 "readOnly",
+                "redis",
                 "ssl",
                 "topology",
                 "uri",
@@ -1029,5 +1203,6 @@ mod tests {
         assert_eq!(v["engine"], "pg");
         assert_eq!(v["env"], "staging");
         assert_eq!(v["ssl"], "prefer");
+        assert!(v["redis"].is_null());
     }
 }

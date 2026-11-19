@@ -55,4 +55,6 @@ export interface Session {
   messages: Msg[];
   /** Skills the user picked for this chat, by name. Missing in chats saved before skills existed; a new chat starts with none. */
   skills?: string[];
+  /** The schedule that started this chat; missing for chats the user started. */
+  scheduleId?: string;
 }

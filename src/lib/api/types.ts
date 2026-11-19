@@ -31,21 +31,26 @@ import type {
   ExportResult,
   GuardCheck,
   GuardCheckArgs,
+  KeyList,
   ListAiModelsArgs,
   ListColumnsArgs,
   ListDatabasesArgs,
+  ListKeysArgs,
   ListSchemasArgs,
   ListTablesArgs,
   McpSettings,
   McpStatus,
   MongoUriParts,
   ParseMongoUriArgs,
+  ParseRedisUriArgs,
   QueryProgress,
   QueryProgressArgs,
   QueryRun,
+  RedisUriParts,
   ReorderConnectionsArgs,
   RollbackTransactionArgs,
   RunAiReadArgs,
+  RunScheduledReadArgs,
   RunQueryArgs,
   RunSort,
   SaveAiSettingsArgs,
@@ -110,7 +115,7 @@ export interface QueryResult {
   documents?: unknown[];
   /** MongoDB only: BSON type of each cell, same shape as `rows`; "missing" when the document has no such field. */
   cellTypes?: string[][];
-  /** MongoDB edits: full cell values loaded with `cellValue`, by row index and path; an update uses them as its old values. */
+  /** MongoDB and Redis edits: full values loaded with `cellValue`, by row index and column. */
   loaded?: Record<number, Record<string, TypedValue>>;
 }
 
@@ -153,6 +158,8 @@ export interface Capabilities {
   ai: boolean;
   /** The desktop app runs the MCP server. */
   mcp: boolean;
+  /** The desktop app shows OS notifications. */
+  notifications: boolean;
 }
 
 /** The commands every transport implements. The argument types are the Rust command arguments. */
@@ -168,6 +175,7 @@ export interface Backend {
   listDatabases(args: ListDatabasesArgs): Promise<string[]>;
   listSchemas(args: ListSchemasArgs): Promise<string[]>;
   listTables(args: ListTablesArgs): Promise<TableInfo[]>;
+  listKeys(args: ListKeysArgs): Promise<KeyList>;
   listColumns(args: ListColumnsArgs): Promise<ColumnInfo[]>;
   tableProperties(args: TablePropertiesArgs): Promise<TableProperties>;
   schemaSnapshot(args: SchemaSnapshotArgs): Promise<SchemaSnapshot>;
@@ -193,9 +201,11 @@ export interface Backend {
   /** Without `fileExport` the UI downloads in the browser. */
   savePdf(name: string, pdf: Uint8Array): Promise<string | null>;
   parseMongoUri(args: ParseMongoUriArgs): Promise<MongoUriParts | null>;
+  parseRedisUri(args: ParseRedisUriArgs): Promise<RedisUriParts | null>;
   guardCheck(args: GuardCheckArgs): Promise<GuardCheck>;
   classifyWrite(args: ClassifyWriteArgs): Promise<WriteInfo>;
   runAiRead(args: RunAiReadArgs): Promise<AiReadResult>;
+  runScheduledRead(args: RunScheduledReadArgs): Promise<AiReadResult>;
   getAiSettings(): Promise<AiSettingsView>;
   saveAiSettings(args: SaveAiSettingsArgs): Promise<AiSettingsView>;
   setAiKey(args: SetAiKeyArgs): Promise<void>;

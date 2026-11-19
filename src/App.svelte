@@ -1,16 +1,18 @@
 <script lang="ts">
-  import { Database, Search, Settings, ScrollText, Sun, Moon, Plus, Sparkles, PanelRight, PanelLeft, CircleArrowUp, PanelBottom } from '@lucide/svelte';
-  import { FileCode, Play, Square, X, LoaderCircle, Check, Undo2, ListOrdered, FileUp, Scissors, Copy, ClipboardPaste, ChevronUp, ChevronDown, Table2, Eye, ScanEye, RotateCw, Save, CopyPlus, WandSparkles } from '@lucide/svelte';
-  import { tick } from 'svelte';
-  import { db, envTag, duplicateDraft, sameSource, setAiWrite, dbOf, defaultDb, type Conn } from './lib/connections.svelte';
+  import { Database, Search, Settings, ScrollText, Sun, Moon, Plus, Sparkles, PanelRight, PanelLeft, CircleArrowUp, PanelBottom, CalendarClock } from '@lucide/svelte';
+  import { FileCode, Play, Square, X, LoaderCircle, Check, Undo2, ListOrdered, FileUp, Scissors, Copy, ClipboardPaste, ChevronUp, ChevronDown, Table2, Eye, ScanEye, RotateCw, Save, CopyPlus, WandSparkles, Pencil } from '@lucide/svelte';
+  import { tick, untrack } from 'svelte';
+  import { fade } from 'svelte/transition';
+  import { canWrite, db, envTag, duplicateDraft, isRedis, isSql, sameSource, sameTarget, setAiWrite, dbOf, defaultDb, type Conn } from './lib/connections.svelte';
   import { ui } from './lib/state.svelte';
   import { look, backdropOn, toggleTheme } from './lib/appearance.svelte';
   import { catalog, completionColumns, completionLinks, forget as forgetCatalog, loadSnapshot, loadedTables, properties, snapshot, structureChanged } from './lib/catalog.svelte';
   import { openChatOnTab } from './lib/chat.svelte';
   import type { Source as ChatSource } from './lib/connections.svelte';
-  import { api, ApiError } from './lib/api';
+  import { api, ApiError, type QueryResult } from './lib/api';
   import { appendStatement } from './lib/sql/text';
   import { appendMongoStatement } from './lib/mongo/text';
+  import { appendRedisStatement } from './lib/redis/text';
   import { snapshotSchema } from './lib/results';
   import { confirmDiscard } from './lib/edits';
   import { tabs, activeTab, active, newTab, selectTab, closeTab, setTabConn, openTableTab, openSqlTab, clearResults, activateResult, closeResult, pendingOf, tabDatabase, isPlaceholderTitle, type Tab } from './lib/tabs.svelte';
@@ -19,7 +21,8 @@
   import { tableKey, tableIdOf, tableLabel } from './lib/tableId';
   import { runs, clock, run, cancel, cancelRun, loadTableData, loadMore, sortResult, refreshResult, countRows, exportTable, exportCollection, askDanger } from './lib/run.svelte';
   import { manualCommit, refreshStatus, leaveSession, settlePending, txButtons, endActive } from './lib/tx.svelte';
-  import { ask } from './lib/ask.svelte';
+  import { schedules, unseen, unseenFailed, newSchedule, scheduleFromSaved } from './lib/schedules.svelte';
+  import { ask, confirm } from './lib/ask.svelte';
   import { overlays, overlayOpen } from './lib/overlays.svelte';
   import { notify } from './lib/notice.svelte';
   import { KEYS, isKey } from './lib/keys';
@@ -39,10 +42,14 @@
   import TableProperties from './lib/components/TableProperties.svelte';
   import TableFilterBar from './lib/components/TableFilterBar.svelte';
   import SavedQueries from './lib/components/SavedQueries.svelte';
+  import SchedulerPage from './lib/components/SchedulerPage.svelte';
+  import RedisKeyDialog from './lib/components/RedisKeyDialog.svelte';
   import SaveQueryDialog from './lib/components/SaveQueryDialog.svelte';
   import NoticeToast from './lib/components/NoticeToast.svelte';
   import WhatsNewDialog from './lib/components/WhatsNewDialog.svelte';
   import AskHost from './lib/components/AskHost.svelte';
+  import GridToolbar from './lib/components/GridToolbar.svelte';
+  import Menu from './lib/components/ui/Menu.svelte';
   import { updates, checkForUpdates, showWhatsNew } from './lib/updates.svelte';
 
   // The overlay title bar puts the macOS window buttons over the top-left corner.
@@ -93,31 +100,67 @@
 
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
   let mainEl = $state<HTMLElement>();
+  let viewportWidth = $state(window.innerWidth);
+  const dockChat = $derived(viewportWidth >= 1100);
+  // Keep room for the workspace; when the window is smaller than that budget, keep the overlay usable.
+  const chatWidthLimit = $derived(Math.min(640, Math.max(Math.min(240, viewportWidth - 16), viewportWidth - 560)));
+  const chatWidth = $derived(Math.min(ui.chatWidth, chatWidthLimit));
+  const sidebarWidthLimit = $derived(clamp(viewportWidth - (dockChat && ui.chatOpen ? chatWidth : 0) - 324, 140, 480));
+  const sidebarWidth = $derived(Math.min(ui.sidebarWidth, sidebarWidthLimit));
+  // The overlay chat covers the editor and its Run button. Entering the narrow layout (or starting in it)
+  // closes the chat once; the user can open it again with the toggle.
+  let wasDocked = true;
+  $effect.pre(() => {
+    if (wasDocked && !dockChat) ui.chatOpen = false;
+    wasDocked = dockChat;
+  });
+  let chatHidden = $state(!ui.chatOpen);
+  let resizingChat = $state(false);
+  let chatToggle = $state<HTMLButtonElement>();
+  let chatPanel = $state<HTMLDivElement>();
+
+  $effect.pre(() => {
+    if (ui.chatOpen) {
+      chatHidden = false;
+    } else {
+      if (chatPanel?.contains(document.activeElement)) chatToggle?.focus();
+      if (matchMedia('(prefers-reduced-motion: reduce)').matches) chatHidden = true;
+      else {
+        const timer = setTimeout(() => (chatHidden = true), 160);
+        return () => clearTimeout(timer);
+      }
+    }
+  });
 
   // Pointer capture keeps the moves coming after the pointer leaves the thin handle.
-  function drag(e: PointerEvent, move: (dx: number, dy: number) => void) {
+  function drag(e: PointerEvent, move: (dx: number, dy: number) => void, end?: () => void) {
     if (e.button !== 0) return;
     e.preventDefault();
     const el = e.currentTarget as HTMLElement;
     const [x, y] = [e.clientX, e.clientY];
     el.setPointerCapture(e.pointerId);
     el.onpointermove = (m) => move(m.clientX - x, m.clientY - y);
-    el.onlostpointercapture = () => (el.onpointermove = el.onlostpointercapture = null);
+    el.onlostpointercapture = () => {
+      el.onpointermove = el.onlostpointercapture = null;
+      end?.();
+    };
   }
 
-  const setSidebar = (w: number) => (ui.sidebarWidth = Math.round(clamp(w, 160, 480)));
-  const setChat = (w: number) => (ui.chatWidth = Math.round(clamp(w, 280, 640)));
+  const setSidebar = (w: number) => (ui.sidebarWidth = Math.round(clamp(w, 140, sidebarWidthLimit)));
+  const setChat = (w: number) => (ui.chatWidth = Math.round(clamp(w, 240, chatWidthLimit)));
   const setSplit = (px: number) => mainEl && (ui.editorSplit = clamp(px / mainEl.clientHeight, 0.1, 0.8));
 
   function resizeSidebar(e: PointerEvent) {
-    const w = ui.sidebarWidth;
+    const w = sidebarWidth;
     drag(e, (dx) => setSidebar(w + dx));
   }
 
   // The chat panel is on the right: a drag to the left makes it wider.
   function resizeChat(e: PointerEvent) {
-    const w = ui.chatWidth;
-    drag(e, (dx) => setChat(w - dx));
+    if (e.button !== 0) return;
+    const w = chatWidth;
+    resizingChat = true;
+    drag(e, (dx) => setChat(w - dx), () => (resizingChat = false));
   }
 
   function resizeEditor(e: PointerEvent) {
@@ -129,12 +172,12 @@
   // Arrow keys move a focused splitter by 16 px.
   function keySidebar(e: KeyboardEvent) {
     const d = { ArrowLeft: -16, ArrowRight: 16 }[e.key];
-    if (d) { e.preventDefault(); setSidebar(ui.sidebarWidth + d); }
+    if (d) { e.preventDefault(); setSidebar(sidebarWidth + d); }
   }
 
   function keyChat(e: KeyboardEvent) {
     const d = { ArrowLeft: 16, ArrowRight: -16 }[e.key];
-    if (d) { e.preventDefault(); setChat(ui.chatWidth + d); }
+    if (d) { e.preventDefault(); setChat(chatWidth + d); }
   }
 
   function keyEditor(e: KeyboardEvent) {
@@ -142,7 +185,13 @@
     if (d && mainEl) { e.preventDefault(); restoreSplit = null; setSplit(ui.editorSplit * mainEl.clientHeight + d); }
   }
 
-  // The sash arrows (as in DBeaver): one arrow moves the split to its limit; the other arrow then restores it.
+  async function toggleResults() {
+    ui.resultsOpen = !ui.resultsOpen;
+    await tick();
+    mainEl?.querySelector<HTMLButtonElement>('[data-results-toggle]:not([hidden] *)')?.focus();
+  }
+
+  // The toolbar arrows move the sash to a limit; the opposite arrow restores the normal split.
   let restoreSplit: number | null = null;
   function sash(dir: 'up' | 'down') {
     const target = dir === 'up' ? 0.1 : 0.8;
@@ -155,39 +204,47 @@
     ui.editorSplit = target;
   }
 
-  async function switchConn(c: Conn) {
-    if (c.id === conn.id || !confirmDiscard(tab.edits)) return;
+  let switching = $state<'conn' | 'db' | null>(null);
+
+  async function switchTarget(target: { conn: Conn } | { database: string }) {
+    if (switching) return;
     const t = tab;
-    if (!(await settlePending([t], 'Switching the connection'))) return;
-    leaveSession(t);
-    setTabConn(t, c);
-    openFirstTable();
+    const c = conn;
+    const previousDb = t.database;
+    const result = t.result;
+    const connSwitch = 'conn' in target;
+    if (connSwitch ? target.conn.id === c.id : c.engine === 'sqlite' || target.database === database) return;
+    switching = connSwitch ? 'conn' : 'db';
+    const stillValid = () => t === tab && conn === c && t.database === previousDb && t.result === result && (!connSwitch || db.connections.includes(target.conn));
+    try {
+      if (!await confirmDiscard(t.edits) || !stillValid()) return;
+      if (!await settlePending([t], connSwitch ? 'Switching the connection' : 'Switching the database') || !stillValid()) return;
+      leaveSession(t);
+      if (connSwitch) setTabConn(t, target.conn);
+      else t.database = target.database;
+      openFirstTable();
+    } finally {
+      switching = null;
+    }
   }
 
-  // The session belongs to the old database, like a connection switch.
-  async function switchDb(name: string) {
-    if (conn.engine === 'sqlite' || name === database || !confirmDiscard(tab.edits)) return;
-    const t = tab;
-    if (!(await settlePending([t], 'Switching the database'))) return;
-    leaveSession(t);
-    t.database = name;
-    openFirstTable();
-  }
-
-  // Double-click, ⌘-click or "View data" in the tree: a table tab with the table's data and properties.
+  // Double-click, ⌘-click or "View data" in the tree opens a table or key tab.
   // A tab that already shows the table comes to the front instead of a second one.
   // `filters`: replace the tab's filters and load again, also when the tab already exists (foreign key links).
-  async function openTableView(c: Conn, t: TableRef, filters?: TableFilter[]) {
+  async function openTableView(c: Conn, t: TableRef, { filters, view }: { filters?: TableFilter[]; view?: Tab['view'] } = {}) {
+    const redis = isRedis(c);
     // A table opens in its own tab (or picks the open one): the current tab keeps its edits.
     const { tab: nt, created } = openTableTab(c, t);
-    if (filters) {
+    if (view === 'properties') nt.view = 'properties';
+    else if (redis) nt.view = 'data';
+    else if (filters) {
       nt.filters = filters;
       nt.view = 'data';
     }
     ui.page = 'query';
     await tick();
-    (tabStrip?.querySelector('[aria-current=page]') ?? tabStrip?.lastElementChild)?.scrollIntoView({ inline: 'nearest' });
-    if (created || filters) loadTableData(nt);
+    tabStrip?.querySelector('[aria-selected=true]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    if (nt.view === 'data' && (created || filters || (redis && !nt.result))) await loadTableData(nt);
   }
 
   /** Opens the referenced table, filtered to the row that `row` points at. */
@@ -195,7 +252,7 @@
     const values = fk.columns.map((col) => row[col]);
     if (values.some((v) => v === null || typeof v === 'object')) return;
     const ref: TableRef = { database: from.database, schema: fk.refSchema ?? null, name: fk.refTable, kind: 'table' };
-    openTableView(c, ref, fk.refColumns.map((column, i) => ({ id: crypto.randomUUID(), column, operator: '=', value: String(values[i]) })));
+    openTableView(c, ref, { filters: fk.refColumns.map((column, i) => ({ id: crypto.randomUUID(), column, operator: '=', value: String(values[i]) })) });
   }
 
   // The tabs stay in the title bar on every page; picking one goes back to the query view.
@@ -205,24 +262,79 @@
   }
 
   let tabStrip = $state<HTMLDivElement>();
+  let tabRow = $state<HTMLDivElement>();
+  let tabMenu = $state<{ t: Tab; trigger: HTMLButtonElement; anchor: HTMLButtonElement | { x: number; y: number } } | null>(null);
+  let fadeLeft = $state(false);
+  let fadeRight = $state(false);
+
+  function updateTabEdges() {
+    if (!tabStrip) return;
+    fadeLeft = tabStrip.scrollLeft > 1;
+    fadeRight = tabStrip.scrollLeft + tabStrip.clientWidth < tabStrip.scrollWidth - 1;
+  }
+
+  $effect(() => {
+    if (!tabStrip || !tabRow) return;
+    const observer = new ResizeObserver(updateTabEdges);
+    observer.observe(tabStrip);
+    observer.observe(tabRow);
+    return () => observer.disconnect();
+  });
+
+  function tabKey(e: KeyboardEvent, t: Tab) {
+    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault();
+      editorMenu = null;
+      const trigger = e.currentTarget as HTMLButtonElement;
+      tabMenu = { t, trigger, anchor: trigger };
+      return;
+    }
+    const list = tabs.list;
+    const at = list.indexOf(t);
+    const next = e.key === 'ArrowLeft' ? (at + list.length - 1) % list.length : e.key === 'ArrowRight' ? (at + 1) % list.length : e.key === 'Home' ? 0 : e.key === 'End' ? list.length - 1 : -1;
+    if (next < 0) return;
+    e.preventDefault();
+    pickTab(list[next].id);
+    document.getElementById(`query-tab-${list[next].id}`)?.focus();
+  }
+
+  function openTabMenu(e: MouseEvent, t: Tab) {
+    e.preventDefault();
+    e.stopPropagation();
+    editorMenu = null;
+    const trigger = e.currentTarget as HTMLButtonElement;
+    tabMenu = { t, trigger, anchor: e.clientX || e.clientY ? { x: e.clientX, y: e.clientY } : trigger };
+  }
   async function addTab() {
     // A new tab keeps the edits of the tab it leaves: it never asks to discard them.
     newTab();
     ui.page = 'query';
     await tick();
-    tabStrip?.lastElementChild?.scrollIntoView({ inline: 'nearest' });
+    tabStrip?.querySelector('[aria-selected=true]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 
-  // Pending edits belong to the active tab's result; other tabs can close without asking.
+  // Each close gets the same safeguards, including when invoked from Close others.
   async function dropTab(t: Tab) {
-    if (t.edits.saving) return;
-    if (isDirty(t) && !confirm(`“${t.title}” has unsaved changes. Close the tab without saving them?`)) return;
-    if (t.id !== tab.id && pendingOf(t) && !confirm(`“${t.title}” has unsaved grid changes. Close the tab without saving them?`)) return;
-    if (t.id === tab.id && !confirmDiscard(t.edits)) return;
-    if (!(await settlePending([t], 'Closing this tab')) || !tabs.list.some((x) => x.id === t.id)) return;
+    if (t.edits.saving) return false;
+    if (isDirty(t) && !await confirm({ title: 'Close tab without saving?', body: `“${t.title}” has unsaved changes.`, confirmLabel: 'Close tab', destructive: true })) return false;
+    if (t.id !== tab.id && pendingOf(t) && !await confirm({ title: 'Close tab without saving?', body: `“${t.title}” has unsaved grid changes.`, confirmLabel: 'Close tab', destructive: true })) return false;
+    if (t.id === tab.id && !await confirmDiscard(t.edits)) return false;
+    if (!await settlePending([t], 'Closing this tab') || !tabs.list.includes(t) || t.edits.saving) return false;
+    const hadFocus = document.getElementById(`query-tab-${t.id}`)?.parentElement?.contains(document.activeElement);
     cancelRun(t);
     closeTab(t.id);
     leaveSession(t);
+    if (hadFocus) {
+      await tick();
+      document.getElementById(`query-tab-${tab.id}`)?.focus();
+    }
+    return true;
+  }
+
+  async function closeOtherTabs(keep: Tab) {
+    for (const t of tabs.list.filter((t) => t !== keep)) {
+      if (!await dropTab(t)) break;
+    }
   }
 
   let renaming = $state<string | null>(null);
@@ -234,14 +346,37 @@
     if (t.savedId && findSaved(t.savedId)) renameSaved(t.savedId, title);
     else t.title = title.trim();
   }
-  const focusSelect = (el: HTMLInputElement) => el.select();
+
+  async function keyRename(e: KeyboardEvent, t: Tab) {
+    if (e.key !== 'Enter' && e.key !== 'Escape') return;
+    e.preventDefault();
+    if (e.key === 'Escape') renaming = null;
+    else rename(t, (e.currentTarget as HTMLInputElement).value);
+    await tick();
+    document.getElementById(`query-tab-${t.id}`)?.focus();
+  }
+
+  function focusSelect(el: HTMLInputElement) {
+    el.focus();
+    el.select();
+  }
 
   const conn = $derived(active());
   const hasConn = $derived(db.connections.length > 0);
   const database = $derived(tabDatabase(tab, conn));
   // Autocomplete and palette tables of the active database; the catalog loads them once per database.
   const snap = $derived(snapshot(conn.id, database));
-  const snapItems = $derived(snap?.status === 'ok' ? snap.items : null);
+  // Autocomplete tables: the snapshot, kept while it reloads. When it has no tables (still loading, failed,
+  // or not loaded), the table lists that the tree loaded for this database stand in, without columns.
+  const snapItems = $derived.by(() => {
+    const s = snap && snap.status !== 'error' ? snap.items : null;
+    if (s?.tables.length) return s;
+    const listed = loadedTables()
+      .filter(({ c, t, partition }) => c.id === conn.id && t.database === database && !partition)
+      .map(({ t }) => ({ ...(t.schema ? { schema: t.schema } : {}), name: t.name, kind: t.kind, columns: [] }));
+    return listed.length ? { database, tables: listed, truncated: true } : s;
+  });
+  const tablesState = $derived(!snap || snap.status === 'loading' ? { status: 'loading' as const } : snap.status === 'error' ? { status: 'error' as const, error: snap.error } : { status: 'ok' as const });
   const schema = $derived(snapshotSchema(snapItems));
   const tables = $derived(Object.keys(schema));
   // Tree highlight follows the shown result; joins, unions, CTEs and aggregates have no single table.
@@ -249,7 +384,7 @@
     const { result: r, opened } = tab;
     return opened && r && !r.error && r.sql === opened.sql ? tableKey(opened.id) : null;
   });
-  // SQL: the statements decide the Run/Save cues. A Mongo tab only needs to know whether there is any text to run.
+  // Only SQL statements decide the Read/Write cues. Other editors only need to know if there is text to run.
   const split = $derived(statements(conn.engine, tab.query));
   const kind = $derived(conn.engine === 'mongo' ? (tab.query.trim() ? 'read' : 'empty') : split.empty ? 'empty' : split.write ? 'write' : 'read');
   const busy = $derived(runs[tab.id]);
@@ -261,7 +396,14 @@
     // A structure change or a connection pointing elsewhere drops the snapshot; load it again.
     catalog.rev;
     if (!conn.id) return;
-    void loadSnapshot(conn.id, database);
+    const [id, dbName] = [conn.id, database];
+    // Untracked: the load reads the snapshot state, so a tracked call re-ran this effect on every state
+    // change, and a failed snapshot was asked again in an endless loop that never settled.
+    void untrack(() => loadSnapshot(id, dbName)).then(() => {
+      const s = snapshot(id, dbName);
+      // A failed snapshot leaves autocomplete without tables; say why instead of an empty list.
+      if (s?.status === 'error') notify(false, `Autocomplete could not load the ${isRedis(conn) ? 'keys' : 'tables'} of ${dbName}: ${s.error}`);
+    });
   });
 
   /** Autocomplete columns beyond the snapshot and join foreign keys; the catalog answers from its own caches. */
@@ -270,7 +412,11 @@
 
   /** The SQL a plain Run executes: the selection, or the statement at the cursor, or the whole query. */
   function currentSql(): string {
-    return editor ? editor.commands().selection().trim() || editor.commands().statementAt() : tab.query;
+    if (!editor) return tab.query;
+    const { selection, statementAt } = editor.commands();
+    const selectedText = selection();
+    const trimmed = selectedText.trim();
+    return trimmed ? (isRedis(conn) ? selectedText : trimmed) : statementAt();
   }
 
   // Editor context menu. It replaces the native menu, so it carries Cut / Copy / Paste too.
@@ -279,15 +425,9 @@
   function openEditorMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
+    tabMenu = null;
     editor?.commands().pointAt(e.clientX, e.clientY);
-    // Menu is w-64 (256px) and about 340px tall; keep it inside the window.
-    editorMenu = { x: Math.max(4, Math.min(e.clientX, innerWidth - 260)), y: Math.max(4, Math.min(e.clientY, innerHeight - 344)), sel: !!editor?.commands().selection() };
-  }
-
-  // The action runs first: the menu's `{@const}` reads `editorMenu`, which is null once closed.
-  function menuAct(fn: () => void) {
-    fn();
-    editorMenu = null;
+    editorMenu = { x: e.clientX, y: e.clientY, sel: !!editor?.commands().selection() };
   }
 
   function copySelection(cut: boolean) {
@@ -314,9 +454,10 @@
 
   // Create and duplicate point the active tab at the new connection.
   async function canSwitch() {
-    if (!confirmDiscard(tab.edits)) return false;
     const t = tab;
-    if (!(await settlePending([t], 'Switching the connection'))) return false;
+    const result = t.result;
+    if (!await confirmDiscard(t.edits) || t !== tab || t.result !== result) return false;
+    if (!await settlePending([t], 'Switching the connection') || t !== tab || t.result !== result) return false;
     leaveSession(t);
     return true;
   }
@@ -329,7 +470,7 @@
     const counts = tabs.list.filter((t) => t.connId === c.id).map(pendingOf).filter((n) => n > 0);
     if (!counts.length) return true;
     const n = counts.reduce((a, b) => a + b, 0);
-    return confirm(`Discard ${n} unsaved grid change${n === 1 ? '' : 's'} in ${counts.length} tab${counts.length === 1 ? '' : 's'}?`);
+    return confirm({ title: 'Discard unsaved grid changes?', body: `This connection change discards ${n} unsaved grid change${n === 1 ? '' : 's'} in ${counts.length} tab${counts.length === 1 ? '' : 's'}.`, confirmLabel: 'Discard changes', destructive: true });
   }
 
   // Tauri: closing the window or menu Quit with a pending transaction asks here first; the backend rolls back
@@ -338,12 +479,18 @@
     if (!api.capabilities.quitPrompt) return;
     let off: (() => void) | undefined;
     let gone = false;
+    let quitting = false;
     import('@tauri-apps/api/event')
       .then(({ listen }) =>
         listen('sandb://quit-requested', async () => {
-          if (tabs.list.some((t) => t.edits.saving)) return;
-          if ((tabs.list.some((t) => pendingOf(t)) || tabs.list.some((t) => t.status?.pending)) && !confirm('There are unsaved grid changes. Quit without saving them?')) return;
-          if (await settlePending(tabs.list, 'Quitting sandb', true)) api.quitApp().catch(() => {});
+          if (quitting || tabs.list.some((t) => t.edits.saving)) return;
+          quitting = true;
+          try {
+            if ((tabs.list.some((t) => pendingOf(t)) || tabs.list.some((t) => t.status?.pending)) && !await confirm({ title: 'Quit without saving?', body: 'There are unsaved grid changes. Quit without saving them?', confirmLabel: 'Quit', destructive: true })) return;
+            if (await settlePending(tabs.list, 'Quitting sandb', true)) await api.quitApp().catch(() => {});
+          } finally {
+            quitting = false;
+          }
         }),
       )
       .then((u) => (gone ? u() : (off = u)));
@@ -399,24 +546,26 @@
     api.setUnsavedEdits(unsaved).catch(() => {});
   });
 
-  /** Switching result tabs drops edit mode, like switching editor tabs. */
-  function openResult(t: Tab, i: number) {
-    if (t.resultIndex === i) return;
-    if (!confirmDiscard(t.edits)) return;
-    activateResult(t, i);
+  /** Switching result tabs drops edit mode but keeps the grid's per-result presentation state. */
+  async function openResult(t: Tab, r: QueryResult) {
+    const previous = t.result;
+    if (previous === r || !await confirmDiscard(t.edits) || t !== tab || t.result !== previous) return;
+    const i = t.results.indexOf(r);
+    if (i >= 0) activateResult(t, i);
   }
 
   /** The X of one result tab; closing the last one hides the results pane. */
-  function dropResult(t: Tab, i: number) {
-    const active = i === t.resultIndex;
-    if (active && !confirmDiscard(t.edits)) return;
+  async function dropResult(t: Tab, r: QueryResult) {
+    const previous = t.result;
+    if (previous === r && !await confirmDiscard(t.edits)) return;
+    const i = t.results.indexOf(r);
+    if (t !== tab || i < 0 || t.result !== previous) return;
     closeResult(t, i);
-    if (!t.results.length) ui.resultsOpen = false;
-  }
-
-  function resultLabel(t: Tab, r: { title?: string }, i: number) {
-    if (r.title) return r.title;
-    return t.results.length > 1 ? `Result ${i + 1}` : 'Results';
+    if (!t.results.length) {
+      ui.resultsOpen = false;
+      await tick();
+      mainEl?.querySelector<HTMLButtonElement>('[data-results-toggle]')?.focus();
+    }
   }
 
   function resultTip(r: { title?: string; sql?: string }, i: number) {
@@ -460,7 +609,9 @@
   /** Throws on a backend error; the delete dialog shows it and keeps the connection. `false`: nothing was deleted. */
   async function deleteConnection(c: Conn): Promise<boolean> {
     const wasActive = c.id === conn.id;
-    if (wasActive && !confirmDiscard(tab.edits)) return false;
+    const t = tab;
+    const result = t.result;
+    if (wasActive && (!await confirmDiscard(t.edits) || t !== tab || t.result !== result)) return false;
     // One decision for every tab on the connection; Cancel leaves the delete dialog open.
     if (!(await settlePending(tabs.list.filter((t) => t.connId === c.id), 'Deleting the connection'))) return false;
     await api.deleteConnection({ id: c.id });
@@ -508,21 +659,22 @@
     clearResults(tab);
   }
 
-  // Palette tables: the whole active database (its snapshot), plus every table list the tree has loaded in other databases.
+  // Palette tables: the active database's snapshot plus lists the tree has loaded, including Redis key searches.
   const paletteTables = $derived.by<PaletteTable[]>(() => {
     const here = `${conn.name} / ${database}`;
     const out: PaletteTable[] = [];
     const seen = new Set<string>();
-    for (const t of snap?.status === 'ok' ? (snap.items?.tables ?? []) : []) {
+    for (const t of !isRedis(conn) && snap?.status === 'ok' ? (snap.items?.tables ?? []) : []) {
       const label = tableLabel(t);
       if (seen.has(label)) continue;
       seen.add(label);
       out.push({ key: `${conn.id}/${database}/${label}`, label, hint: here, open: () => openTableView(conn, { database, schema: t.schema ?? null, name: t.name, kind: t.kind }) });
     }
     for (const { c, t } of loadedTables()) {
-      if (c.id === conn.id && t.database === database) continue;
+      const redis = isRedis(c);
+      if (!redis && c.id === conn.id && t.database === database) continue;
       const open = () => { ui.page = 'query'; openTableView(c, t); };
-      out.push({ key: tableKey(tableIdOf(c.id, t)), label: tableLabel(t), hint: `${c.name} / ${t.database}`, open });
+      out.push({ key: tableKey(tableIdOf(c.id, t)), label: tableLabel(t), hint: `${c.name} / ${redis ? `db${t.database}` : t.database}`, open });
     }
     return out;
   });
@@ -571,7 +723,7 @@
     t.savedId = q.id;
     ui.page = 'query';
     await tick();
-    tabStrip?.querySelector('[aria-current=page]')?.scrollIntoView({ inline: 'nearest' });
+    tabStrip?.querySelector('[aria-selected=true]')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     if (andRun) void run({ sql: t.query }, t);
     else editor?.commands().focus();
   }
@@ -610,10 +762,15 @@
       void run({ sql }, chatTab(sql, src), cls);
       return;
     }
-    if (t.table || runs[t.id] || cls.empty || !confirmDiscard(t.edits)) return;
+    if (t.table || runs[t.id] || cls.empty) return;
+    const targetResult = t.result;
+    const targetDatabase = t.database;
+    if (!await confirmDiscard(t.edits) || t !== tab || t.result !== targetResult || t.database !== targetDatabase || runs[t.id]) return;
     ui.page = 'query';
     // Keep the query already in the tab; the new one goes below it as its own statement.
-    t.query = engine === 'mongo' ? appendMongoStatement(t.query, sql) : appendStatement(t.query, sql, engine);
+    if (engine === 'mongo') t.query = appendMongoStatement(t.query, sql);
+    else if (engine === 'redis') t.query = appendRedisStatement(t.query, sql);
+    else t.query = appendStatement(t.query, sql, engine);
     void run({ sql }, t, cls);
   }
 
@@ -621,15 +778,57 @@
   function chatInsert(sql: string, src?: ChatSource) {
     const c = src ? db.connections.find((x) => x.id === src.connId) : undefined;
     const same = !src || !c || sameSource({ connId: tab.connId, database: tab.database }, { connId: c.id, database: src.database });
-    if (!tab.table && same) tab.query = conn.engine === 'mongo' ? appendMongoStatement(tab.query, sql) : appendStatement(tab.query, sql, conn.engine);
-    else chatTab(sql, src);
+    if (tab.table || !same) chatTab(sql, src);
+    else if (conn.engine === 'mongo') tab.query = appendMongoStatement(tab.query, sql);
+    else if (conn.engine === 'redis') tab.query = appendRedisStatement(tab.query, sql);
+    else tab.query = appendStatement(tab.query, sql, conn.engine);
+  }
+
+  const tableBusy = $state<Record<string, boolean>>({});
+
+  async function runRedisKeyCommand(original: Conn, database: string, sql: string | null) {
+    if (!sql) return;
+    // An edit or deletion during confirmation must not send the command to a different target.
+    const c = db.connections.find((c) => c.id === original.id);
+    if (!c || !isRedis(c) || !sameTarget(c, original) || c.ssl !== original.ssl || !canWrite(c)) {
+      notify(false, 'The Redis connection changed. Open the key action again.');
+      return;
+    }
+    ui.page = 'query';
+    await run({ sql }, openSqlTab(c, database, sql));
+  }
+
+  async function newRedisKey(c: Conn, database: string) {
+    const original = $state.snapshot(c);
+    const sql = await ask<string | null>(RedisKeyDialog, { conn: c, target: { mode: 'new', database } });
+    await runRedisKeyCommand(original, database, sql);
   }
 
   async function tableAction(a: TableAction, c: Conn, t: TableRef) {
+    const key = tableKey(tableIdOf(c.id, t));
+    if (tableBusy[key]) return;
+    tableBusy[key] = true;
     try {
       switch (a) {
         case 'view':
-          return openTableView(c, t);
+          return await openTableView(c, t);
+        case 'properties':
+          return await openTableView(c, t, { view: 'properties' });
+        case 'renameKey':
+        case 'ttlKey': {
+          const original = $state.snapshot(c);
+          const mode = a === 'renameKey' ? 'rename' : 'ttl';
+          const sql = await ask<string | null>(RedisKeyDialog, { conn: c, target: { mode, database: t.database, key: t.name } });
+          return await runRedisKeyCommand(original, t.database, sql);
+        }
+        case 'deleteKey': {
+          const original = $state.snapshot(c);
+          const sql = `DEL ${t.name}`;
+          if (await confirm({ title: 'Delete Redis key?', body: `${c.name} / db${t.database}\n${sql}`, confirmLabel: 'Delete key', destructive: true })) {
+            await runRedisKeyCommand(original, t.database, sql);
+          }
+          return;
+        }
         case 'ddl':
           return openInNewTab(c, t, await api.tableDdl({ connId: c.id, database: t.database, schema: t.schema, table: t.name }));
         case 'select':
@@ -638,20 +837,21 @@
           return openInNewTab(c, t, a === 'select' ? selectSql(c.engine, t, cols) : insertSql(c.engine, t, cols));
         }
         case 'count':
-          return countRows(c, t);
+          return await countRows(c, t);
         case 'exportDdl':
         case 'exportSql':
         case 'exportCsv':
-          return exportTable(c, t, a);
+          return await exportTable(c, t, a);
         case 'exportDocuments':
-          void exportCollection(c, t);
-          return;
+          return await exportCollection(c, t);
         case 'truncate':
         case 'drop':
-          void askDanger({ action: a, c, t });
+          await askDanger({ action: a, c, t });
       }
     } catch (err) {
       notify(false, ApiError.from(err).message);
+    } finally {
+      delete tableBusy[key];
     }
   }
 </script>
@@ -666,78 +866,95 @@
 <div class="flex h-full flex-col">
   <!-- Title bar. data-tauri-drag-region acts on the element itself only, so the empty strips drag the window and the buttons stay clickable. -->
   <div class="flex h-10 shrink-0 items-center px-2 select-none" data-tauri-drag-region>
-    <div class="flex h-full shrink-0 items-center gap-2 {inset ? 'pl-[76px]' : 'pl-2.5'}" style:width={ui.sidebarOpen ? `${ui.sidebarWidth}px` : undefined} data-tauri-drag-region>
+    <div class="flex h-full min-w-max shrink-0 items-center gap-2 {inset ? 'pl-[76px]' : 'pl-2.5'}" style:width={ui.sidebarOpen ? `${sidebarWidth}px` : undefined} data-tauri-drag-region>
       <!-- The app icon's spark: a horizontal bar and two bars at ±60°. -->
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.75" stroke-linecap="round" class="shrink-0 text-accent" aria-hidden="true"><path d="M5 12h14M8.5 5.938l7 12.124M15.5 5.938l-7 12.124" /></svg>
-      <span class="text-[13px] font-semibold tracking-[-0.01em]" data-tauri-drag-region>sandb</span>
-      <button class="btn btn-ghost ml-auto size-7 shrink-0 p-0" onclick={() => (ui.sidebarOpen = !ui.sidebarOpen)} title={ui.sidebarOpen ? 'Hide sidebar' : 'Show sidebar'} aria-label="Toggle sidebar" aria-pressed={ui.sidebarOpen}><PanelLeft size={15} /></button>
+      <span class="text-base font-semibold tracking-[-0.01em]" data-tauri-drag-region>sandb</span>
+      <button class="btn btn-ghost btn-on ml-auto size-7 shrink-0 p-0" onclick={() => (ui.sidebarOpen = !ui.sidebarOpen)} title={ui.sidebarOpen ? 'Hide sidebar' : 'Show sidebar'} aria-label="Toggle sidebar" aria-pressed={ui.sidebarOpen}><PanelLeft size={15} /></button>
     </div>
     {#if hasConn}
       <!-- The strip starts at the main card's left edge, so the first tab lines up with the card below. -->
-      <div bind:this={tabStrip} class="ml-1.5 flex h-full min-w-0 items-center gap-1 overflow-x-auto pl-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+      <div class="relative ml-1.5 h-full min-w-0">
+        <div bind:this={tabStrip} onscroll={updateTabEdges} class="h-full overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden" role="tablist" aria-label="Workspace tabs">
+          <div bind:this={tabRow} role="presentation" class="flex h-full w-max items-center gap-1 px-0.5">
         {#each tabs.list as t (t.id)}
-          {@const on = t.id === tab.id && ui.page === 'query'}
+          {@const on = t.id === tab.id}
           {@const dirtyT = isDirty(t)}
           {@const prodT = db.connections.find((c) => c.id === t.connId)?.env === 'production'}
           <!-- Production tabs carry a red underline, so the cue shows before the tab is opened. -->
-          <div class="group relative flex h-7 shrink-0 items-center rounded-md text-[12.5px] {on ? 'tab-on font-medium text-ink' : 'text-muted hover:bg-hover hover:text-ink'}">
-            {#if prodT}<span class="pointer-events-none absolute inset-x-1.5 bottom-0 h-0.5 rounded-full bg-red-600 dark:bg-red-500" aria-hidden="true"></span>{/if}
+          <div role="presentation" class="group relative flex h-7 shrink-0 items-center rounded-md text-sm {on ? 'tab-on font-medium text-ink' : 'text-muted hover:bg-hover hover:text-ink'}">
+            {#if prodT}<span class="pointer-events-none absolute inset-x-1.5 bottom-0 h-0.5 rounded-full bg-danger" aria-hidden="true"></span>{/if}
             {#if renaming === t.id}
               <span class="flex items-center gap-2 pl-2.5"><FileCode size={13} class="text-faint" />
-                <input class="w-28 bg-transparent outline-none" value={t.title} aria-label="Tab name" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" use:focusSelect onblur={(e) => rename(t, e.currentTarget.value)} onkeydown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); else if (e.key === 'Escape') renaming = null; }} />
+                <input class="focus-ring w-28 rounded-sm bg-transparent" value={t.title} aria-label="Tab name" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" use:focusSelect onblur={(e) => rename(t, e.currentTarget.value)} onkeydown={(e) => keyRename(e, t)} />
               </span>
             {:else}
-              <button class="flex h-full items-center gap-2 pl-2.5" aria-current={t.id === tab.id ? 'page' : undefined} onclick={() => pickTab(t.id)} ondblclick={() => (renaming = t.id)} title="{prodT ? 'Production · ' : ''}Double-click to rename">
+              <button class="flex h-full items-center gap-2 rounded-md pl-2.5" id="query-tab-{t.id}" role="tab" aria-selected={on} aria-controls={on ? 'workspace-panel' : undefined} tabindex={on ? 0 : -1} aria-haspopup="menu" onclick={() => pickTab(t.id)} ondblclick={() => (renaming = t.id)} onkeydown={(e) => tabKey(e, t)} oncontextmenu={(e) => openTabMenu(e, t)} title="{prodT ? 'Production · ' : ''}Double-click to rename">
                 {#if t.table}<Table2 size={13} class={on ? 'text-accent' : 'text-faint'} />{:else}<FileCode size={13} class={on ? 'text-accent' : 'text-faint'} />{/if} <span class="max-w-40 truncate">{t.title}</span>{#if prodT}<span class="sr-only">, production</span>{/if}
-                {#if runs[t.id] && !on}<LoaderCircle size={12} class="animate-spin text-faint" />{/if}
-                {#if t.status?.pending}<span class="size-1.5 rounded-full bg-amber-500" title="Transaction open"></span>{/if}
+                {#if runs[t.id] && (!on || ui.page !== 'query')}<LoaderCircle size={12} class="text-faint motion-safe:animate-spin" />{/if}
+                {#if t.status?.pending}<span class="size-1.5 rounded-full bg-warn" title="Transaction open"></span>{/if}
               </button>
             {/if}
             <!-- Unsaved changes to a saved query: a dot, as in code editors; it turns into the X on hover. -->
-            <button class="mr-1 ml-1.5 grid size-[18px] place-items-center rounded text-faint hover:bg-hover hover:text-ink {on || dirtyT ? '' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'}" title={dirtyT ? 'Unsaved changes · close tab' : 'Close tab'} aria-label="Close {t.title}{dirtyT ? ' (unsaved changes)' : ''}" onclick={() => dropTab(t)}>
+            <button class="focus-ring mr-1 ml-1.5 grid size-[18px] place-items-center rounded text-faint hover:bg-hover hover:text-ink {on || dirtyT ? '' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'}" tabindex={on ? 0 : -1} title={dirtyT ? 'Unsaved changes · close tab' : 'Close tab'} aria-label="Close {t.title}{dirtyT ? ' (unsaved changes)' : ''}" onclick={() => dropTab(t)}>
               {#if dirtyT}<span class="size-2 rounded-full bg-accent group-hover:hidden"></span><X size={12} class="hidden group-hover:block" />{:else}<X size={12} />{/if}
             </button>
           </div>
         {/each}
+          </div>
+        </div>
+        {#if fadeLeft}<span class="pointer-events-none absolute inset-y-0 left-0 w-3 bg-linear-to-r from-canvas to-transparent" aria-hidden="true"></span>{/if}
+        {#if fadeRight}<span class="pointer-events-none absolute inset-y-0 right-0 w-3 bg-linear-to-l from-canvas to-transparent" aria-hidden="true"></span>{/if}
       </div>
-      <button class="ml-1 grid size-7 shrink-0 place-items-center rounded-md text-faint hover:bg-hover hover:text-ink" title="New query" aria-label="New query" onclick={addTab}><Plus size={15} /></button>
+      <button class="btn btn-ghost ml-1 size-7 shrink-0 p-0" title="New query" aria-label="New query" onclick={addTab}><Plus size={15} /></button>
     {/if}
     <div class="h-full min-w-6 flex-1" data-tauri-drag-region></div>
     {#if updates.status === 'available' || updates.status === 'restart'}
-      <button class="mr-1 flex h-7 items-center gap-1.5 rounded-md px-2 text-[12px] font-medium text-amber-600 hover:bg-hover dark:text-amber-400" title="sandb v{updates.next} is available" onclick={() => { ui.settingsSection = 'updates'; ui.page = 'settings'; }}><CircleArrowUp size={14} /> Update</button>
+      <button class="btn btn-ghost mr-1 shrink-0 text-warn" title="sandb v{updates.next} is available" onclick={() => { ui.settingsSection = 'updates'; ui.page = 'settings'; }}><CircleArrowUp size={13} /> Update</button>
     {/if}
-    <button class="btn btn-ghost size-7 p-0 {ui.chatOpen ? 'bg-hover text-ink' : ''}" onclick={() => (ui.chatOpen = !ui.chatOpen)} title="Toggle AI chat" aria-label="Toggle AI chat"><PanelRight size={15} /></button>
+    <button bind:this={chatToggle} class="btn btn-ghost btn-on size-7 shrink-0 p-0" aria-pressed={ui.chatOpen} aria-controls="assistant-panel" onclick={() => (ui.chatOpen = !ui.chatOpen)} title="Toggle AI chat" aria-label="Toggle AI chat"><PanelRight size={15} /></button>
   </div>
 
-  <div class="relative flex min-h-0 flex-1 gap-2 px-2 pb-2">
+  <div class="relative flex min-h-0 flex-1 gap-2 overflow-clip px-2 pb-2">
   <!-- Sidebar: sits on the canvas, so it reads as one piece with the title bar.
        Hidden, not unmounted, so the tree keeps its expanded nodes. -->
-  <aside class="flex shrink-0 flex-col overflow-hidden" style:width="{ui.sidebarWidth}px" hidden={!ui.sidebarOpen}>
+  <aside class="flex shrink-0 flex-col overflow-hidden" style:width="{sidebarWidth}px" hidden={!ui.sidebarOpen}>
     <div class="pt-1 pb-2">
-      <button class="flex h-7 w-full items-center gap-2 rounded-md bg-hover px-2.5 text-muted hover:bg-active hover:text-ink" onclick={() => (overlays.palette = true)}>
+      <button class="btn btn-ghost w-full gap-2 bg-hover px-2.5 hover:bg-active" onclick={() => (overlays.palette = true)}>
         <Search size={13} /> <span class="flex-1 text-left">Quick search</span>
-        <kbd class="text-[11px]">{KEYS.palette.hint}</kbd>
+        <kbd class="text-xs">{KEYS.palette.hint}</kbd>
       </button>
     </div>
 
     <div class="seg mb-1.5 flex w-full" role="tablist" aria-label="Sidebar">
       <button class="seg-item flex-1 px-1.5 {ui.sidebarView === 'connections' ? 'seg-on' : ''}" role="tab" aria-selected={ui.sidebarView === 'connections'} onclick={() => (ui.sidebarView = 'connections')}>Connections</button>
-      <button class="seg-item flex flex-1 items-center justify-center gap-1.5 px-1.5 {ui.sidebarView === 'queries' ? 'seg-on' : ''}" role="tab" aria-selected={ui.sidebarView === 'queries'} onclick={() => (ui.sidebarView = 'queries')}>Queries {#if saved.list.length}<span class="text-[11px] font-normal text-faint tabular-nums">{saved.list.length}</span>{/if}</button>
+      <button class="seg-item flex flex-1 items-center justify-center gap-1.5 px-1.5 {ui.sidebarView === 'queries' ? 'seg-on' : ''}" role="tab" aria-selected={ui.sidebarView === 'queries'} onclick={() => (ui.sidebarView = 'queries')}>Queries {#if saved.list.length}<span class="text-xs font-normal text-faint tabular-nums">{saved.list.length}</span>{/if}</button>
     </div>
 
     <!-- Both stay mounted: the tree keeps its expanded nodes, the list its filter. -->
-    <nav class="-mx-1 flex-1 overflow-auto px-1 pb-2" hidden={ui.sidebarView !== 'connections'}>
-      <ConnectionTree {selected} onopen={openTableView} onnew={newConnection} onedit={editConnection} onduplicate={duplicateConnection} ondelete={askDeleteConnection} ontable={tableAction} onreorder={reorderConnections} />
+    <nav class="flex-1 overflow-auto pb-2 [scrollbar-gutter:stable]" hidden={ui.sidebarView !== 'connections'}>
+      <ConnectionTree {selected} {tableBusy} onopen={openTableView} onnew={newConnection} onedit={editConnection} onduplicate={duplicateConnection} ondelete={askDeleteConnection} ontable={tableAction} onredisnew={newRedisKey} onreorder={reorderConnections} />
     </nav>
-    <nav class="-mx-1 flex-1 overflow-auto px-1 pb-2" hidden={ui.sidebarView !== 'queries'} aria-label="Saved queries">
-      <SavedQueries activeId={ui.page === 'query' ? (savedQ?.id ?? null) : null} onopen={(q) => openSaved(q)} onrun={(q) => openSaved(q, true)} ondelete={deleteQuery} />
+    <nav class="flex-1 overflow-auto pb-2 [scrollbar-gutter:stable]" hidden={ui.sidebarView !== 'queries'} aria-label="Saved queries">
+      <SavedQueries activeId={ui.page === 'query' ? (savedQ?.id ?? null) : null} onopen={(q) => openSaved(q)} onrun={(q) => openSaved(q, true)} onschedule={(q) => newSchedule(scheduleFromSaved(q))} ondelete={deleteQuery} />
     </nav>
 
+    <button class="nav-item shrink-0 {ui.page === 'scheduler' ? 'nav-item-active' : ''}" aria-current={ui.page === 'scheduler' ? 'page' : undefined} onclick={() => (ui.page = ui.page === 'scheduler' ? 'query' : 'scheduler')}>
+      <CalendarClock size={13} /> <span class="flex-1">Schedules</span>
+      {#if unseenFailed()}
+        <span class="size-1.5 shrink-0 rounded-full bg-danger" aria-label="A scheduled run failed"></span>
+      {:else if schedules.list.some((s) => unseen(s) > 0)}
+        <span class="size-1.5 shrink-0 rounded-full bg-accent" aria-label="New scheduled runs"></span>
+      {:else if schedules.list.length}
+        <span class="text-xs font-normal text-faint tabular-nums">{schedules.list.length}</span>
+      {/if}
+    </button>
+
     <div class="flex items-center gap-0.5 pt-1">
-      <button class="nav-item flex-1 {ui.page === 'settings' ? 'nav-item-active' : ''}" onclick={() => (ui.page = ui.page === 'settings' ? 'query' : 'settings')}><Settings size={14} /> Settings</button>
-      <button class="nav-item size-[26px] justify-center p-0 {ui.page === 'audit' ? 'nav-item-active' : ''}" title="Audit log" aria-label="Audit log" onclick={() => (ui.page = ui.page === 'audit' ? 'query' : 'audit')}><ScrollText size={14} /></button>
-      <button class="btn btn-ghost size-[26px] p-0" title="Toggle theme" onclick={toggleTheme}>
-        {#if ui.dark}<Sun size={14} />{:else}<Moon size={14} />{/if}
+      <button class="nav-item min-w-0 flex-1 {ui.page === 'settings' ? 'nav-item-active' : ''}" onclick={() => (ui.page = ui.page === 'settings' ? 'query' : 'settings')}><Settings size={13} /> Settings</button>
+      <button class="nav-item size-list-row justify-center p-0 {ui.page === 'audit' ? 'nav-item-active' : ''}" title="Audit log" aria-label="Audit log" onclick={() => (ui.page = ui.page === 'audit' ? 'query' : 'audit')}><ScrollText size={13} /></button>
+      <button class="btn btn-ghost size-list-row p-0" title="Toggle theme" onclick={toggleTheme}>
+        {#if ui.dark}<Sun size={13} />{:else}<Moon size={13} />{/if}
       </button>
     </div>
   </aside>
@@ -745,44 +962,42 @@
   <!-- Fills the gap between the sidebar and the card: the negative margins cancel its share of the flex gap.
        A focusable separator is the ARIA window-splitter pattern; Svelte counts every separator as static. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-  <div class="-mx-2 w-2 shrink-0 cursor-col-resize rounded-full outline-none hover:bg-accent/25 focus-visible:bg-accent/40" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" aria-valuenow={ui.sidebarWidth} aria-valuemin={160} aria-valuemax={480} tabindex="0" hidden={!ui.sidebarOpen} onpointerdown={resizeSidebar} onkeydown={keySidebar}></div>
+  <div class="-mx-2 w-2 shrink-0 cursor-col-resize touch-none rounded-full outline-none hover:bg-accent/25 focus-visible:bg-accent/40" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" aria-valuenow={sidebarWidth} aria-valuemin={140} aria-valuemax={sidebarWidthLimit} tabindex="0" hidden={!ui.sidebarOpen} onpointerdown={resizeSidebar} onkeydown={keySidebar}></div>
 
   <!-- Main -->
   <!-- `overflow-clip`, not `overflow-hidden`: a too-wide row (the grid footer with the chat open) must never scroll
        the pane when a dialog hands focus back to a button, which cut off the left edge. -->
   <main bind:this={mainEl} class="card relative flex min-w-[300px] flex-1 flex-col overflow-clip">
     <!-- Production work gets a red top edge on every view of the tab: table data, properties and the editor. -->
-    {#if ui.page === 'query' && hasConn && conn.env === 'production'}<div class="pointer-events-none absolute inset-x-0 top-0 z-10 h-0.5 bg-red-600 dark:bg-red-500" aria-hidden="true"></div>{/if}
-    {#if ui.page === 'settings'}
-      <SettingsPage onEnableWrites={enableWrites} />
-    {:else if ui.page === 'audit'}
-      <AuditPage />
-    {:else if !hasConn}
+    {#if ui.page === 'query' && hasConn && conn.env === 'production'}<div class="pointer-events-none absolute inset-x-0 top-0 z-sticky h-0.5 bg-danger" aria-hidden="true"></div>{/if}
+    <!-- The workspace stays mounted behind full pages so editor undo and grid state survive a visit. -->
+    <div id="workspace-panel" class="flex min-h-0 flex-1 flex-col" role={hasConn ? 'tabpanel' : undefined} aria-labelledby={hasConn ? `query-tab-${tab.id}` : undefined} hidden={ui.page !== 'query'}>
+    {#if !hasConn}
       <div class="grid flex-1 place-items-center p-6 text-center">
         <div class="max-w-xs space-y-2">
-          <div class="mx-auto grid size-9 place-items-center rounded-lg bg-accent/12 text-accent"><Database size={17} /></div>
+          <div class="mx-auto grid size-9 place-items-center rounded-lg bg-accent/12 text-accent"><Database size={15} /></div>
           <p class="font-medium">{db.loading ? 'Loading connections…' : 'No connections yet'}</p>
-          {#if db.loadError}<p class="text-[12px] text-red-600 dark:text-red-400" role="alert">{db.loadError}</p>{/if}
+          {#if db.loadError}<p class="text-sm text-danger" role="alert">{db.loadError}</p>{/if}
           {#if !db.loading}<button class="btn btn-primary mx-auto" onclick={newConnection}><Plus size={13} /> New connection</button>{/if}
         </div>
       </div>
     {:else if tab.table}
     {@const t = tab.table}
-    <div class="flex h-11 shrink-0 items-center gap-2 px-3">
-      {#if t.kind === 'view'}<Eye size={14} class="shrink-0 text-accent" />{:else if t.kind === 'matview'}<ScanEye size={14} class="shrink-0 text-accent" />{:else}<Table2 size={14} class="shrink-0 text-accent" />{/if}
-      <span class="min-w-0 truncate text-[13px] font-semibold" title={displayName(t)}>{displayName(t)}</span>
+    {@const redis = isRedis(conn)}
+    <div class="flex h-pane-header shrink-0 items-center gap-2 px-3">
+      {#if t.kind === 'view'}<Eye size={13} class="shrink-0 text-accent" />{:else if t.kind === 'matview'}<ScanEye size={13} class="shrink-0 text-accent" />{:else}<Table2 size={13} class="shrink-0 text-accent" />{/if}
+      <span class="min-w-0 truncate text-base font-semibold" title={displayName(t)}>{displayName(t)}</span>
       {#if conn.env === 'production'}<span class="tag shrink-0 {envTag.production}">production</span>{/if}
-      <span class="hidden min-w-0 truncate text-[12px] text-faint md:inline">{conn.name} / {database}</span>
-      <!-- Collections show their properties too: fields, indexes, validator, options, stats and the script. -->
-      <div class="seg ml-2 shrink-0" role="tablist" aria-label="Table view">
-        <button class="seg-item {tab.view === 'data' ? 'seg-on' : ''}" role="tab" aria-selected={tab.view === 'data'} onclick={() => (tab.view = 'data')}>Data</button>
+      <span class="hidden min-w-0 truncate text-sm text-faint md:inline">{conn.name} / {redis ? `db${t.database}` : database}</span>
+      <div class="seg ml-2 shrink-0" role="tablist" aria-label={redis ? 'Key view' : 'Table view'}>
+        <button class="seg-item {tab.view === 'data' ? 'seg-on' : ''}" role="tab" aria-selected={tab.view === 'data'} onclick={() => { tab.view = 'data'; if (redis && !tab.result) void loadTableData(tab); }}>Data</button>
         <button class="seg-item {tab.view === 'properties' ? 'seg-on' : ''}" role="tab" aria-selected={tab.view === 'properties'} onclick={() => (tab.view = 'properties')}>Properties</button>
       </div>
       <div class="flex-1"></div>
       {#if tab.view === 'data'}
         {#if busy}
-          <span class="font-mono text-[11.5px] text-muted tabular-nums">{((now - busy.started) / 1000).toFixed(1)} s</span>
-          <button class="btn btn-secondary" onclick={cancel} title="Cancel the running query"><Square size={11} class="fill-current" /> Cancel</button>
+          <span class="font-mono text-xs text-muted tabular-nums">{((now - busy.started) / 1000).toFixed(1)} s</span>
+          <button class="btn btn-secondary" onclick={cancel} title="Cancel the running query"><Square size={12} class="fill-current" /> Cancel</button>
         {:else}
           <button class="btn btn-ghost" onclick={() => loadTableData(tab)} title="Load the rows again"><RotateCw size={13} /> Refresh</button>
         {/if}
@@ -791,172 +1006,214 @@
     {#if tab.view === 'data'}
       {@const key = tableLabel(t)}
       {@const columns = tab.result?.columns.length ? tab.result.columns : (schema[key] ?? [])}
-      <div class="flex min-h-0 flex-1 flex-col border-t border-line">
-        <TableFilterBar {columns} types={tab.result?.types ?? []} bind:filters={tab.filters} loading={!!busy} onapply={() => loadTableData(tab)} />
-        <div class="relative min-h-0 flex-1">
-          <ResultsGrid tab={tab} running={busy} oncancel={() => cancelRun(tab)} sort={tab.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} foreignKeys={tableFks} onfollow={(fk, row) => followForeignKey(conn, t, fk, row)} />
+      {#key tab.id}
+        <div class="flex min-h-0 flex-1 flex-col border-t border-line">
+          {#if !redis}<TableFilterBar {columns} types={tab.result?.types ?? []} bind:filters={tab.filters} loading={!!busy} onapply={() => loadTableData(tab)} />{/if}
+          <div class="relative min-h-0 flex-1">
+            <ResultsGrid tab={tab} running={busy} oncancel={() => cancelRun(tab)} sort={tab.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} foreignKeys={tableFks} onfollow={(fk, row) => followForeignKey(conn, t, fk, row)} />
+          </div>
         </div>
-      </div>
+      {/key}
     {:else}
       <div class="flex min-h-0 flex-1 border-t border-line">
         {#key tab.id}<TableProperties {conn} table={t} onopen={(r) => openTableView(conn, r)} />{/key}
       </div>
     {/if}
     {:else}
-    <div class="flex h-11 shrink-0 items-center gap-1.5 px-2.5">
-      <TargetBar {conn} {database} onconn={switchConn} ondb={switchDb} />
-      <!-- The container query sits on this group, not on the toolbar: in WebKit before 18.2 a size container
-           also traps TargetBar's fixed menu backdrop. A size container has no content width, so min-w keeps
-           room for the icon-only buttons; labels show only when the group has more room. -->
-      <div class="@container flex flex-1 items-center gap-1.5 {manualCommit(conn) && conn.engine !== 'mongo' ? 'min-w-[88px]' : 'min-w-0'}">
-      {#if manualCommit(conn) && conn.engine !== 'mongo'}
+    <div class="flex min-h-pane-header shrink-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 px-2.5 py-1.5">
+      <div class="flex min-w-52 flex-1 items-center gap-1.5 xl:min-w-72">
+      <TargetBar {conn} {database} {switching} onconn={(conn) => switchTarget({ conn })} ondb={(database) => switchTarget({ database })} />
+      {#if manualCommit(conn)}
         {@const st = tab.status}
-        <span class="mx-1 h-4 w-px shrink-0 bg-line"></span>
         <!-- An aborted transaction counts as pending; Rollback is the way out of it. Disabled buttons do not show tooltips reliably, so the wrappers carry the title. -->
-        <span class="shrink-0" title="Commit the tab's open transaction"><button class="btn btn-ghost px-2 @[16rem]:px-2.5" onclick={() => endActive(true)} disabled={!st?.pending || st.aborted || !!busy || txButtons.busy} title="Commit the tab's open transaction" aria-label="Commit"><Check size={14} /> <span class="hidden @[16rem]:inline">Commit</span></button></span>
-        <span class="shrink-0" title="Roll back the tab's open transaction"><button class="btn btn-ghost px-2 @[16rem]:px-2.5" onclick={() => endActive(false)} disabled={!(st?.pending || st?.aborted) || !!busy || txButtons.busy} title="Roll back the tab's open transaction" aria-label="Rollback"><Undo2 size={14} /> <span class="hidden @[16rem]:inline">Rollback</span></button></span>
+        <div class="flex w-18 shrink-0 items-center gap-1 border-l border-line pl-1.5 xl:w-41">
+          <span class="flex-1" title="Commit the tab's open transaction"><button class="btn btn-ghost w-full px-1.5" onclick={() => endActive(true)} disabled={!st?.pending || st.aborted || !!busy || txButtons.busy || !!switching} title="Commit the tab's open transaction" aria-label="Commit"><Check size={13} /> <span class="hidden xl:inline">Commit</span></button></span>
+          <span class="flex-1" title="Roll back the tab's open transaction"><button class="btn btn-ghost w-full px-1.5" onclick={() => endActive(false)} disabled={!(st?.pending || st?.aborted) || !!busy || txButtons.busy || !!switching} title="Roll back the tab's open transaction" aria-label="Rollback"><Undo2 size={13} /> <span class="hidden xl:inline">Rollback</span></button></span>
+        </div>
         {#if st?.pending}
-          <span class="flex min-w-0 items-center gap-1.5 text-[12px] font-medium text-amber-700 dark:text-amber-400" role="status" title="Transaction open"><span class="size-1.5 shrink-0 rounded-full bg-amber-500"></span> <span class="truncate">Transaction open</span></span>
+          <span class="flex min-w-0 items-center gap-1.5 text-sm font-medium text-warn" role="status" title="Transaction open"><span class="size-1.5 shrink-0 rounded-full bg-warn"></span> <span class="truncate">Transaction open</span></span>
         {/if}
-        {#if txButtons.error?.tab === tab.id}<span class="min-w-0 truncate text-[12px] text-red-700 dark:text-red-400" role="alert">{txButtons.error.text}</span>{/if}
+        {#if txButtons.error?.tab === tab.id}<span class="min-w-0 truncate text-sm text-danger" role="alert">{txButtons.error.text}</span>{/if}
       {/if}
       </div>
-      <!-- statementKind reads SQL keywords, so a Mongo tab has no Read/Write cue. -->
-      {#if conn.engine !== 'mongo'}
+      <div class="ml-auto flex min-w-0 items-center gap-1.5">
+      <!-- statementKind reads SQL keywords, so only SQL tabs have a Read/Write cue. -->
+      {#if isSql(conn)}
         {#if kind === 'read'}
-          <span class="hidden shrink-0 px-1 text-[12px] font-medium text-emerald-700 lg:inline dark:text-emerald-400" role="status" title="This query only reads data">Read</span>
+          <span class="hidden shrink-0 px-1 text-sm font-medium text-ok lg:inline" role="status" title="This query only reads data">Read</span>
         {:else if kind === 'write'}
-          <span class="shrink-0 px-1 text-[12px] font-medium text-amber-700 dark:text-amber-400" role="status" title="This query changes data">Write</span>
+          <span class="shrink-0 px-1 text-sm font-medium text-warn" role="status" title="This query changes data">Write</span>
         {/if}
       {/if}
       <!-- A saved, unchanged tab shows "Saved"; ⌘S then has nothing to write. -->
       <button class="btn btn-ghost shrink-0 px-2 xl:px-2.5" onclick={() => saveQuery()} disabled={!savedQ && kind === 'empty'} title={savedQ ? (tabClean ? `“${savedQ.name}” is saved · ⇧⌘S saves a copy` : `Save changes to “${savedQ.name}” (${KEYS.save.hint})`) : `Save query (${KEYS.save.hint})`} aria-label={tabClean ? 'Saved' : 'Save query'}>
-        {#if tabClean}<Check size={14} class="text-emerald-600 dark:text-emerald-400" />{:else}<Save size={14} />{/if}
+        {#if tabClean}<Check size={13} class="text-ok" />{:else}<Save size={13} />{/if}
         <span class="hidden xl:inline">{tabClean ? 'Saved' : 'Save'}</span>
       </button>
       <!-- Opens the chat on this tab's database. With the chat already open, narrow toolbars drop it. -->
-      <button class="btn btn-ghost shrink-0 px-2 2xl:px-2.5 {ui.chatOpen ? 'hidden lg:inline-flex' : ''}" onclick={openChatOnTab} title="Explain with AI"><Sparkles size={14} /> <span class="hidden 2xl:inline">Explain with AI</span></button>
+      <button class="btn btn-ghost shrink-0 px-2 2xl:px-2.5 {ui.chatOpen ? 'hidden lg:inline-flex' : ''}" onclick={openChatOnTab} title="Explain with AI" aria-label="Explain with AI"><Sparkles size={13} /> <span class="hidden 2xl:inline">Explain with AI</span></button>
       {#if busy}
         {#if busy.script}
           {@const s = busy.script}
           <!-- Total is 0 until the first poll answers. -->
-          <span class="flex min-w-0 items-center gap-2 text-[12px] text-muted" role="status" title="Running {s.name}">
+          <span class="flex min-w-0 items-center gap-2 text-sm text-muted" role="status" title="Running {s.name}">
             <span class="max-w-40 truncate">{s.name}</span>
-            <span class="h-1 w-24 shrink-0 overflow-hidden rounded-full bg-hover" role="progressbar" aria-label="Script progress" aria-valuenow={s.done} aria-valuemin={0} aria-valuemax={s.total || undefined}>
-              <span class="block h-full rounded-full bg-accent transition-[width]" style:width="{s.total ? (s.done / s.total) * 100 : 0}%"></span>
+            <span class="h-1 w-12 shrink-0 overflow-hidden rounded-full bg-hover xl:w-16" role="progressbar" aria-label="Script progress" aria-valuenow={s.done} aria-valuemin={0} aria-valuemax={s.total || undefined}>
+              <span class="block h-full rounded-full bg-accent motion-safe:transition-[width] motion-safe:duration-150" style:width="{s.total ? (s.done / s.total) * 100 : 0}%"></span>
             </span>
-            <span class="shrink-0 font-mono text-[11.5px] tabular-nums">{s.total ? `${s.done}/${s.total}` : '…'}</span>
+            <span class="shrink-0 font-mono text-xs tabular-nums">{s.total ? `${s.done}/${s.total}` : '…'}</span>
           </span>
         {/if}
-        <span class="font-mono text-[11.5px] text-muted tabular-nums">{((now - busy.started) / 1000).toFixed(1)} s</span>
-        <button class="btn btn-secondary" onclick={cancel} title="Cancel the running query"><Square size={11} class="fill-current" /> Cancel</button>
+        <span class="font-mono text-xs text-muted tabular-nums">{((now - busy.started) / 1000).toFixed(1)} s</span>
+        <button class="btn btn-secondary" onclick={cancel} title="Cancel the running query"><Square size={12} class="fill-current" /> Cancel</button>
       {:else}
-        <button class="btn btn-primary pr-2" onclick={() => run({ sql: currentSql() })} disabled={kind === 'empty'} title="Run the selection, or the statement at the cursor"><Play size={11} class="fill-current" /> Run <kbd class="ml-0.5 hidden font-sans text-[11px] font-normal lg:inline" aria-hidden="true">{KEYS.run.hint}</kbd></button>
+        <button class="btn btn-primary shrink-0 pr-2" onclick={() => run({ sql: currentSql() })} disabled={kind === 'empty' || !!switching} title="Run the selection, or the statement at the cursor"><Play size={12} class="fill-current" /> Run <kbd class="ml-0.5 hidden font-sans text-xs font-normal xl:inline" aria-hidden="true">{KEYS.run.hint}</kbd></button>
       {/if}
+      </div>
     </div>
 
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="min-h-28 overflow-hidden {ui.resultsOpen ? 'shrink-0' : 'flex-1'}" style:height={ui.resultsOpen ? `${ui.editorSplit * 100}%` : undefined} oncontextmenu={openEditorMenu}>
+    <div class="min-h-28 overflow-hidden {ui.resultsOpen ? 'shrink-0' : 'flex-1'}" style:height={ui.resultsOpen ? `min(${ui.editorSplit * 100}%, calc(100% - 8.5rem))` : undefined} oncontextmenu={openEditorMenu}>
       <!-- Keyed so undo never crosses into another tab's text. -->
       {#key tab.id}
-        <SqlEditor bind:this={editor} bind:value={tab.query} onrun={() => run({ sql: currentSql() })} onrunnew={() => run({ sql: currentSql(), append: true })} onrunall={() => run({ sql: tab.query })} onformat={formatQuery} snapshot={snapItems} {columnsOf} {linksOf} dialect={conn.engine} />
+        <SqlEditor bind:this={editor} bind:value={tab.query} onrun={() => { if (!switching) void run({ sql: currentSql() }); }} onrunnew={() => { if (!switching) void run({ sql: currentSql(), append: true }); }} onrunall={() => { if (!switching) void run({ sql: tab.query }); }} onformat={formatQuery} snapshot={snapItems} {tablesState} {columnsOf} {linksOf} dialect={conn.engine} />
       {/key}
     </div>
     <input bind:this={scriptInput} type="file" accept=".sql,text/plain" class="hidden" onchange={runScript} />
 
+    {#snippet windowControls()}
+      <button class="btn btn-sm btn-ghost btn-on" aria-pressed={ui.resultsOpen} aria-controls="query-results" title={ui.resultsOpen ? 'Hide results' : 'Show results'} onclick={toggleResults} data-results-toggle><PanelBottom size={13} /> Results</button>
+      {#if ui.resultsOpen}
+        <button class="btn btn-sm btn-ghost size-6 p-0" title="Maximize results / restore" aria-label="Move split up" onclick={() => sash('up')}><ChevronUp size={12} /></button>
+        <button class="btn btn-sm btn-ghost size-6 p-0" title="Maximize editor / restore" aria-label="Move split down" onclick={() => sash('down')}><ChevronDown size={12} /></button>
+        {#if tab.results.length === 1 && tab.result}
+          <button class="btn btn-sm btn-ghost size-6 p-0" title="Close result" aria-label="Close result" onclick={() => tab.result && dropResult(tab, tab.result)}><X size={12} /></button>
+        {/if}
+      {/if}
+    {/snippet}
+
     <!-- Hidden, not unmounted, so the grid keeps its scroll, selection and edit mode. -->
     <div class="contents" hidden={!ui.resultsOpen}>
-      <div class="relative z-30 -my-1 h-2 shrink-0">
-        <!-- Overlaps the editor and grid by 4 px each, so the grab area is wider than the border line. -->
-        <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-        <div class="absolute inset-0 cursor-row-resize outline-none hover:bg-accent/25 focus-visible:bg-accent/40" role="separator" aria-orientation="horizontal" aria-label="Resize editor" aria-valuenow={Math.round(ui.editorSplit * 100)} aria-valuemin={10} aria-valuemax={80} tabindex="0" onpointerdown={resizeEditor} onkeydown={keyEditor}></div>
-        <div class="absolute top-1/2 left-1/2 flex -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-md border border-line bg-surface">
-          <button class="grid h-4 w-5 place-items-center text-faint hover:bg-hover hover:text-ink" title="Maximize results / restore" aria-label="Move split up" onclick={() => sash('up')}><ChevronUp size={12} /></button>
-          <button class="grid h-4 w-5 place-items-center text-faint hover:bg-hover hover:text-ink" title="Maximize editor / restore" aria-label="Move split down" onclick={() => sash('down')}><ChevronDown size={12} /></button>
-        </div>
+      <!-- The sash overlaps its neighboring panes, so the 8px grab zone is wider than the grab line. -->
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+      <div class="group relative z-sticky -my-1 grid h-2 shrink-0 cursor-row-resize touch-none place-items-center outline-none hover:bg-accent/15 focus-visible:bg-accent/25" role="separator" aria-orientation="horizontal" aria-label="Resize editor" aria-controls="query-results" aria-valuenow={Math.round(ui.editorSplit * 100)} aria-valuemin={10} aria-valuemax={80} tabindex="0" onpointerdown={resizeEditor} onkeydown={keyEditor}>
+        <span class="pointer-events-none h-[3px] w-8 rounded-full bg-faint/65 group-hover:bg-accent group-focus-visible:bg-accent" aria-hidden="true"></span>
       </div>
 
-      <div class="flex min-h-0 flex-1 flex-col border-t border-line">
+      <div class="flex min-h-0 flex-1 flex-col border-t border-line" id="query-results">
         <!-- Result tab strip (as in DBeaver): one tab per grid result; its X closes that result. -->
-        {#if tab.results.length}
-        <div class="flex h-8 shrink-0 items-end gap-0.5 overflow-x-auto border-b border-line px-1.5" role="tablist" aria-label="Results">
-            {#each tab.results as r, i (i)}
-              {@const on = tab.resultIndex === i}
-              <div
-                class="-mb-px flex h-7 shrink-0 items-center gap-1.5 rounded-t-md border border-b-0 pr-1 pl-2.5 text-[12.5px] font-medium {on ? 'border-line bg-surface text-ink' : 'border-transparent text-muted hover:bg-hover hover:text-ink'}"
-                role="tab"
-                aria-selected={on}
-                title={resultTip(r, i)}
-                tabindex="0"
-                onclick={() => openResult(tab, i)}
-                onkeydown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); openResult(tab, i); } }}
-              >
-                {#if r.title === 'Messages'}<ScrollText size={13} class="shrink-0 text-accent" />{:else}<Table2 size={13} class="shrink-0 text-accent" />{/if}
-                <span class="max-w-40 truncate">{resultLabel(tab, r, i)}</span>
-                <button class="ml-1 grid size-[18px] place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Close result" aria-label="Close result" onclick={(e) => { e.stopPropagation(); dropResult(tab, i); }}><X size={12} /></button>
+        {#if tab.results.length > 1}
+          <div class="flex h-8 shrink-0 items-end gap-0.5 overflow-x-auto border-b border-line px-1.5" role="tablist" aria-label="Results">
+            {#each tab.results as r, i (r)}
+              {@const on = tab.result === r}
+              <div role="presentation" class="-mb-px flex h-7 shrink-0 items-center gap-1.5 rounded-t-md border border-b-0 pr-1 text-sm font-medium {on ? 'border-line bg-surface text-ink' : 'border-transparent text-muted hover:bg-hover hover:text-ink'}">
+                <button class="flex h-full items-center gap-1.5 rounded-t-md pl-2.5" role="tab" aria-selected={on} title={resultTip(r, i)} onclick={() => openResult(tab, r)}>
+                  {#if r.title === 'Messages'}<ScrollText size={13} class="shrink-0 text-accent" />{:else}<Table2 size={13} class="shrink-0 text-accent" />{/if}
+                  <span class="max-w-40 truncate">{r.title ?? `Result ${i + 1}`}</span>
+                </button>
+                <button class="focus-ring ml-1 grid size-[18px] place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Close result" aria-label="Close result" onclick={() => dropResult(tab, r)}><X size={12} /></button>
               </div>
             {/each}
         </div>
         {/if}
         <div class="relative min-h-0 flex-1">
-          {#key `${tab.id}:${tab.resultIndex}:${tab.result?.sql ?? ''}:${tab.result?.title ?? ''}`}
-            <ResultsGrid tab={tab} running={busy} oncancel={() => cancelRun(tab)} sort={tab.result?.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} />
+          {#key tab.id}
+            <ResultsGrid tab={tab} {windowControls} running={busy} oncancel={() => cancelRun(tab)} sort={tab.result?.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} />
           {/key}
         </div>
       </div>
     </div>
 
-    <footer class="flex h-8 shrink-0 items-center gap-2 border-t border-line px-2 text-[12px] text-muted">
-      <button class="btn h-6 px-2 text-[12px] {ui.resultsOpen ? 'bg-hover text-ink' : 'btn-ghost'}" aria-pressed={ui.resultsOpen} title={ui.resultsOpen ? 'Hide results' : 'Show results'} onclick={() => (ui.resultsOpen = !ui.resultsOpen)}><PanelBottom size={13} /> Results</button>
-      {#if !ui.resultsOpen && tab.result}
-        <span class="text-faint tabular-nums">{tab.result.rows.length}{tab.result.truncated ? '+' : ''} rows · {tab.result.ms} ms</span>
-      {/if}
-    </footer>
+    {#if !ui.resultsOpen}
+      <GridToolbar summary={tab.result} {windowControls} />
     {/if}
+
+    {/if}
+    </div>
+    {#if ui.page !== 'query'}
+      {#key ui.page}
+        <div class="absolute inset-0 bg-surface" transition:fade|global={{ duration: matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 150 }} onoutrostart={(e) => (e.currentTarget.inert = true)} onintrostart={(e) => (e.currentTarget.inert = false)}>
+          {#if ui.page === 'settings'}
+            <SettingsPage onEnableWrites={enableWrites} />
+          {:else if ui.page === 'audit'}
+            <AuditPage />
+          {:else}
+            <SchedulerPage />
+          {/if}
+        </div>
+      {/key}
+    {/if}
+    <NoticeToast />
   </main>
 
-  {#if ui.chatOpen}
-    <!-- Below 880 px the panel floats over the main card, so it has no gap to drag. -->
-    <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-    <div class="-mx-2 hidden w-2 shrink-0 cursor-col-resize rounded-full outline-none hover:bg-accent/25 focus-visible:bg-accent/40 min-[880px]:block" role="separator" aria-orientation="vertical" aria-label="Resize assistant" aria-valuenow={ui.chatWidth} aria-valuemin={280} aria-valuemax={640} tabindex="0" onpointerdown={resizeChat} onkeydown={keyChat}></div>
-    <ChatPanel {tables} activeBusy={!!busy} onEnableWrites={enableWrites} onInsertSql={chatInsert} onRunSql={chatRun} />
-  {/if}
+  <!-- Both positions use the same mounted panel; the dock reserves space only while it is open. -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+  <div class="-mx-2 w-2 shrink-0 cursor-col-resize touch-none rounded-full outline-none hover:bg-accent/25 focus-visible:bg-accent/40" role="separator" aria-orientation="vertical" aria-label="Resize assistant" aria-controls="assistant-panel" aria-valuenow={chatWidth} aria-valuemin={240} aria-valuemax={chatWidthLimit} tabindex="0" hidden={!ui.chatOpen || !dockChat} onpointerdown={resizeChat} onkeydown={keyChat}></div>
+  <div class="assistant-slot {dockChat ? 'assistant-docked relative shrink-0' : 'absolute inset-y-0 right-2'} {resizingChat ? '' : 'motion-safe:transition-[width] motion-safe:duration-[160ms]'}" style:--assistant-width="{chatWidth}px" hidden={chatHidden}>
+    <div bind:this={chatPanel} id="assistant-panel" class="assistant-panel absolute inset-y-0 right-0 z-chat {dockChat ? '' : 'bottom-2 rounded-[10px] shadow-2xl'} motion-safe:transition-transform motion-safe:duration-[160ms]" inert={!ui.chatOpen}>
+      <ChatPanel {tables} activeBusy={!!busy} onEnableWrites={enableWrites} onInsertSql={chatInsert} onRunSql={chatRun} />
+    </div>
+  </div>
   </div>
 </div>
-<svelte:window onclick={() => (editorMenu = null)} oncontextmenu={(e) => { editorMenu = null; blockNativeMenu(e); }} onkeydown={(e) => { if (e.key === 'Escape') editorMenu = null; }} />
+<svelte:window bind:innerWidth={viewportWidth} oncontextmenu={blockNativeMenu} />
+{#if tabMenu}
+  {@const m = tabMenu}
+  <Menu anchor={m.anchor} returnFocus={m.trigger} label="Tab actions" onclose={() => (tabMenu = null)}>
+    <button class="menu-item" role="menuitem" tabindex="-1" onclick={() => (renaming = m.t.id)}><Pencil size={13} /> Rename</button>
+    <button class="menu-item" role="menuitem" tabindex="-1" onclick={() => dropTab(m.t)}><X size={13} /> Close</button>
+    <button class="menu-item" role="menuitem" tabindex="-1" disabled={tabs.list.length < 2} onclick={() => closeOtherTabs(m.t)}><Copy size={13} /> Close others</button>
+  </Menu>
+{/if}
 {#if editorMenu}
   {@const m = editorMenu}
-  <div class="popover fixed z-40 w-64 p-1" style="left:{m.x}px;top:{m.y}px" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-    <button class="nav-item" role="menuitem" disabled={!!busy} onclick={() => menuAct(() => run({ sql: m.sel ? editor!.commands().selection() : editor!.commands().statementAt() }))}><Play size={13} /> <span class="flex-1">{m.sel ? 'Run selection' : 'Run statement at cursor'}</span><kbd class="kbd">{KEYS.run.hint}</kbd></button>
-    <button class="nav-item" role="menuitem" disabled={!!busy || kind === 'empty'} onclick={() => menuAct(() => run({ sql: tab.query }))}><ListOrdered size={13} /> <span class="flex-1">Run all statements</span><kbd class="kbd">{KEYS.runAll.hint}</kbd></button>
-    <button class="nav-item" role="menuitem" disabled={!!busy} onclick={() => menuAct(() => scriptInput?.click())}><FileUp size={13} /> Run SQL script from file…</button>
-    <button class="nav-item" role="menuitem" disabled={kind === 'empty'} onclick={() => menuAct(formatQuery)}><WandSparkles size={13} /> <span class="flex-1">{m.sel ? 'Format selection' : 'Format query'}</span><kbd class="kbd">{KEYS.format.hint}</kbd></button>
-    <div class="mx-2 my-1 h-px bg-line"></div>
-    <button class="nav-item" role="menuitem" disabled={!savedQ && kind === 'empty'} onclick={() => menuAct(() => saveQuery())}><Save size={13} /> <span class="flex-1">{savedQ ? 'Save changes' : 'Save query…'}</span><kbd class="kbd">{KEYS.save.hint}</kbd></button>
-    <button class="nav-item" role="menuitem" disabled={kind === 'empty'} onclick={() => menuAct(() => saveQuery(true))}><CopyPlus size={13} /> <span class="flex-1">Save as new query…</span><kbd class="kbd">{KEYS.saveAs.hint}</kbd></button>
-    <div class="mx-2 my-1 h-px bg-line"></div>
-    <button class="nav-item" role="menuitem" disabled={!m.sel} onclick={() => menuAct(() => copySelection(true))}><Scissors size={13} /> Cut</button>
-    <button class="nav-item" role="menuitem" disabled={!m.sel} onclick={() => menuAct(() => copySelection(false))}><Copy size={13} /> Copy</button>
-    <button class="nav-item" role="menuitem" onclick={() => menuAct(() => navigator.clipboard?.readText().then((s) => editor?.commands().insert(s), () => {}))}><ClipboardPaste size={13} /> Paste</button>
-    <button class="nav-item" role="menuitem" onclick={() => menuAct(() => editor?.commands().selectAll())}><span class="size-[13px]"></span> Select all</button>
-  </div>
+  <Menu anchor={{ x: m.x, y: m.y }} label="Query editor actions" class="w-64" onclose={() => (editorMenu = null)}>
+    <button class="menu-item" role="menuitem" tabindex="-1" disabled={!!busy || !!switching} onclick={() => { const cmd = editor?.commands(); if (cmd) void run({ sql: m.sel ? cmd.selection() : cmd.statementAt() }); }}><Play size={13} /> <span class="flex-1">{m.sel ? 'Run selection' : 'Run statement at cursor'}</span><kbd class="kbd">{KEYS.run.hint}</kbd></button>
+    <button class="menu-item" role="menuitem" tabindex="-1" disabled={!!busy || !!switching || kind === 'empty'} onclick={() => run({ sql: tab.query })}><ListOrdered size={13} /> <span class="flex-1">Run all statements</span><kbd class="kbd">{KEYS.runAll.hint}</kbd></button>
+    {#if !isRedis(conn)}
+      <button class="menu-item" role="menuitem" tabindex="-1" disabled={!!busy || !!switching} onclick={() => scriptInput?.click()}><FileUp size={13} /> {isSql(conn) ? 'Run SQL script from file…' : 'Run script from file…'}</button>
+      <button class="menu-item" role="menuitem" tabindex="-1" disabled={kind === 'empty'} onclick={formatQuery}><WandSparkles size={13} /> <span class="flex-1">{m.sel ? 'Format selection' : 'Format query'}</span><kbd class="kbd">{KEYS.format.hint}</kbd></button>
+    {/if}
+    <div role="separator" class="mx-2 my-1 h-px bg-line"></div>
+    <button class="menu-item" role="menuitem" tabindex="-1" disabled={!savedQ && kind === 'empty'} onclick={() => saveQuery()}><Save size={13} /> <span class="flex-1">{savedQ ? 'Save changes' : 'Save query…'}</span><kbd class="kbd">{KEYS.save.hint}</kbd></button>
+    <button class="menu-item" role="menuitem" tabindex="-1" disabled={kind === 'empty'} onclick={() => saveQuery(true)}><CopyPlus size={13} /> <span class="flex-1">Save as new query…</span><kbd class="kbd">{KEYS.saveAs.hint}</kbd></button>
+    <div role="separator" class="mx-2 my-1 h-px bg-line"></div>
+    <button class="menu-item" role="menuitem" tabindex="-1" disabled={!m.sel} onclick={() => copySelection(true)}><Scissors size={13} /> Cut</button>
+    <button class="menu-item" role="menuitem" tabindex="-1" disabled={!m.sel} onclick={() => copySelection(false)}><Copy size={13} /> Copy</button>
+    <button class="menu-item" role="menuitem" tabindex="-1" onclick={async () => { const target = editor; const text = await navigator.clipboard?.readText().catch(() => undefined); if (text !== undefined && target === editor) target?.commands().insert(text); }}><ClipboardPaste size={13} /> Paste</button>
+    <button class="menu-item" role="menuitem" tabindex="-1" onclick={() => editor?.commands().selectAll()}><span class="size-[13px]"></span> Select all</button>
+  </Menu>
 {/if}
 <ConnectionDialog bind:open={overlays.connection} conn={connEdit} canswitch={canSwitch} canupdate={canUpdate} onsaved={openFirstTable} onedited={connEdited} />
 <WhatsNewDialog />
-<NoticeToast />
 <CommandPalette
   bind:open={overlays.palette}
   tables={paletteTables}
   onfocuseditor={focusEditor}
-  onrun={() => { if (kind === 'empty') return; ui.page = 'query'; run({ sql: currentSql() }); }}
+  onrun={() => { if (kind === 'empty' || switching) return; ui.page = 'query'; run({ sql: currentSql() }); }}
   ontogglechat={() => (ui.chatOpen = !ui.chatOpen)}
   ontogglesidebar={() => (ui.sidebarOpen = !ui.sidebarOpen)}
   onpage={(p) => (ui.page = p)}
   ontoggletheme={toggleTheme}
   onnewconnection={newConnection}
-  onswitch={(c) => { ui.page = 'query'; switchConn(c); }}
+  onswitch={(c) => { ui.page = 'query'; switchTarget({ conn: c }); }}
   onsave={() => saveQuery()}
   onopensaved={(q) => openSaved(q)}
 />
 <!-- Last, so an answer stacks above the connection dialog and any dialog that waits on it. -->
 <AskHost />
+
+<style>
+  .assistant-slot,
+  .assistant-panel {
+    width: var(--assistant-width);
+  }
+
+  .assistant-docked:has(.assistant-panel[inert]) { width: 0; margin-left: -0.5rem; }
+  .assistant-panel[inert] { translate: 100% 0; pointer-events: none; }
+
+  @starting-style {
+    .assistant-docked { width: 0; }
+    .assistant-panel { translate: 100% 0; }
+  }
+</style>

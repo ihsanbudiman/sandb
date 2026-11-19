@@ -91,6 +91,7 @@ pub async fn tables(client: &Client, db: &str) -> Result<Vec<TableInfo>, AppErro
             row_estimate,
             has_rowid: None,
             partition_of: None,
+            redis_type: None,
         });
     }
     tables.sort_by(|a, b| a.name.cmp(&b.name));
@@ -305,6 +306,7 @@ pub async fn properties(
             options: ejson_pretty(Bson::Document(options))?,
             stats,
         }),
+        redis: None,
     })
 }
 

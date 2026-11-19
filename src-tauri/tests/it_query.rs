@@ -102,7 +102,7 @@ async fn introspection_on_each_engine() {
                 assert_eq!(dbs, vec!["main"]);
                 ("main", None)
             }
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         let tables = ops::list_tables(&c.st, &c.conn.id, db, schema)
             .await
@@ -135,7 +135,7 @@ async fn introspection_on_each_engine() {
                 .await
                 .unwrap(),
             Engine::Sqlite => tables.clone(),
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         let an: Vec<&str> = analytics.iter().map(|t| t.name.as_str()).collect();
         assert!(
@@ -409,7 +409,7 @@ async fn paging_caps_rows_and_flags_truncation() {
             Engine::Pg => "SELECT * FROM analytics.events ORDER BY id",
             Engine::Mysql => "SELECT * FROM analytics.events ORDER BY id",
             Engine::Sqlite => "SELECT * FROM events ORDER BY id",
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         let r = run(&c, sql, None).await;
         let s = &r.statements[0];
@@ -453,7 +453,7 @@ async fn multi_statement_runs_on_one_connection() {
             Engine::Sqlite => {
                 "CREATE TEMP TABLE it_scratch (id int, label text);\nINSERT INTO it_scratch VALUES (1, 'a'), (2, 'b');\nSELECT id, label, 'it_multi' AS app FROM it_scratch ORDER BY id"
             }
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         let r = run(&c, sql, None).await;
         let n = r.statements.len();
@@ -537,7 +537,7 @@ async fn cancel_stops_long_queries() {
             Engine::Sqlite => {
                 "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000000000) SELECT count(*) FROM n"
             }
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         expect_cancel(&c, sql).await;
     }
@@ -591,7 +591,7 @@ async fn csv_export_round_trips() {
             // never treated as a read, so it could not be exported.
             Engine::Mysql => ("analytics.events", "CONCAT('a,b \"q\"', '\\n', 'line2')"),
             Engine::Sqlite => ("events", "'a,b \"q\"' || char(10) || 'line2'"),
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.csv");
@@ -684,7 +684,7 @@ async fn large_text_is_cut_in_the_grid_but_not_in_the_export() {
                     "'POLYGON((' || replace(hex(zeroblob({REPEATS})), '00', '106.8 -6.2, ') || '))'"
                 ),
             ),
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         let l = &c.label;
         let r = run(
@@ -818,7 +818,7 @@ async fn session_settings_do_not_leak_into_the_next_run() {
                 "SELECT count(*) AS v FROM sqlite_temp_master WHERE name = 'it_leak'",
                 json!(0),
             ),
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         run(&c, set, None).await;
         // Several runs, so a pooled connection would be picked up if one leaked.

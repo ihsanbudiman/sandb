@@ -17,6 +17,7 @@ use crate::core::ai::settings;
 use crate::core::ai::skills;
 use crate::core::ai::tools::{self, Decision, ToolContext};
 use crate::core::connections::target_database;
+use crate::core::engine::Engine;
 use crate::core::error::{AppError, ErrorCode};
 use crate::core::ops;
 use crate::core::result::{Engines, Source};
@@ -221,7 +222,7 @@ async fn converse(
     for (i, s) in req.sources.iter().enumerate() {
         let conn = state.connection(&s.conn_id)?;
         let database = target_database(&conn, s.database.as_deref());
-        if conn.engine.sql().is_none() && database.is_empty() {
+        if conn.engine == Engine::Mongo && database.is_empty() {
             return Err(AppError::invalid(format!(
                 "Choose a database for {}",
                 conn.name
@@ -439,6 +440,7 @@ mod tests {
                     uri: String::new(),
                     auth_source: String::new(),
                     topology: None,
+                    redis: None,
                 },
                 None,
             )

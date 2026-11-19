@@ -4,6 +4,44 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-19
+
+- New: Redis support for standalone, Cluster and Sentinel. Connect with fields or a `redis://` or `rediss://` URI.
+  - Browse and filter keys. Run redis-cli commands and edit supported results in the grid.
+  - View key properties, generate or export `.redis` scripts, and export results as CSV.
+  - Ask the assistant to read or chart Redis data. Add SQL and MongoDB sources to the same chat. A proposed write needs approval.
+  - Use the Redis syntax and tuning skills. Share Redis connections with MCP clients for guarded reads.
+  - Chat and MCP block some Redis server details. The editor and user-written query schedules still follow the Redis account's permissions.
+  - After an approved Redis write, show a change count only when the command reports one.
+- New: schedules. A schedule runs a query or asks the AI assistant a question at set times. Open **Schedules** at the bottom of the sidebar, or **New schedule** in the command palette (⌘K):
+  - Set the times: every N minutes, every N hours, every day at a time, or on some days of the week at a time.
+  - For a query schedule, choose the database from the list of the connection. When sandb cannot get the list, type the database name.
+  - A query schedule is **Read-only** or **Allow writes**. A read-only schedule runs one read statement in a read-only session, and it gets at most 100 rows and 5 minutes. A schedule that allows writes runs all statements and commits them at once. On a production connection, you must confirm scheduled writes first.
+  - An AI prompt schedule starts a new chat in the chat history for each run. In a scheduled run, the assistant can only read.
+  - Each schedule keeps its last 20 runs. The 3 newest runs keep their rows or the reply. **Open in editor** and **Open chat** open a run's query or chat.
+  - When a run ends, sandb shows a message in the app. When the window is not in front, sandb shows a system notification. You can get a message for each run, only for failed runs, or never.
+  - Schedules run only while sandb is open. When a run was due while sandb was closed, it runs one time after sandb starts.
+  - Right-click a saved query and click **Schedule…** to make a schedule from it.
+  - The audit log shows scheduled queries with the source `Schedule`.
+- New: SQL shortcuts. At the start of a statement, type a short word and press Tab or Enter: `sel` gives `SELECT * FROM `, `selc` gives `SELECT COUNT(*) FROM `, `ins` gives `INSERT INTO `, `upd` gives `UPDATE ` and `del` gives `DELETE FROM `. The table list then opens.
+- Changed: the AI assistant prompt separates draft queries from live reads. It tells the assistant to ask when the target is unclear and to report partial results as partial.
+  - A request for a chart, graph or plot calls for the chart tool, even after a data read. A text reply or table does not replace the chart.
+- Changed: MCP instructions explain how to choose a shared connection, find the schema, and use the read tool for each database engine. MCP remains read-only.
+- Changed: the autocomplete list opens by itself, as with Ctrl+Space, 200 ms after you type a space, a comma or `(` at the end of a line. It shows what fits there: tables after `FROM`, columns after `WHERE`, the next clauses (`WHERE`, `JOIN`, `ORDER BY`…) after a table. If you type more in that time, the list does not open. In a list that opened by itself, Tab inserts the item and Enter makes a new line; the list says so at the bottom. It does not open for indentation, in the middle of a line, after `;` or after `AS`.
+- Changed: the UI is cleaner and more consistent:
+  - The results area has one toolbar. The result tabs show only when a run gives more than one result. A table shows one **Filter** button until you add a filter.
+  - The editor splitter shows a grab line. The widths of the sidebar and the assistant, the editor height and the open panels stay after a restart.
+  - In a window narrower than 1100 px, the assistant opens over the editor and starts closed.
+  - Settings, Schedules and Audit log have the same header. The last tab stays marked while one of these pages is open.
+  - Menus, dialogs, toasts and the assistant panel open with a short animation. Up to 3 toasts show at the bottom right.
+  - You can use the arrow keys in all menus and in the tab strip. Every button, tab, tree row and menu item shows a focus ring. A dialog keeps the focus inside it.
+  - Right-click a cell in any result to copy the cell, the rows, the column or the rows as CSV.
+  - The app uses its own dialog instead of the system prompt to confirm a delete or to discard changes. Short lists use the app's own dropdown.
+  - Right-click a tab to rename it, close it or close the other tabs.
+- Fixed: the title bar no longer moves out of view after a click in the connection tree.
+- Fixed: the Commit and Rollback buttons no longer change size during a run.
+- Fixed: after `FROM`, the table list no longer stays empty. When the schema of the database could not load, sandb asked for it again in an endless loop, so the tables never came. Now the list uses the tables that the connection tree loaded, shows "Loading tables…" while the schema loads, and shows the reason when it cannot load.
+
 ## [0.14.0] - 2026-11-18
 
 - Changed: SQL autocomplete now works more like DataGrip. The list shows the items that fit the clause at the cursor:

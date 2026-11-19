@@ -26,14 +26,27 @@ const mongoScenarios = {
   'mongo write': (coll) => ['propose_mongo_write', { query: `db.${coll}.insertOne({item: "mock", qty: 1})` }],
   'mongo out': (coll) => ['run_mongo_read', { query: `db.orders.aggregate([{$match: {status: "paid"}}, {$out: "${coll}"}])` }],
 };
+const redisScenarios = {
+  'redis read': () => ['run_redis_read', { command: 'HGETALL user:1' }],
+  'redis chart': () => ['render_redis_chart', {
+    command: 'ZRANGE leaderboard 0 9 REV WITHSCORES',
+    type: 'bar', title: 'Leaderboard scores', x: 'member', y: ['score'],
+  }],
+  'redis write': (key) => ['propose_redis_write', { command: `HSET ${key} name Mock` }],
+  'redis keys': () => ['run_redis_read', { command: 'KEYS *' }],
+  'redis settings': () => ['run_redis_read', { command: 'CONFIG GET databases' }],
+};
 // "mixed": one step per tool result, a PG read on db1 and then a MongoDB read on db2.
 const mixedSteps = [
   ['run_read_query', { source: 'db1', sql: 'SELECT count(*) AS orders FROM orders' }],
   ['run_mongo_read', { source: 'db2', query: 'db.orders.countDocuments({})' }],
 ];
-// Checked in this order, so "error" and "slow" win over tool keywords, and the two-word MongoDB
-// keywords win over "write" and "chart".
-const keywords = ['error', 'slow', 'mixed', 'mongo out', 'mongo write', 'mongo chart', 'mongo read', 'bypass', 'write', 'chart', 'describe', 'count', 'list'];
+const redisMixedSteps = [
+  mixedSteps[0],
+  ['run_redis_read', { source: 'db2', command: 'GET greeting' }],
+];
+// Check the engine-specific keywords before their generic forms.
+const keywords = ['error', 'slow', 'redis mixed', 'mixed', 'redis keys', 'redis settings', 'redis write', 'redis chart', 'redis read', 'mongo out', 'mongo write', 'mongo chart', 'mongo read', 'bypass', 'write', 'chart', 'describe', 'count', 'list'];
 
 let seq = 0;
 const nextId = (p) => `${p}_${Date.now().toString(36)}${(++seq).toString(36)}`;
@@ -56,10 +69,11 @@ function plan(body) {
   const lastUser = msgs[userAt];
   const q = textOf(lastUser?.content).toLowerCase();
   const kw = keywords.find((k) => new RegExp(`\\b${k}\\b`).test(q));
-  if (kw === 'mixed') {
+  if (kw === 'mixed' || kw === 'redis mixed') {
+    const steps = kw === 'redis mixed' ? redisMixedSteps : mixedSteps;
     const results = msgs.slice(userAt + 1).filter((m) => m.role === 'tool').map((m) => textOf(m.content));
-    if (results.length < mixedSteps.length) {
-      const [name, args] = mixedSteps[results.length];
+    if (results.length < steps.length) {
+      const [name, args] = steps[results.length];
       return { kind: 'tool', name, args: JSON.stringify(args) };
     }
     return { kind: 'text', text: `Mixed results received: ${results.map((r) => r.slice(0, 200)).join(' | ')}` };
@@ -72,6 +86,12 @@ function plan(body) {
   if (kw in mongoScenarios) {
     const coll = q.match(/\b(?:ai_)?it_[0-9a-f]+/)?.[0] ?? 'it_mock';
     const [name, args] = mongoScenarios[kw](coll);
+    return { kind: 'tool', name, args: JSON.stringify(args) };
+  }
+  if (kw in redisScenarios) {
+    const key = textOf(lastUser?.content).match(/\bit_[0-9a-f]+\b/i)?.[0];
+    if (kw === 'redis write' && !key) return { kind: 'text', text: 'Supply a scratch key: redis write it_<hex>.' };
+    const [name, args] = redisScenarios[kw](key);
     return { kind: 'tool', name, args: JSON.stringify(args) };
   }
   if (kw) {

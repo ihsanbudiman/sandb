@@ -225,7 +225,7 @@ async fn session_survives_several_runs() {
                 Engine::Mysql => "SELECT CAST(CONNECTION_ID() AS SIGNED) AS b",
                 // SQLite has no backend id; a temp table lives on the connection itself.
                 Engine::Sqlite => "CREATE TEMP TABLE it_keep (a int)",
-                Engine::Mongo => unreachable!("SQL engines only"),
+                Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
             };
             // The write opens the transaction (and the session); a plain read alone would not.
             run_tab_ok(c, &format!("INSERT INTO {t} VALUES (1, 1)"), "tab").await;
@@ -363,7 +363,7 @@ async fn clean_runs_leave_no_transaction() {
             // write-capable statement (even `SET @x`) counts as pending there.
             Engine::Mysql => "START TRANSACTION; SELECT 1",
             Engine::Sqlite => "PRAGMA user_version; SELECT 1",
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         for sql in ["SELECT 1", not_plain] {
             run_tab_ok(&c, sql, "tab").await;

@@ -88,6 +88,11 @@ impl<K: Owner + Eq + Hash + Clone, V: Clone> GenerationCache<K, V> {
         Some(value.clone())
     }
 
+    /// Drops one cached value without invalidating the owner's other values.
+    pub fn remove(&self, key: &K) -> Option<V> {
+        self.lock().slots.remove(key).map(|(_, value, _)| value)
+    }
+
     /// Caches `value` for `key`. `None` when the owner's settings changed since `generation`,
     /// so the caller must re-read them. An entry cached by a parallel caller is reused.
     pub fn insert(&self, key: K, generation: u64, value: V) -> Option<Cached<V>> {

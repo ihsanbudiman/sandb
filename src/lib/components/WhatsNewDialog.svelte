@@ -11,13 +11,13 @@
 
     {#each whatsNew.releases as r (r.version)}
       <section>
-        <h3 class="text-[12.5px] font-semibold text-ink">{r.version} <span class="font-normal text-faint">{r.date}</span></h3>
-        <div class="text-[12.5px] text-muted"><Markdown text={r.notes} /></div>
+        <h3 class="text-sm font-semibold text-ink">{r.version} <span class="font-normal text-faint">{r.date}</span></h3>
+        <div class="text-sm text-muted"><Markdown text={r.notes} /></div>
       </section>
     {/each}
 
     {#snippet footer()}
-      <button class="btn btn-primary" onclick={closeWhatsNew}>Got it</button>
+      <button class="btn btn-sm btn-primary" data-autofocus onclick={closeWhatsNew}>Got it</button>
     {/snippet}
   </Modal>
 {/if}

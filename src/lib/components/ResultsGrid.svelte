@@ -1,15 +1,43 @@
+<script module lang="ts">
+  import type { QueryResult } from '../api';
+
+  function createGridState() {
+    const prefs = $state({
+      columnWidths: [] as number[],
+      tableWidth: null as number | null,
+      selected: {} as Record<string, true>,
+      pickedCols: {} as Record<string, true>,
+      rowAnchor: -1,
+      colAnchor: -1,
+      view: 'columns' as 'columns' | 'json',
+      scrollTop: 0,
+      scrollLeft: 0,
+    });
+    return prefs;
+  }
+
+  // Results of a run can outlive the mounted grid. Closed and replaced results release their state.
+  const states = new WeakMap<QueryResult, ReturnType<typeof createGridState>>();
+  function stateFor(result: QueryResult) {
+    let prefs = states.get(result);
+    if (!prefs) states.set(result, prefs = createGridState());
+    return prefs;
+  }
+</script>
+
 <script lang="ts">
-  import { untrack } from 'svelte';
-  import { ArrowUpDown, ArrowUp, ArrowDown, ArrowUpRight, Check, X, Pencil, Minus, Eye, Undo2, CircleSlash, CircleAlert, CircleCheck, Copy, Braces, Clock } from '@lucide/svelte';
+  import { untrack, type Snippet } from 'svelte';
+  import { ArrowUpDown, ArrowUp, ArrowDown, ArrowUpRight, Check, X, Pencil, Minus, Eye, Undo2, CircleSlash, CircleAlert, CircleCheck, Copy, Braces, Clock, LoaderCircle } from '@lucide/svelte';
   import { api, ApiError, type Cell, type ForeignKeyInfo, type Row, type RunSort, type TypedValue } from '../api';
   import { focusOnMount } from '../actions';
-  import { canWrite } from '../connections.svelte';
+  import { canWrite, isSql } from '../connections.svelte';
   import { pendingCount, resetEdits } from '../editModel';
-  import { addRow, buildStatements, editBlocker, parseInput, prepareEdit, saveEdits, setCell } from '../edits';
+  import { addRow, buildStatements, confirmDiscard, editBlocker, parseInput, prepareEdit, saveEdits, setCell } from '../edits';
   import { loadMongoCell, mongoColumnType, mongoEditProblem, mongoOriginal, validMongoValue } from '../mongoEdit';
   import { mongoLiteral } from '../mongo/value';
   import { MONGO_WRITABLE_TYPES } from '../api/generated/constants';
-  import { cellText, copyValue, formatCell, isBytes, isCutOff, moreRows } from '../results';
+  import { loadRedisCell, redisCellProblem, redisDeleteProblem, redisEditProblem, redisOriginal } from '../redisEdit';
+  import { cellText, copyValue, csvCell, formatCell, isBytes, isCutOff, moreRows } from '../results';
   import { isBooleanType, isNow, isTemporalType, NOW_VALUE } from '../sql/value';
   import { KEYS } from '../keys';
   import { exportCsv as runExportCsv, exportDocuments as runExportDocuments, exportSql as runExportSql, type ExportMessage } from '../gridExport';
@@ -24,6 +52,7 @@
   import Modal from './Modal.svelte';
   import QueryRunning from './QueryRunning.svelte';
   import { ask } from '../ask.svelte';
+  import Menu from './ui/Menu.svelte';
 
   /** The grid of one tab: its shown result, its grid edits and the API calls scoped to its session. `running`: the tab's run, if any. */
   let {
@@ -36,7 +65,8 @@
     onsort,
     foreignKeys = [],
     onfollow,
-  }: { tab: Tab; running?: Running; oncancel?: () => void; onloadmore?: () => void; onsaved: () => void; sort?: RunSort | null; onsort?: (sort: RunSort) => void; foreignKeys?: ForeignKeyInfo[]; onfollow?: (fk: ForeignKeyInfo, row: Row) => void } = $props();
+    windowControls,
+  }: { tab: Tab; running?: Running; oncancel?: () => void; onloadmore?: () => void; onsaved: () => void; sort?: RunSort | null; onsort?: (sort: RunSort) => void; foreignKeys?: ForeignKeyInfo[]; onfollow?: (fk: ForeignKeyInfo, row: Row) => void; windowControls?: Snippet } = $props();
 
   const loading = $derived(!!running);
   const result = $derived(tab.result);
@@ -68,29 +98,51 @@
 
   // Mongo results carry their documents: the JSON view, the cell type tips and Copy value key on them.
   const mongoConn = $derived(conn.engine === 'mongo');
+  const redisConn = $derived(conn.engine === 'redis');
+  const canEditRows = $derived(!redisConn || result?.edit?.pk[0] !== 'key');
   const fileExport = $derived(mongoConn && api.capabilities.fileExport);
   const mongoDocs = $derived(Array.isArray(result?.documents));
-  const blocker = $derived(canWrite(conn) ? editBlocker(result) : 'Read-only connection: edits are off');
+  const blocker = $derived(canWrite(conn) ? editBlocker(result, redisConn) : 'Read-only connection: edits are off');
   const count = $derived(pendingCount(edits));
 
-  // Columns or JSON view of a Mongo result; the choice stays for this grid instance.
-  let view = $state<'columns' | 'json'>('columns');
+  const emptyGrid = createGridState();
+  const grid = $derived(result ? stateFor(result) : emptyGrid);
+  const { view, tableWidth, columnWidths, selected, pickedCols } = $derived(grid);
 
   // Scrolling near the end of the grid loads the next page. Not while edits are pending: a new result drops them.
   let scroller = $state<HTMLDivElement>();
+  let viewportHeight = $state(0);
   const canLoadMore = $derived(!!result && moreRows(result) && !!onloadmore && !loading && !count);
   function loadIfAtEnd() {
     const el = scroller;
-    if (el && canLoadMore && el.scrollHeight - el.scrollTop - el.clientHeight < 200) onloadmore?.();
+    if (el?.clientHeight && canLoadMore && el.scrollHeight - el.scrollTop - el.clientHeight < 200) onloadmore?.();
   }
+  function onScroll(e: Event & { currentTarget: HTMLDivElement }) {
+    if (e.currentTarget !== scroller || !e.currentTarget.clientHeight) return;
+    grid.scrollTop = e.currentTarget.scrollTop;
+    grid.scrollLeft = e.currentTarget.scrollLeft;
+    loadIfAtEnd();
+  }
+
+  $effect(() => {
+    if (!scroller || !viewportHeight) return;
+    const prefs = grid;
+    scroller.scrollTo({ top: untrack(() => prefs.scrollTop), left: untrack(() => prefs.scrollLeft) });
+  });
+
   // Also after each page lands: a pane taller than the rows has no scroll event to wait for.
   $effect(() => {
-    if (canLoadMore) untrack(loadIfAtEnd);
+    if (viewportHeight && canLoadMore) untrack(loadIfAtEnd);
   });
 
   // A new result (or a connection turned read-only) drops edit mode unless the result is still editable.
   $effect(() => {
-    if (blocker) edits.on = false;
+    if (!blocker) return;
+    edits.on = false;
+    if (redisConn) {
+      editing = null;
+      redisText = null;
+    }
   });
 
   // A notice not tied to a row (for example "not editable") goes away by itself; row errors stay until dismissed.
@@ -107,8 +159,6 @@
 
   const MIN_COLUMN_WIDTH = 48;
   const MAX_COLUMN_WIDTH = 640;
-  let columnWidths = $state<number[]>([]);
-  let tableWidth = $state<number | null>(null);
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
   function measuredColumns(handle: HTMLElement) {
@@ -118,15 +168,15 @@
     if (columnWidths.length === result.columns.length && tableWidth !== null) return { widths: [...columnWidths], width: tableWidth };
     const widths = Array.from(header.cells).slice(1).map((cell) => cell.getBoundingClientRect().width);
     const width = table.getBoundingClientRect().width;
-    columnWidths = [...widths];
-    tableWidth = width;
+    grid.columnWidths = [...widths];
+    grid.tableWidth = width;
     return { widths, width };
   }
 
   function setColumnWidth(ci: number, value: number, initial: { widths: number[]; width: number }) {
     const width = Math.round(clamp(value, MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH));
-    columnWidths[ci] = width;
-    tableWidth = initial.width + width - initial.widths[ci];
+    grid.columnWidths[ci] = width;
+    grid.tableWidth = initial.width + width - initial.widths[ci];
   }
 
   // Pointer capture keeps the moves coming after the pointer leaves the thin handle.
@@ -168,10 +218,9 @@
     if (result) exportMsg = await runExportSql(result, conn, tab.id, () => result);
   }
 
-  let selected = $state<Record<string, true>>({});
   let editing = $state<{ key: string; col: string } | null>(null);
   let draft = $state('');
-  let menu = $state<{ x: number; y: number; r: GridRow; col: string } | null>(null);
+  let menu = $state.raw<{ anchor: { x: number; y: number } | HTMLElement; cell: HTMLTableCellElement; r: GridRow; col: string } | null>(null);
   let dialog = $state<'preview' | 'save' | null>(null);
   /** The save in flight: its id cancels it, and the dialog shows its busy state. */
   let saving = $state(false);
@@ -180,27 +229,38 @@
   let preparing = $state(false);
   /** Full text of the cell open in the editor when the grid shows it cut off; saving it unchanged is not an edit. */
   let full: { key: string; col: string; text: string | null } | null = null;
-  let loadingCell = $state(false);
+  let loadingCell = $state.raw<{ key: string; col: string } | null>(null);
   /** Mongo: the BSON type picked next to the cell editor. */
   let draftType = $state('string');
+  let redisText = $state.raw<{ row: GridRow; col: string; initial: string } | null>(null);
+  let redisTouched = false;
   /** Mongo: a read-only tree of one nested cell (document or array), opened outside edit mode. */
   let viewing = $state<{ title: string; value: unknown } | null>(null);
 
-  // Row keys are result indexes, so they point at other rows once the result changes.
-  // Only the result identity triggers a reset: prepareEdit sets `result.edit` on the same result, and that must not clear column widths.
-  $effect(() => {
-    const r = result;
+  let previous: { result: QueryResult; batch: QueryResult[]; count: number } | null = null;
+  $effect.pre(() => {
+    const current = result;
     untrack(() => {
-      selected = {};
-      pickedCols = {};
-      rowAnchor = colAnchor = -1;
+      const batch = tab.results;
+      // In-place re-runs (pagination, sort, refresh) replace the object in an existing slot.
+      // Keep the viewport and widths, but not selection: row indexes can name different rows.
+      if (current && previous && previous.batch === batch && previous.count === batch.length && !batch.includes(previous.result)) {
+        const old = previous.result;
+        if (current.sql === old.sql && current.columns.length === old.columns.length && current.columns.every((c, i) => c === old.columns[i])) {
+          const prior = stateFor(old);
+          Object.assign(grid, {
+            columnWidths: prior.columnWidths, tableWidth: prior.tableWidth, view: prior.view,
+            scrollTop: prior.scrollTop, scrollLeft: prior.scrollLeft,
+          });
+        }
+      }
+      previous = current ? { result: current, batch, count: batch.length } : null;
       editing = null;
+      redisText = null;
       viewing = null;
       menu = null;
-      columnWidths = [];
-      tableWidth = null;
-      // Edit mode belongs to the tab's own result: a re-run or another result clears it through
-      // `resetEdits`, so a remount must not drop edits that this tab kept while it was inactive.
+      loadingCell = null;
+      full = null;
     });
   });
 
@@ -215,7 +275,7 @@
   const sample = (c: string) => result?.rows.find((x) => x[c] !== null)?.[c] ?? null;
 
   /** A boolean cell: the column type says bool, or the shown value is a boolean. Mongo has its own type list. */
-  const isBoolCell = (r: GridRow, c: string, ci: number) => !mongoConn && (typeof value(r, c) === 'boolean' || isBooleanType(result?.types?.[ci] ?? ''));
+  const isBoolCell = (r: GridRow, c: string, ci: number) => !mongoConn && !redisConn && (typeof value(r, c) === 'boolean' || isBooleanType(result?.types?.[ci] ?? ''));
   /** The cell as a checkbox state; NULL and other values start unchecked. */
   const isTrue = (r: GridRow, c: string) => {
     const v = value(r, c);
@@ -228,9 +288,11 @@
       edits.error = { message: blocker, key: '' };
       return false;
     }
+    const current = result;
     preparing = true;
-    const reason = await prepareEdit(result, conn);
+    const reason = await prepareEdit(current, conn);
     preparing = false;
+    if (result !== current || !canWrite(conn)) return false;
     if (reason) {
       edits.error = { message: reason, key: '' };
       return false;
@@ -240,10 +302,12 @@
   }
 
   async function toggleEdit() {
-    if (edits.on && count && !confirm(`Discard ${count} unsaved change(s)?`)) return;
-    if (edits.on) resetEdits(edits);
-    else if (!(await enableEdit())) return;
-    selected = {};
+    if (edits.on) {
+      const current = result;
+      if (!await confirmDiscard(edits) || result !== current) return;
+      resetEdits(edits);
+    } else if (!(await enableEdit())) return;
+    grid.selected = {};
     editing = null;
   }
 
@@ -254,16 +318,24 @@
     } else setCell(edits, r.idx, r.row, c, v);
   }
 
-  async function startEdit(r: GridRow, c: string) {
-    if (isDeleted(r)) return;
+  async function startEdit(r: GridRow, c: string, multiline = false) {
+    if (isDeleted(r) || loadingCell) return;
     // Outside edit mode a nested cell opens for reading; Edit turns on editing.
     if (!edits.on && isNested(r, c)) return viewCell(r, c);
     const current = result;
     if (!edits.on || !current?.edit) {
-      if (!(await enableEdit())) return;
+      if (preparing || blocker) { await enableEdit(); return; }
+      const cell = { key: r.key, col: c };
+      loadingCell = cell;
+      try {
+        if (!(await enableEdit()) || loadingCell !== cell) return;
+      } finally {
+        if (loadingCell === cell) loadingCell = null;
+      }
     }
     if (result !== current || isDeleted(r)) return;
     if (mongoConn) return startMongoEdit(r, c);
+    if (redisConn && current) return startRedisEdit(current, r, c, multiline);
     const v = value(r, c);
     if (isBytes(v)) {
       edits.error = { message: 'Binary preview cells are read-only', key: r.key };
@@ -278,8 +350,8 @@
         edits.error = { message: 'Truncated text cells are read-only', key: r.key };
         return;
       }
-      if (loadingCell) return;
-      loadingCell = true;
+      const cell = { key: r.key, col: c };
+      loadingCell = cell;
       try {
         text = await api.cellValue({
           request: {
@@ -291,13 +363,14 @@
             column: c,
           },
         });
+        if (loadingCell !== cell) return;
       } catch (e) {
-        edits.error = { message: ApiError.from(e).message, key: r.key };
+        if (loadingCell === cell) edits.error = { message: ApiError.from(e).message, key: r.key };
         return;
       } finally {
-        loadingCell = false;
+        if (loadingCell === cell) loadingCell = null;
       }
-      if (result !== current || isDeleted(r)) return;
+      if (result !== current || !edits.on || isDeleted(r)) return;
       full = { key: r.key, col: c, text };
       text ??= '';
     }
@@ -310,6 +383,12 @@
     // Esc clears `editing` first, so the blur that follows does nothing.
     if (editing?.key !== r.key || editing.col !== c) return;
     if (mongoConn) return commitMongo(r, c, blur);
+    if (redisConn) {
+      // Enter can explicitly set an empty Redis string. Blurring an untouched new cell leaves it unset.
+      if (!r.isNew || value(r, c) !== null || redisTouched || !blur) writeRedis(r, c, draft);
+      editing = null;
+      return;
+    }
     const before = value(r, c);
     // A loaded full value saved as it is stays unchanged; its cut-off preview is the original.
     if (full?.key === r.key && full.col === c && draft === (full.text ?? '')) {
@@ -324,6 +403,63 @@
     } else if (!(before === null && draft === '')) write(r, c, parsed); // Leaving a NULL cell empty keeps it NULL instead of turning it into ''.
     full = null;
     editing = null;
+  }
+
+  async function startRedisEdit(current: QueryResult, r: GridRow, c: string, multiline: boolean) {
+    if ((editing?.key === r.key && editing.col === c) || redisText) return;
+    const bad = redisCellProblem(current, r.idx, c);
+    if (bad) return void (edits.error = { message: bad, key: r.key });
+    const original = r.row[c];
+    let text = r.isNew ? String(original ?? '') : redisOriginal(current, r.idx, c);
+    if (text === undefined && !r.isNew && isCutOff(original)) {
+      const cell = { key: r.key, col: c };
+      loadingCell = cell;
+      try {
+        text = await loadRedisCell(current, conn, r.idx, c, tab.id);
+        if (loadingCell !== cell || result !== current || !edits.on || !canWrite(conn) || isDeleted(r)) return;
+        current.loaded ??= {};
+        current.loaded[r.idx] = { ...current.loaded[r.idx], [c]: { type: 'string', value: text } };
+      } catch (e) {
+        if (loadingCell === cell && result === current) edits.error = { message: ApiError.from(e).message, key: r.key };
+        return;
+      } finally {
+        if (loadingCell === cell) loadingCell = null;
+      }
+    }
+    if (text === undefined) {
+      edits.error = { message: 'This cell has no original value to edit. Reload the result.', key: r.key };
+      return;
+    }
+    if (isChanged(r, c)) text = String(value(r, c));
+    inputError = null;
+    redisTouched = false;
+    draft = text;
+    if (multiline || isCutOff(original) || /[\r\n]/.test(text)) {
+      editing = null;
+      redisText = { row: r, col: c, initial: text };
+    } else editing = { key: r.key, col: c };
+  }
+
+  function writeRedis(r: GridRow, c: string, text: string) {
+    const current = result;
+    if (!current || !edits.on || !canWrite(conn) || isDeleted(r)) return;
+    if (r.isNew) write(r, c, text);
+    else {
+      const original = redisOriginal(current, r.idx, c);
+      if (original === undefined) return;
+      // A draft equal to the displayed abbreviation is still a change if it differs from the full text.
+      setCell(edits, r.idx, { [c]: original }, c, text);
+    }
+    if (edits.error?.key === r.key) edits.error = null;
+  }
+
+  function applyRedisText() {
+    const target = redisText;
+    if (!target) return;
+    // Textareas normalize line endings. Applying without changing the displayed text preserves the exact bytes.
+    if ((target.row.isNew && target.row.row[target.col] === null) ||
+        (draft !== target.initial.replace(/\r\n?/g, '\n') && draft !== target.initial)) writeRedis(target.row, target.col, draft);
+    redisText = null;
   }
 
   // ---- MongoDB: values keep their BSON type ----
@@ -341,15 +477,16 @@
     const have = mongoOriginal(current, r.idx, c);
     if (have) return have;
     if (loadingCell) return null;
-    loadingCell = true;
+    const cell = { key: r.key, col: c };
+    loadingCell = cell;
     try {
       const v = await loadMongoCell(current, conn, r.idx, c, tab.id);
-      return result === current ? v : null;
+      return loadingCell === cell && result === current && edits.on ? v : null;
     } catch (e) {
-      edits.error = { message: ApiError.from(e).message, key: r.key };
+      if (loadingCell === cell) edits.error = { message: ApiError.from(e).message, key: r.key };
       return null;
     } finally {
-      loadingCell = false;
+      if (loadingCell === cell) loadingCell = null;
     }
   }
 
@@ -433,9 +570,6 @@
 
   // Row-number clicks select rows and header clicks select columns, like DBeaver: plain click picks one,
   // ⌘/Ctrl adds or removes one, Shift extends from the last plain or ⌘ click. ⌘C copies the block.
-  let pickedCols = $state<Record<string, true>>({});
-  let rowAnchor = -1;
-  let colAnchor = -1;
 
   function pick<T>(cur: Record<string, true>, items: T[], i: number, anchor: number, e: MouseEvent, key: (x: T) => string) {
     if (e.shiftKey && anchor >= 0) {
@@ -450,19 +584,19 @@
     return out;
   }
 
-  function pickRow(i: number, e: MouseEvent) {
-    selected = pick(selected, rows, i, rowAnchor, e, (r) => r.key);
-    if (!e.shiftKey) rowAnchor = i;
-    if (!e.shiftKey && !e.metaKey && !e.ctrlKey) pickedCols = {};
-    scroller?.focus({ preventScroll: true });
+  function pickRow(i: number, e: MouseEvent & { currentTarget: HTMLButtonElement }) {
+    grid.selected = pick(selected, rows, i, grid.rowAnchor, e, (r) => r.key);
+    if (!e.shiftKey) grid.rowAnchor = i;
+    if (!e.shiftKey && !e.metaKey && !e.ctrlKey) grid.pickedCols = {};
+    e.currentTarget.focus({ preventScroll: true });
   }
 
-  function pickColumn(ci: number, e: MouseEvent) {
+  function pickColumn(ci: number, e: MouseEvent & { currentTarget: HTMLButtonElement }) {
     if (!result) return;
-    pickedCols = pick(pickedCols, result.columns, ci, colAnchor, e, (c) => c);
-    if (!e.shiftKey) colAnchor = ci;
-    if (!e.shiftKey && !e.metaKey && !e.ctrlKey) selected = {};
-    scroller?.focus({ preventScroll: true });
+    grid.pickedCols = pick(pickedCols, result.columns, ci, grid.colAnchor, e, (c) => c);
+    if (!e.shiftKey) grid.colAnchor = ci;
+    if (!e.shiftKey && !e.metaKey && !e.ctrlKey) grid.selected = {};
+    e.currentTarget.focus({ preventScroll: true });
   }
 
   const hasRows = $derived(Object.keys(selected).length > 0);
@@ -509,7 +643,26 @@
     e.clipboardData.setData('text/plain', whole ? cellText(v) : cellText(v).slice(offset(start, range.startOffset)));
   }
 
+  const redisDeleteBlocker = $derived.by(() => {
+    if (!redisConn || !result) return null;
+    for (const r of rows) {
+      if (!selected[r.key] || isDeleted(r)) continue;
+      const bad = redisDeleteProblem(result, r.idx);
+      if (bad) return bad;
+    }
+    return null;
+  });
+
   function deleteRows(keys: string[]) {
+    if (redisConn) {
+      if (!result || !edits.on || !canWrite(conn)) return;
+      const picked = new Set(keys);
+      for (const r of rows) {
+        if (!picked.has(r.key) || isDeleted(r)) continue;
+        const bad = redisDeleteProblem(result, r.idx);
+        if (bad) return void (edits.error = { message: bad, key: r.key });
+      }
+    }
     for (const k of keys) {
       const r = rows.find((x) => x.key === k);
       if (!r) continue;
@@ -519,22 +672,39 @@
       else if (edits.deleted[r.idx]) delete edits.deleted[r.idx];
       else edits.deleted[r.idx] = true;
     }
-    selected = {};
+    grid.selected = {};
   }
 
   function newRow() {
     if (!result) return;
+    if (redisConn && (!canEditRows || !edits.on || !canWrite(conn))) return;
     if (mongoConn) return editDocument();
     const row: Row = Object.fromEntries(result.columns.map((c) => [c, null]));
     addRow(edits, row);
   }
 
-  function openMenu(e: MouseEvent, r: GridRow, c: string) {
-    // Mongo cells always have a menu: Copy value works outside edit mode too.
-    if (!edits.on && !mongoDocs) return;
+  function openMenu(e: MouseEvent | KeyboardEvent, cell: HTMLTableCellElement, r: GridRow, c: string) {
     e.preventDefault();
-    if (edits.on && !selected[r.key]) selected = { [r.key]: true };
-    menu = { x: Math.min(e.clientX, innerWidth - 170), y: Math.min(e.clientY, innerHeight - (mongoDocs ? 220 : 160)), r, col: c };
+    const point = e instanceof MouseEvent && (e.clientX !== 0 || e.clientY !== 0);
+    menu = { anchor: point ? { x: e.clientX, y: e.clientY } : cell, cell, r, col: c };
+  }
+
+  function cellKey(e: KeyboardEvent & { currentTarget: HTMLTableCellElement }, r: GridRow, c: string) {
+    const cell = e.currentTarget;
+    if (e.target !== cell) return;
+    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) return openMenu(e, cell, r, c);
+    let next: Element | null | undefined;
+    if (e.key === 'ArrowLeft') next = cell.cellIndex > 1 ? cell.previousElementSibling : null;
+    else if (e.key === 'ArrowRight') next = cell.nextElementSibling;
+    else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      const row = cell.parentElement;
+      const adjacent = e.key === 'ArrowUp' ? row?.previousElementSibling : row?.nextElementSibling;
+      if (adjacent instanceof HTMLTableRowElement) next = adjacent.cells[cell.cellIndex];
+    }
+    if (next instanceof HTMLTableCellElement) {
+      e.preventDefault();
+      next.focus();
+    }
   }
 
   /** Full value of a Mongo cell, read from its document at the column path; undefined for a missing field. */
@@ -547,9 +717,29 @@
     return v;
   }
 
+  function copyText(text: string) {
+    navigator.clipboard?.writeText(text).catch(() => {});
+  }
+
   function copyCell(r: GridRow, c: string) {
-    const v = docValue(r, c);
-    if (v !== undefined) navigator.clipboard?.writeText(copyValue(v)).catch(() => {});
+    const doc = mongoDocs && !r.isNew && !isChanged(r, c) ? docValue(r, c) : undefined;
+    copyText(doc === undefined ? cellText(value(r, c)) : copyValue(doc));
+  }
+
+  function contextRows(r: GridRow) {
+    return selected[r.key] ? rows.filter((row) => selected[row.key]) : [r];
+  }
+
+  function copyRows(picked: GridRow[]) {
+    if (!result) return;
+    const cols = result.columns;
+    copyText(picked.map((r) => cols.map((c) => cellText(value(r, c))).join('\t')).join('\n'));
+  }
+
+  function copyCsv() {
+    if (!result) return;
+    const cols = result.columns;
+    copyText([cols.map(csvCell).join(','), ...rows.map((r) => cols.map((c) => csvCell(value(r, c))).join(','))].join('\r\n'));
   }
 
   /** A saved document or array cell of a Mongo result. */
@@ -564,8 +754,17 @@
     if (v !== undefined) viewing = { title: c, value: v };
   }
 
+  function previewEdits(mode: 'preview' | 'save') {
+    if (redisConn && result) {
+      if (!edits.on || blocker) return;
+      const problem = redisEditProblem(edits, result);
+      if (problem) return void (edits.error = problem);
+    }
+    dialog = mode;
+  }
+
   async function doSave() {
-    if (!result || saving) return;
+    if (!result || saving || (redisConn && (blocker || !edits.on))) return;
     saving = true;
     // Closing this tab waits for the save: a reset after it would wipe the edits of the next state.
     edits.saving = true;
@@ -601,87 +800,89 @@
     return 'plain';
   }
   const ROW_TINT: Record<Tint, string> = {
-    error: 'bg-red-500/15 outline outline-1 -outline-offset-1 outline-red-500/60',
-    deleted: 'bg-red-500/8 text-faint line-through decoration-red-500/60 dark:bg-red-500/10',
-    new: 'bg-emerald-500/8 dark:bg-emerald-500/10',
+    error: 'bg-danger-soft outline outline-1 -outline-offset-1 outline-danger/60',
+    deleted: 'bg-danger-soft text-faint line-through decoration-danger/60',
+    new: 'bg-ok-soft',
     selected: 'bg-accent/10',
     plain: 'hover:bg-hover',
   };
   /** The row-number cell's tint: its opaque background hides the tint on the `tr`. */
   const NUMBER_TINT: Record<Tint, string> = {
-    error: 'bg-red-500/15',
-    deleted: 'bg-red-500/8 dark:bg-red-500/10',
-    new: 'bg-emerald-500/8 dark:bg-emerald-500/10',
+    error: 'bg-danger-soft',
+    deleted: 'bg-danger-soft',
+    new: 'bg-ok-soft',
     selected: 'bg-accent/10',
     plain: 'group-hover/row:bg-hover',
   };
 </script>
 
-<svelte:window
-  onclick={() => (menu = null)}
-  onkeydown={(e) => { if (e.key === 'Escape') { menu = null; viewing = null; } }}
-/>
-
 {#if running}
-  <QueryRunning run={running} over={!!result} {oncancel} />
+  <div class="pointer-events-none absolute inset-x-0 top-0 z-running {windowControls ? 'bottom-sub-toolbar' : 'bottom-0'}">
+    <QueryRunning run={running} over={!!result} {oncancel} />
+  </div>
 {/if}
 
-{#if !result}
-  <div class="grid h-full place-items-center" class:invisible={loading}>
-    <div class="text-center">
-      <div class="text-[13px] font-medium text-ink">No results yet</div>
-      <div class="mt-1 flex items-center justify-center gap-1.5 text-[12.5px] text-muted">Write a query and press <kbd class="kbd">{KEYS.run.hint}</kbd></div>
-    </div>
-  </div>
-{:else if result.error}
-  <div class="p-4">
-    <div class="flex items-start gap-2.5 rounded-lg bg-red-500/8 px-3.5 py-3" role="alert">
-      <CircleAlert size={15} class="mt-px shrink-0 text-red-600 dark:text-red-400" />
-      <div class="min-w-0">
-        <span class="text-[12.5px] font-semibold text-red-700 dark:text-red-400">Error</span>
-        <pre class="mt-1 font-mono text-[12px] leading-relaxed whitespace-pre-wrap text-red-800 dark:text-red-300">{result.error}</pre>
+{#if !result || result.error || result.note}
+  <div class="flex h-full flex-col">
+    {#if !result}
+      <div class="grid min-h-0 flex-1 place-items-center" class:invisible={loading}>
+        <div class="text-center">
+          <div class="text-base font-medium text-ink">No results yet</div>
+          <div class="mt-1 flex items-center justify-center gap-1.5 text-sm text-muted">Write a query and press <kbd class="kbd">{KEYS.run.hint}</kbd></div>
+        </div>
       </div>
-    </div>
-  </div>
-{:else if result.note}
-  <div class="flex h-full flex-col gap-3 overflow-auto p-4">
-    <div class="flex items-center gap-2.5">
-      <CircleCheck size={15} class="shrink-0 text-emerald-600 dark:text-emerald-400" />
-      <span><span class="sr-only">Succeeded: </span>{result.note} <span class="font-mono text-[11.5px] text-faint">· {result.ms} ms</span></span>
-    </div>
-    {#if result.notices}{@render notices(result.notices)}{/if}
-    {#if result.summary}{@render summary(result.summary)}{/if}
+    {:else if result.error}
+      <div class="min-h-0 flex-1 overflow-auto p-4">
+        <div class="flex items-start gap-2.5 rounded-lg bg-danger-soft px-3.5 py-3 text-danger" role="alert">
+          <CircleAlert size={15} class="mt-px shrink-0" />
+          <div class="min-w-0">
+            <span class="text-sm font-semibold">Error</span>
+            <pre class="mt-1 font-mono text-sm leading-relaxed whitespace-pre-wrap">{result.error}</pre>
+          </div>
+        </div>
+      </div>
+    {:else}
+      <div class="flex min-h-0 flex-1 flex-col gap-3 overflow-auto p-4">
+        <div class="flex items-center gap-2.5">
+          <CircleCheck size={15} class="shrink-0 text-ok" />
+          <span><span class="sr-only">Succeeded: </span>{result.note} <span class="font-mono text-xs text-faint">· {result.ms} ms</span></span>
+        </div>
+        {#if result.notices}{@render notices(result.notices)}{/if}
+        {#if result.summary}{@render summary(result.summary)}{/if}
+      </div>
+    {/if}
+    {#if windowControls}<GridToolbar {windowControls} />{/if}
   </div>
 {:else}
   <div class="flex h-full flex-col">
     {#if result.notices}<div class="border-b border-line px-3 py-1.5">{@render notices(result.notices)}</div>{/if}
     {#if result.summary}<div class="border-b border-line px-3 py-1.5">{@render summary(result.summary)}</div>{/if}
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="min-h-0 flex-1 overflow-auto outline-none" tabindex="-1" bind:this={scroller} onscroll={loadIfAtEnd} onkeydown={copyBlock} oncopy={copySelection}>
+    <div class="min-h-0 flex-1 overflow-auto focus-ring" tabindex="-1" bind:this={scroller} bind:clientHeight={viewportHeight} onscroll={onScroll} onkeydown={copyBlock} oncopy={copySelection}>
       {#if mongoDocs && view === 'json'}
         <JsonTree documents={result.documents ?? []} more={moreRows(result)} {loading} onloadmore={onloadmore} />
       {:else}
-      <table class="w-full border-separate border-spacing-0 font-mono text-[12px] {tableWidth === null ? '' : 'table-fixed'}" style:width={tableWidth === null ? undefined : `${tableWidth}px`}>
+      <table class="w-full border-separate border-spacing-0 font-mono text-sm {tableWidth === null ? '' : 'table-fixed'}" style:width={tableWidth === null ? undefined : `${tableWidth}px`}>
         <colgroup>
           <col class="w-9" />
           {#each result.columns as _, ci}
             <col style:width={columnWidths[ci] === undefined ? undefined : `${columnWidths[ci]}px`} />
           {/each}
         </colgroup>
-        <thead class="sticky top-0 z-10">
+        <thead class="sticky top-0 z-sticky">
           <tr>
-            <th class="sticky left-0 w-9 border-b border-line bg-surface px-2 py-0 text-right font-sans text-[10.5px] font-normal text-faint shadow-[1px_0_0_var(--c-line)]"></th>
+            <th class="sticky left-0 w-9 border-b border-line bg-surface shadow-[1px_0_0_var(--c-line)]"></th>
             {#each result.columns as c, ci}
               <th class="group/th relative h-8 border-b border-l border-line bg-surface px-2.5 py-0 text-left font-normal" title={result.types?.[ci]}>
                 {#if pickedCols[c]}<span class="pointer-events-none absolute inset-0 bg-accent/10"></span>{/if}
                 <div class="relative flex w-full items-center gap-1.5">
-                  <button class="flex min-w-0 flex-1 items-baseline gap-1.5 text-left whitespace-nowrap select-none" title="Select column (⌘ add, ⇧ range)" onclick={(e) => pickColumn(ci, e)}>
-                    <span class="font-sans text-[12px] font-semibold {pickedCols[c] || sort?.column === c ? 'text-accent' : 'text-ink'}">{c}</span>
-                    {#if result.types?.[ci]}<span class="max-w-72 min-w-0 truncate text-[10.5px] text-faint">{result.types?.[ci]}</span>{/if}
+                  <button class="focus-ring flex min-w-0 flex-1 items-baseline gap-1.5 rounded text-left whitespace-nowrap select-none" title="Select column (⌘ add, ⇧ range)" onclick={(e) => pickColumn(ci, e)}>
+                    <span class="font-sans text-sm font-semibold {pickedCols[c] || sort?.column === c ? 'text-accent' : 'text-ink'}">{c}</span>
+                    {#if result.types?.[ci]}<span class="th max-w-72 min-w-0 truncate">{result.types?.[ci]}</span>{/if}
                   </button>
                   {#if result.sortable}
                     <button
-                      class="shrink-0 rounded p-0.5 hover:bg-hover {sort?.column === c ? '' : 'opacity-0 transition-opacity group-hover/th:opacity-100 focus-visible:opacity-100'}"
+                      class="focus-ring shrink-0 rounded p-0.5 hover:bg-hover {sort?.column === c ? '' : 'opacity-0 motion-safe:transition-opacity group-hover/th:opacity-100 focus-visible:opacity-100'}"
                       title="Sort by {c}"
                       aria-label="Sort by {c}"
                       onclick={() => sortBy(c)}
@@ -694,7 +895,7 @@
                 </div>
                 <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
                 <div
-                  class="absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize hover:bg-accent/25 focus-visible:bg-accent/40"
+                  class="focus-ring absolute inset-y-0 -right-1 z-sticky w-2 cursor-col-resize hover:bg-accent/25 focus-visible:bg-accent/40"
                   role="separator"
                   aria-orientation="vertical"
                   aria-label={`Resize ${c} column`}
@@ -715,23 +916,33 @@
           {#each rows as r, i (r.key)}
             <tr class="group/row {ROW_TINT[tintOf(r)]}">
               <td
-                class="sticky left-0 z-[1] cursor-pointer border-b border-line/60 bg-surface px-2 text-right text-[10.5px] tabular-nums shadow-[1px_0_0_var(--c-line)] select-none {selected[r.key] ? 'font-medium text-ink' : 'text-faint'}"
-                onclick={(e) => pickRow(i, e)}
-              ><span class="pointer-events-none absolute inset-0 {NUMBER_TINT[tintOf(r)]}"></span><span class="relative">{r.isNew ? '+' : i + 1}</span></td>
+                class="sticky left-0 border-b border-line/60 bg-surface p-0 text-right text-2xs tabular-nums shadow-[1px_0_0_var(--c-line)] select-none {selected[r.key] ? 'font-medium text-ink' : 'text-faint'}"
+              >
+                <button type="button" class="focus-ring absolute inset-0 w-full cursor-pointer px-2 text-right" aria-label={r.isNew ? 'Select new row' : `Select row ${i + 1}`} aria-pressed={!!selected[r.key]} onclick={(e) => pickRow(i, e)}>
+                  <span class="pointer-events-none absolute inset-0 {NUMBER_TINT[tintOf(r)]}"></span><span class="relative">{r.isNew ? '+' : i + 1}</span>
+                </button>
+              </td>
               {#each result.columns as c, ci}
                 {@const v = value(r, c)}
                 {@const isEd = editing?.key === r.key && editing.col === c}
+                {@const isLoading = loadingCell?.key === r.key && loadingCell.col === c}
                 {@const fk = linkOf(r, c)}
                 <td
                   title={mongoDocs ? (r.isNew ? 'new document' : isChanged(r, c) ? (edits.changed[r.idx][c] as TypedValue).type : (result.cellTypes?.[r.idx]?.[ci] ?? 'missing')) : undefined}
-                  class="relative h-[26px] {tableWidth === null ? 'max-w-72' : ''} truncate border-b border-l border-line/60 {fk ? 'pr-7 pl-2.5' : 'px-2.5'} {isChanged(r, c) && !isDeleted(r) ? 'bg-amber-400/15 dark:bg-amber-400/12' : hasCols && inBlock(r, c) ? 'bg-accent/10' : ''} {typeof v === 'number' ? 'text-right' : ''}"
+                  class="focus-ring relative h-list-row {tableWidth === null ? 'max-w-72' : ''} truncate select-none border-b border-l border-line/60 {fk ? 'pr-7 pl-2.5' : 'px-2.5'} {isChanged(r, c) && !isDeleted(r) ? 'bg-warn-soft' : hasCols && inBlock(r, c) ? 'bg-accent/10' : ''} {typeof v === 'number' ? 'text-right' : ''}"
+                  aria-busy={isLoading || undefined}
+                  tabindex={i === 0 && ci === 0 ? 0 : -1}
                   ondblclick={() => startEdit(r, c)}
                   onclick={(e) => {
                     if (e.metaKey || e.ctrlKey) return;
-                    pickedCols = {};
-                    selected = {};
+                    grid.pickedCols = {};
+                    grid.selected = {};
+                    if (e.target === e.currentTarget || (e.target instanceof Element && e.target.closest('[data-cell]'))) {
+                      e.currentTarget.focus({ preventScroll: true });
+                    }
                   }}
-                  oncontextmenu={(e) => openMenu(e, r, c)}
+                  oncontextmenu={(e) => openMenu(e, e.currentTarget, r, c)}
+                  onkeydown={(e) => cellKey(e, r, c)}
                 >
                   {#if isEd && isBoolCell(r, c, ci)}
                     <!-- WebKit does not focus a clicked checkbox: mousedown would blur it and close the editor before the click toggles it. -->
@@ -739,7 +950,7 @@
                     <label class="absolute inset-0 flex cursor-pointer items-center px-2.5" title="Toggle {c}" onmousedown={(e) => e.preventDefault()}>
                       <input
                         type="checkbox"
-                        class="size-[13px] cursor-pointer accent-accent"
+                        class="focus-ring size-3.5 cursor-pointer"
                         aria-label="Toggle {c}"
                         checked={isTrue(r, c)}
                         use:focusOnMount
@@ -762,26 +973,31 @@
                       oncancel={() => (editing = null)}
                       oninput={() => {
                         inputError = null;
+                        if (redisConn) redisTouched = true;
                         // Typing into a null cell picks a type that can hold the text.
                         if (mongoConn && draftType === 'null') draftType = columnType(c);
                       }}
                     />
                   {/if}
-                  {#if fk && !isEd}
+                  {#if isLoading}
+                    <span class="absolute inset-0 flex items-center justify-center bg-field text-accent" role="status">
+                      <LoaderCircle size={13} class="motion-safe:animate-spin" aria-hidden="true" /><span class="sr-only">Loading cell…</span>
+                    </span>
+                  {:else if fk && !isEd}
                     {@const target = (fk.refSchema ? fk.refSchema + '.' : '') + fk.refTable}
                     <button
-                      class="absolute top-1/2 right-1.5 inline-flex size-4 -translate-y-1/2 items-center justify-center rounded text-faint opacity-60 group-hover/row:opacity-100 hover:bg-accent/15 hover:text-accent"
+                      class="focus-ring absolute top-1/2 right-1.5 inline-flex size-4 -translate-y-1/2 items-center justify-center rounded text-faint opacity-60 group-hover/row:opacity-100 focus-visible:opacity-100 hover:bg-accent/15 hover:text-accent"
                       title="Open {target} where {fk.refColumns.map((rc, k) => `${rc} = ${String(r.row[fk.columns[k]])}`).join(' and ')}"
                       aria-label="Open referenced row in {target}"
                       onclick={(e) => { e.stopPropagation(); onfollow?.(fk, r.row); }}
                       ondblclick={(e) => e.stopPropagation()}
                     ><ArrowUpRight size={12} /></button>
                   {/if}
-                  <span class:invisible={isEd} data-cell data-row={i} data-col={ci}>
+                  <span class:invisible={isEd || isLoading} data-cell data-row={i} data-col={ci}>
                     {#if v === null}
-                      <span class="text-[11px] italic {selected[r.key] ? 'text-muted' : 'text-faint'}">NULL</span>
+                      <span class="text-xs italic {selected[r.key] ? 'text-muted' : 'text-faint'}">NULL</span>
                     {:else if typeof v === 'boolean'}
-                      {#if v}<Check size={14} class="text-emerald-600 dark:text-emerald-400" />{:else}<X size={14} class="text-faint" />{/if}
+                      {#if v}<Check size={13} class="text-ok" />{:else}<X size={13} class="text-faint" />{/if}
                     {:else if typeof v === 'number'}
                       <span class="tabular-nums">{v}</span>
                     {:else if typeof v === 'object'}
@@ -799,101 +1015,118 @@
       {/if}
     </div>
     {#if edits.error}
-      <div class="flex items-center gap-2 border-t border-red-500/25 bg-red-500/6 px-3 py-1.5 text-[12px] text-red-700 dark:text-red-400">
+      <div class="flex items-center gap-2 border-t border-danger/25 bg-danger-soft px-3 py-1.5 text-sm text-danger" role="alert">
         <CircleAlert size={13} class="shrink-0" />
         <span class="sr-only">ERROR</span>
         <span class="min-w-0 flex-1 truncate" title={edits.error.message}>{edits.error.message}</span>
-        <button class="btn btn-ghost h-5 px-1 text-[11px]" onclick={() => (edits.error = null)} aria-label="Dismiss"><X size={12} /></button>
+        <button class="btn btn-sm btn-ghost p-1" onclick={() => (edits.error = null)} aria-label="Dismiss"><X size={12} /></button>
       </div>
     {/if}
     <GridToolbar
       {result}
       {edits}
       mongo={mongoConn}
+      redis={redisConn}
+      {canEditRows}
+      deleteBlocker={redisDeleteBlocker}
       {blocker}
       {preparing}
       {loading}
       {view}
       {exportMsg}
-      canExportSql={api.capabilities.fileExport}
+      canExportSql={isSql(conn) && api.capabilities.fileExport}
       {fileExport}
       selectedCount={Object.keys(selected).length}
       onedit={toggleEdit}
       onnew={newRow}
       ondelete={() => deleteRows(Object.keys(selected))}
       ondiscard={() => resetEdits(edits, true)}
-      onpreview={() => (dialog = 'preview')}
-      onsave={() => (dialog = 'save')}
-      onview={(v) => (view = v)}
+      onpreview={() => previewEdits('preview')}
+      onsave={() => previewEdits('save')}
+      onview={(v) => (grid.view = v)}
       onexport={fileExport ? exportDocumentsNow : exportCsvNow}
       onexportsql={exportSqlNow}
       onreview={isPlan(result, conn.engine) ? () => reviewPlan(result, conn.engine) : undefined}
+      {windowControls}
     />
   </div>
 {/if}
 
 {#if menu}
-  {@const m = menu}
-  <div class="popover fixed z-40 w-40 p-1" style="left:{m.x}px;top:{m.y}px" role="menu" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={() => {}}>
-    {#if mongoDocs}
-      {#if edits.on && m.r.isNew}
-        <button class="nav-item" onclick={() => { editDocument(m.r); menu = null; }}><Braces size={13} /> Edit document…</button>
-      {:else if edits.on && !isDeleted(m.r)}
-        <button class="nav-item" onclick={() => { startEdit(m.r, m.col); menu = null; }}><Pencil size={13} /> Edit cell</button>
-        <button class="nav-item" onclick={() => { editJson(m.r, m.col); menu = null; }}><Braces size={13} /> Edit as JSON…</button>
-        <button class="nav-item" onclick={() => { setMongoNull(m.r, m.col); menu = null; }}><CircleSlash size={13} /> Set null</button>
-        {#if isChanged(m.r, m.col)}
-          <button class="nav-item" onclick={() => { setCell(edits, m.r.idx, m.r.row, m.col, m.r.row[m.col]); menu = null; }}><Undo2 size={13} /> Revert cell</button>
+  {@const { anchor, cell, r, col } = menu}
+  {@const picked = contextRows(r)}
+  {@const editProblem = redisConn && result ? redisCellProblem(result, r.idx, col) : null}
+  {@const deleteProblem = redisConn && result ? picked.reduce<string | null>((bad, row) => bad ?? (isDeleted(row) ? null : redisDeleteProblem(result, row.idx)), null) : null}
+  <Menu {anchor} returnFocus={cell} label="Cell actions" onclose={() => (menu = null)}>
+    <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => copyCell(r, col)}><Copy size={13} /> Copy cell</button>
+    <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => copyRows(picked)}><Copy size={13} /> Copy {picked.length > 1 ? 'rows' : 'row'}</button>
+    <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => copyText(rows.map((row) => cellText(value(row, col))).join('\n'))}><Copy size={13} /> Copy column</button>
+    <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={copyCsv}><Copy size={13} /> Copy as CSV</button>
+    {#if isNested(r, col)}
+      <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => viewCell(r, col)}><Eye size={13} /> View value</button>
+    {/if}
+    {#if edits.on && !blocker}
+      <div role="separator" class="mx-2 my-1 h-px bg-line"></div>
+      {#if mongoConn && r.isNew}
+        <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => editDocument(r)}><Braces size={13} /> Edit document…</button>
+      {:else if !isDeleted(r)}
+        <button type="button" role="menuitem" tabindex="-1" class="menu-item" disabled={!!editProblem} title={editProblem ?? undefined} onclick={() => startEdit(r, col)}><Pencil size={13} /> Edit cell</button>
+        {#if mongoConn}
+          <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => editJson(r, col)}><Braces size={13} /> Edit as JSON…</button>
+          <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => setMongoNull(r, col)}><CircleSlash size={13} /> Set null</button>
+        {:else if redisConn}
+          {#if !editProblem}
+            <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => startEdit(r, col, true)}><Pencil size={13} /> Edit as multiline text…</button>
+          {/if}
+        {:else}
+          <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => write(r, col, null)}><CircleSlash size={13} /> Set NULL</button>
+          {#if isTemporalType(result?.types?.[result.columns.indexOf(col)] ?? '')}
+            <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => write(r, col, NOW_VALUE)}><Clock size={13} /> Set NOW()</button>
+          {/if}
+        {/if}
+        {#if isChanged(r, col)}
+          <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => setCell(edits, r.idx, r.row, col, r.row[col])}><Undo2 size={13} /> Revert cell</button>
         {/if}
       {/if}
-      {#if !m.r.isNew}
-        {#if isNested(m.r, m.col)}
-          <button class="nav-item" onclick={() => { viewCell(m.r, m.col); menu = null; }}><Eye size={13} /> View value</button>
-        {/if}
-        <button class="nav-item" onclick={() => { copyCell(m.r, m.col); menu = null; }}><Copy size={13} /> Copy value</button>
-      {/if}
-      {#if edits.on}
-        <button class="nav-item {isDeleted(m.r) ? '' : 'text-red-600 dark:text-red-400'}" onclick={() => { deleteRows(Object.keys(selected).length ? Object.keys(selected) : [m.r.key]); menu = null; }}>
-          {#if isDeleted(m.r)}<Undo2 size={13} /> Restore document{:else}<Minus size={13} /> Delete document{Object.keys(selected).length > 1 ? 's' : ''}{/if}
+      {#if canEditRows}
+        <button type="button" role="menuitem" tabindex="-1" class="menu-item {isDeleted(r) ? '' : 'nav-item-danger'}" disabled={!!deleteProblem} title={deleteProblem ?? undefined} onclick={() => deleteRows(picked.map((row) => row.key))}>
+          {#if isDeleted(r)}<Undo2 size={13} /> Restore {mongoConn ? 'document' : 'row'}
+          {:else}<Minus size={13} /> Delete {mongoConn ? 'document' : 'row'}{picked.length > 1 ? 's' : ''}{/if}
         </button>
       {/if}
-    {:else}
-      {#if !isDeleted(m.r)}
-        <button class="nav-item" onclick={() => { startEdit(m.r, m.col); menu = null; }}><Pencil size={13} /> Edit cell</button>
-        <button class="nav-item" onclick={() => { write(m.r, m.col, null); menu = null; }}><CircleSlash size={13} /> Set NULL</button>
-        {#if isTemporalType(result?.types?.[result.columns.indexOf(m.col)] ?? '')}
-          <button class="nav-item" onclick={() => { write(m.r, m.col, NOW_VALUE); menu = null; }}><Clock size={13} /> Set NOW()</button>
-        {/if}
-        {#if isChanged(m.r, m.col)}
-          <button class="nav-item" onclick={() => { setCell(edits, m.r.idx, m.r.row, m.col, m.r.row[m.col]); menu = null; }}><Undo2 size={13} /> Revert cell</button>
-        {/if}
-      {/if}
-      <button class="nav-item {isDeleted(m.r) ? '' : 'text-red-600 dark:text-red-400'}" onclick={() => { deleteRows(Object.keys(selected).length ? Object.keys(selected) : [m.r.key]); menu = null; }}>
-        {#if isDeleted(m.r)}<Undo2 size={13} /> Restore row{:else}<Minus size={13} /> Delete row{Object.keys(selected).length > 1 ? 's' : ''}{/if}
-      </button>
     {/if}
-  </div>
+  </Menu>
 {/if}
 
 {#snippet notices(lines: string[])}
-  <ul class="space-y-0.5 font-mono text-[11.5px] text-amber-700 dark:text-amber-400" role="status">
+  <ul class="space-y-0.5 font-mono text-xs text-warn" role="status">
     {#each lines as l, i (i)}<li>{l}</li>{/each}
   </ul>
 {/snippet}
 
 {#snippet summary(lines: string[])}
-  <ol class="space-y-0.5 font-mono text-[11.5px] text-muted">
+  <ol class="space-y-0.5 font-mono text-xs text-muted">
     {#each lines as l, i (i)}<li class="truncate" title={l}>{l}</li>{/each}
   </ol>
 {/snippet}
 
 <EditSaveDialog bind:mode={dialog} {stmts} {conn} transactions={result?.edit?.transactions !== false} {saving} error={edits.error?.message ?? null} onsave={doSave} oncancel={cancelSave} />
+{#if redisText && !blocker && edits.on}
+  <Modal title={`Edit ${redisText.col}`} width="max-w-xl" closable onclose={() => (redisText = null)}>
+    <textarea class="input h-72 resize-y py-1.5 font-mono text-sm leading-relaxed" data-autofocus aria-label="Cell value" bind:value={draft} autocapitalize="off" autocomplete="off" spellcheck="false"></textarea>
+    {#snippet footer()}
+      <button class="btn btn-secondary" onclick={() => (redisText = null)}>Cancel</button>
+      <button class="btn btn-primary" onclick={applyRedisText}>Apply</button>
+    {/snippet}
+  </Modal>
+{/if}
 {#if viewing}
   {@const v = viewing}
-  <Modal title={v.title} width="max-w-xl" bodyClass="max-h-[60vh] overflow-auto" closable onclose={() => (viewing = null)}>
+  <Modal title={v.title} width="max-w-xl" bodyClass="max-h-[60vh] overflow-auto select-text" closable onclose={() => (viewing = null)}>
     {#snippet head()}<Braces size={15} class="text-faint" />{/snippet}
     {#key v}<JsonTree documents={[v.value]} name={v.title} />{/key}
     {#snippet footer()}
+      <button class="btn btn-ghost" onclick={() => copyText(copyValue(v.value))}><Copy size={13} /> Copy value</button>
       <button class="btn btn-secondary" onclick={() => (viewing = null)}>Close</button>
     {/snippet}
   </Modal>

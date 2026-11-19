@@ -1,5 +1,6 @@
 import { api, type Engine, type WriteInfo } from './api';
 import { mongoStatementRanges } from './mongo/text';
+import { redisStatementRanges } from './redis/text';
 import { statementKind, statementRanges } from './sql/text';
 
 /** What the text holds, without asking the backend. */
@@ -12,6 +13,10 @@ export interface Statements {
 
 /** The local split of `text`: the same statement rules the editor and the Run menu use. */
 export function statements(engine: Engine, text: string): Statements {
+  if (engine === 'redis') {
+    const count = redisStatementRanges(text).length;
+    return { count, empty: count === 0, write: false };
+  }
   if (engine === 'mongo') {
     const count = mongoStatementRanges(text).length;
     return { count, empty: count === 0, write: false };
@@ -38,10 +43,11 @@ export function fromInfo(engine: Engine, text: string, info: WriteInfo): Classif
   const local = statements(engine, text);
   const kinds = info.statements;
   const unparsable = info.warnings.some((w) => w.code === 'unparsable');
-  // SQL statements send no `read`, so only a Mongo statement can say it only reads.
+  // SQL statements send no `read`; other engines may explicitly mark a statement as a read.
   const writes = kinds.filter((s) => s.read !== true);
   // Both classifiers send `structure`; a statement without the flag changes nothing.
   const structure = kinds.some((s) => s.structure === true);
+  if (engine === 'redis') return { ...local, write: !local.empty && (unparsable || writes.length > 0), structure, unparsable, info };
   if (engine === 'mongo') {
     // Comment-only text splits into a range but classifies as no statements: nothing to run.
     const empty = local.count === 0 || (!kinds.length && !unparsable);
@@ -53,7 +59,7 @@ export function fromInfo(engine: Engine, text: string, info: WriteInfo): Classif
 /**
  * The one classification of a run: the empty check, read vs write, a schema/collection change and the
  * backend's warnings. A failed classification is never guessed around: the text counts as an unparsable
- * write, so a production Mongo run still asks before it runs.
+ * write, so a production MongoDB or Redis run still asks before it runs.
  */
 export async function classify(engine: Engine, text: string, database?: string | null): Promise<Classification> {
   try {
@@ -61,6 +67,6 @@ export async function classify(engine: Engine, text: string, database?: string |
   } catch {
     // No preview is available; `unparsable` covers it.
     const local = statements(engine, text);
-    return { ...local, write: engine === 'mongo' ? !local.empty : local.write, structure: false, unparsable: true, info: null };
+    return { ...local, write: engine === 'mongo' || engine === 'redis' ? !local.empty : local.write, structure: false, unparsable: true, info: null };
   }
 }

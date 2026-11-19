@@ -1,36 +1,18 @@
 <script lang="ts">
   import { Download, FileCode, Eye, LoaderCircle, Minus, Pencil, Plus, Sparkles, Undo2 } from '@lucide/svelte';
+  import type { Snippet } from 'svelte';
   import type { QueryResult } from '../api';
   import { pendingCount, type Edits } from '../editModel';
   import type { ExportMessage } from '../gridExport';
   import { moreRows } from '../results';
 
-  let {
-    result,
-    edits,
-    mongo,
-    blocker,
-    preparing,
-    loading,
-    view,
-    exportMsg,
-    canExportSql,
-    fileExport,
-    selectedCount,
-    onedit,
-    onnew,
-    ondelete,
-    ondiscard,
-    onpreview,
-    onsave,
-    onview,
-    onexport,
-    onexportsql,
-    onreview,
-  }: {
+  type GridActions = {
     result: QueryResult;
     edits: Edits;
     mongo: boolean;
+    redis: boolean;
+    canEditRows: boolean;
+    deleteBlocker: string | null;
     /** Why the result cannot be edited; null when it can. */
     blocker: string | null;
     preparing: boolean;
@@ -51,56 +33,63 @@
     onexportsql: () => void;
     /** Set when the result is a query plan: sends it to the assistant for a performance review. */
     onreview?: () => void;
-  } = $props();
+  };
 
-  const count = $derived(pendingCount(edits));
+  let props: { windowControls?: Snippet; summary?: QueryResult | null } & (GridActions | { result?: never }) = $props();
 </script>
 
-<footer class="@container flex h-9 shrink-0 items-center gap-1 border-t border-line px-2 text-[12px] text-muted">
-  <span title={blocker ?? (edits.on ? 'Leave edit mode' : mongo ? 'Edit documents in this result' : 'Edit rows in this result')}>
-    <button
-      class="btn h-7 px-2 text-[12px] {edits.on ? 'bg-accent/6 text-accent' : 'btn-ghost'}"
-      disabled={!!blocker || preparing}
-      title={blocker ?? undefined}
-      onclick={onedit}
-    ><Pencil size={13} /> Edit</button>
-  </span>
-  {#if edits.on}
-    <span class="px-1 text-[12px] font-medium text-accent">Editing</span>
-    <button class="btn btn-ghost h-7 px-2 text-[12px]" title={mongo ? 'Add document' : 'Add row'} onclick={onnew}><Plus size={13} /><span class="hidden @[36rem]:inline">{mongo ? 'Document' : 'Row'}</span></button>
-    <button class="btn btn-ghost h-7 px-2 text-[12px]" title={mongo ? 'Delete selected documents' : 'Delete selected rows'} disabled={!selectedCount} onclick={ondelete}><Minus size={13} /><span class="hidden @[36rem]:inline">Delete</span></button>
-    <span class="mx-1 h-4 w-px bg-line"></span>
-  {/if}
-  {#if count}
-    <span class="px-1 text-[12px] font-medium text-ink">{count} change{count === 1 ? '' : 's'}</span>
-    <button class="btn btn-ghost h-7 px-2 text-[12px]" title="Discard changes" onclick={ondiscard}><Undo2 size={13} /><span class="hidden @[36rem]:inline">Discard</span></button>
-    <button class="btn btn-ghost h-7 px-2 text-[12px]" title={mongo ? 'Preview commands' : 'Preview SQL'} onclick={onpreview}><Eye size={13} /><span class="hidden @[36rem]:inline">{mongo ? 'Preview commands' : 'Preview SQL'}</span></button>
-    <button class="btn btn-primary h-7 px-3 text-[12px]" onclick={onsave}>Save</button>
-  {:else}
-    <span class="flex items-center gap-2.5 px-1.5 text-[12px] text-faint tabular-nums">
-      <span title={result.truncated ? `First ${result.rows.length} rows; ${result.isRead ? (moreRows(result) ? 'scroll down to load more' : 'the page reached its size limit, so loading more brings no new rows') : 'more exist. Only a read-only statement loads more, because loading runs the SQL again'}` : undefined}>{result.rows.length}{result.truncated ? '+' : ''} rows</span>
-      <span class="size-0.5 rounded-full bg-faint"></span>
-      <span>{result.ms} ms</span>
+<footer class="@container flex h-sub-toolbar shrink-0 items-center gap-1 border-t border-line px-2 text-sm text-muted">
+  {@render props.windowControls?.()}
+  {#if props.result}
+    {@const { result, edits, mongo, redis, canEditRows, deleteBlocker, blocker, preparing, loading, view, exportMsg, canExportSql, fileExport, selectedCount, onedit, onnew, ondelete, ondiscard, onpreview, onsave, onview, onexport, onexportsql, onreview } = props}
+    {@const count = pendingCount(edits)}
+    {#if props.windowControls}<span class="mx-0.5 h-4 w-px shrink-0 bg-line"></span>{/if}
+    <span class="shrink-0" title={blocker ?? (edits.on ? 'Leave edit mode' : mongo ? 'Edit documents in this result' : 'Edit rows in this result')}>
+      <button class="btn btn-sm btn-ghost btn-on" aria-pressed={edits.on} disabled={!!blocker || preparing} title={blocker ?? undefined} onclick={onedit}><Pencil size={13} /> Edit</button>
     </span>
-    {#if result.truncated && loading}
-      <span class="flex items-center gap-1.5 px-1 text-[12px] text-faint"><LoaderCircle size={13} class="animate-spin" /> Loading more…</span>
+    {#if edits.on}
+      <span class="hidden px-1 text-xs font-medium text-accent @[36rem]:inline">Editing</span>
+      {#if canEditRows}
+        <button class="btn btn-sm btn-ghost" title={mongo ? 'Add document' : 'Add row'} onclick={onnew}><Plus size={13} /><span class="hidden @[44rem]:inline">{mongo ? 'Document' : 'Row'}</span></button>
+        <button class="btn btn-sm btn-ghost" title={deleteBlocker ?? (mongo ? 'Delete selected documents' : 'Delete selected rows')} disabled={!selectedCount || !!deleteBlocker} onclick={ondelete}><Minus size={13} /><span class="hidden @[44rem]:inline">Delete</span></button>
+      {/if}
+      <span class="mx-0.5 h-4 w-px shrink-0 bg-line"></span>
     {/if}
-  {/if}
-  {#if Array.isArray(result.documents)}
-    <div class="seg ml-2 shrink-0" role="tablist" aria-label="Result view">
-      <button class="seg-item {view === 'columns' ? 'seg-on' : ''}" role="tab" aria-selected={view === 'columns'} onclick={() => onview('columns')}>Columns</button>
-      <button class="seg-item {view === 'json' ? 'seg-on' : ''}" role="tab" aria-selected={view === 'json'} onclick={() => onview('json')}>JSON</button>
+    {#if count}
+      <span class="shrink-0 px-1 text-xs font-medium text-ink">{count} change{count === 1 ? '' : 's'}</span>
+      <button class="btn btn-sm btn-ghost" title="Discard changes" onclick={ondiscard}><Undo2 size={13} /><span class="hidden @[44rem]:inline">Discard</span></button>
+      <button class="btn btn-sm btn-ghost" title={mongo || redis ? 'Preview commands' : 'Preview SQL'} onclick={onpreview}><Eye size={13} /><span class="hidden @[44rem]:inline">{mongo || redis ? 'Preview commands' : 'Preview SQL'}</span></button>
+      <button class="btn btn-sm btn-primary" onclick={onsave}>Save</button>
+    {:else}
+      <span class="flex min-w-0 items-center gap-1.5 truncate px-1 text-xs text-faint tabular-nums">
+        <span class="shrink-0" title={result.truncated ? `First ${result.rows.length} rows; ${result.isRead ? (moreRows(result) ? 'scroll down to load more' : 'the page reached its size limit, so loading more brings no new rows') : `more exist. Only a read-only statement loads more, because loading runs the ${redis ? 'command' : 'SQL'} again`}` : undefined}>{result.rows.length}{result.truncated ? '+' : ''} rows</span>
+        <span class="size-0.5 shrink-0 rounded-full bg-faint"></span>
+        <span class="shrink-0">{result.ms} ms</span>
+      </span>
+      {#if result.truncated && loading}
+        <span class="flex items-center gap-1.5 px-1 text-xs text-faint" role="status"><LoaderCircle size={13} class="motion-safe:animate-spin" /> <span class="sr-only @[36rem]:not-sr-only">Loading more…</span></span>
+      {/if}
+    {/if}
+    {#if Array.isArray(result.documents)}
+      <div class="seg ml-1 shrink-0" role="tablist" aria-label="Result view">
+        <button class="seg-item {view === 'columns' ? 'seg-on' : ''}" role="tab" aria-selected={view === 'columns'} onclick={() => onview('columns')}>Columns</button>
+        <button class="seg-item {view === 'json' ? 'seg-on' : ''}" role="tab" aria-selected={view === 'json'} onclick={() => onview('json')}>JSON</button>
+      </div>
+    {/if}
+    {#if exportMsg}
+      <span class="min-w-0 truncate text-xs {exportMsg.ok ? 'text-ok' : 'text-danger'}" title={exportMsg.text}>{exportMsg.text}</span>
+    {/if}
+    <div class="ml-auto flex shrink-0 items-center gap-1">
+      {#if onreview}
+        <button class="btn btn-sm btn-ghost text-accent" title="Send this plan to the assistant for a performance review" onclick={onreview}><Sparkles size={13} /><span class="hidden @[44rem]:inline">Review with AI</span></button>
+      {/if}
+      {#if canExportSql}
+        <button class="btn btn-sm btn-ghost" title="Export as SQL INSERT statements" onclick={onexportsql}><FileCode size={13} /><span class="hidden @[44rem]:inline">Export SQL</span></button>
+      {/if}
+      <button class="btn btn-sm btn-ghost" title={fileExport ? 'Export the documents as CSV, JSON or NDJSON' : 'Export CSV'} onclick={onexport}><Download size={13} /><span class="hidden @[44rem]:inline">{fileExport ? 'Export...' : 'Export CSV'}</span></button>
     </div>
+  {:else if props.summary}
+    {@const result = props.summary}
+    <span class="px-1 text-xs text-faint tabular-nums">{result.rows.length}{result.truncated ? '+' : ''} rows · {result.ms} ms</span>
   {/if}
-  {#if exportMsg}
-    <span class="min-w-0 truncate text-[12px] {exportMsg.ok ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}" title={exportMsg.text}>{exportMsg.text}</span>
-  {/if}
-  <!-- A MongoDB result has no INSERT statements; the document formats come from the export dialog. -->
-  {#if onreview}
-    <button class="btn btn-ghost ml-auto h-7 px-2 text-[12px] text-accent" title="Send this plan to the assistant for a performance review" onclick={onreview}><Sparkles size={13} /><span class="hidden @[36rem]:inline">Review with AI</span></button>
-  {/if}
-  {#if !mongo && canExportSql}
-    <button class="btn btn-ghost h-7 px-2 text-[12px] {onreview ? '' : 'ml-auto'}" title="Export as SQL INSERT statements" onclick={onexportsql}><FileCode size={13} /><span class="hidden @[36rem]:inline">Export SQL</span></button>
-  {/if}
-  <button class="btn btn-ghost h-7 px-2 text-[12px] {mongo && !onreview ? 'ml-auto' : ''}" title={fileExport ? 'Export the documents as CSV, JSON or NDJSON' : 'Export CSV'} onclick={onexport}><Download size={13} /><span class="hidden @[36rem]:inline">{fileExport ? 'Export...' : 'Export CSV'}</span></button>
 </footer>

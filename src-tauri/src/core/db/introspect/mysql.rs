@@ -69,6 +69,7 @@ pub async fn tables(p: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, App
                 },
                 has_rowid: None,
                 partition_of: None,
+                redis_type: None,
             }
         })
         .collect())
@@ -366,6 +367,7 @@ pub async fn properties(
         foreign_keys,
         references,
         mongo: None,
+        redis: None,
     }))
 }
 

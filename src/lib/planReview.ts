@@ -8,13 +8,13 @@ import { cellText, isCutOff } from './results';
 /** Most plan characters in one question; a longer plan is cut, and the question says so. */
 const MAX_PLAN_CHARS = 24_000;
 
-const TUNING_SKILL: Record<Engine, string> = { pg: 'postgres-tuning', mysql: 'mysql-tuning', sqlite: 'sqlite-tuning', mongo: 'mongo-tuning' };
+const TUNING_SKILL: Record<Exclude<Engine, 'redis'>, string> = { pg: 'postgres-tuning', mysql: 'mysql-tuning', sqlite: 'sqlite-tuning', mongo: 'mongo-tuning' };
 
 const withoutComments = (sql: string) => sql.replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
 
 /** The result is the output of EXPLAIN (SQL) or of an `explain` command (MongoDB). */
 export function isPlan(r: QueryResult | null | undefined, engine: Engine): boolean {
-  if (!r?.sql || r.error || r.note || !r.rows.length) return false;
+  if (engine === 'redis' || !r?.sql || r.error || r.note || !r.rows.length) return false;
   return engine === 'mongo' ? /\bexplain\b/.test(r.sql) : /^explain\b/i.test(withoutComments(r.sql));
 }
 
@@ -28,6 +28,7 @@ function planText(r: QueryResult): string {
 
 /** Opens the assistant on the tab's database and asks it to review the plan, with the tuning skill of the engine. */
 export function reviewPlan(r: QueryResult, engine: Engine) {
+  if (engine === 'redis') return;
   if (chat.live) {
     notify(false, 'The assistant is still answering. Try again when it is done.');
     return;

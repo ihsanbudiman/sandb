@@ -3,41 +3,17 @@
 //! commas, comments, `ObjectId(…)`, `ISODate(…)`, `/regex/`, …), read straight into BSON. Text
 //! outside the subset gets an error with its line and column.
 
-use std::fmt;
-
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use mongodb::bson::oid::ObjectId;
 use mongodb::bson::spec::BinarySubtype;
 use mongodb::bson::{Binary, Bson, DateTime, Decimal128, Document, Regex, Timestamp};
 
+#[cfg(test)]
 use crate::core::error::AppError;
-use crate::core::mongo::options::whole_number;
 use crate::core::mongo::command::{Command, Find, Method, Statement};
-
-/// A parse failure. `line` and `column` are 1-based; the column counts characters.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ParseError {
-    pub message: String,
-    pub line: u32,
-    pub column: u32,
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Line {}, column {}: {}",
-            self.line, self.column, self.message
-        )
-    }
-}
-
-impl From<ParseError> for AppError {
-    fn from(e: ParseError) -> Self {
-        AppError::invalid(e.to_string())
-    }
-}
+use crate::core::mongo::options::whole_number;
+use crate::core::parse_error::ParseError;
 
 /// All statements of the editor text, in order. Text with only whitespace and comments gives an
 /// empty list.

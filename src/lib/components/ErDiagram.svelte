@@ -210,22 +210,22 @@
 
 <div class="relative h-full bg-sunken">
   {#if !ready}
-    <div class="grid h-full place-items-center text-faint"><LoaderCircle size={16} class="animate-spin" /></div>
+    <div class="grid h-full place-items-center text-faint" role="status"><LoaderCircle size={15} class="motion-safe:animate-spin" /><span class="sr-only">Loading diagram…</span></div>
   {:else}
-    <div class="absolute top-2 right-4 z-20 flex items-center gap-0.5 rounded-md border border-line bg-surface p-0.5 text-[12px] shadow-sm">
-      <button class="btn btn-ghost size-7 p-0" title="Zoom out" aria-label="Zoom out" disabled={zoom <= ZMIN} onclick={() => zoomTo(zoom / ZSTEP)}><ZoomOut size={13} /></button>
-      <button class="btn btn-ghost h-7 w-12 px-0 tabular-nums" title="Reset zoom to 100%" onclick={() => zoomTo(1)}>{Math.round(zoom * 100)}%</button>
-      <button class="btn btn-ghost size-7 p-0" title="Zoom in" aria-label="Zoom in" disabled={zoom >= ZMAX} onclick={() => zoomTo(zoom * ZSTEP)}><ZoomIn size={13} /></button>
-      <button class="btn btn-ghost size-7 p-0" title="Fit to view" aria-label="Fit to view" onclick={fit}><Maximize size={13} /></button>
+    <div class="absolute top-2 right-4 z-sticky flex items-center gap-0.5 rounded-md border border-line bg-surface p-0.5 shadow-sm">
+      <button class="btn btn-ghost size-6 p-0" title="Zoom out" aria-label="Zoom out" disabled={zoom <= ZMIN} onclick={() => zoomTo(zoom / ZSTEP)}><ZoomOut size={13} /></button>
+      <button class="btn btn-sm btn-ghost w-12 px-0 tabular-nums" title="Reset zoom to 100%" onclick={() => zoomTo(1)}>{Math.round(zoom * 100)}%</button>
+      <button class="btn btn-ghost size-6 p-0" title="Zoom in" aria-label="Zoom in" disabled={zoom >= ZMAX} onclick={() => zoomTo(zoom * ZSTEP)}><ZoomIn size={13} /></button>
+      <button class="btn btn-ghost size-6 p-0" title="Fit to view" aria-label="Fit to view" onclick={fit}><Maximize size={13} /></button>
       <span class="mx-0.5 h-4 w-px bg-line"></span>
-      <button class="btn btn-ghost h-7 px-2" title="Reset layout" onclick={() => (pos = layout())}><RotateCcw size={13} /> Reset layout</button>
+      <button class="btn btn-sm btn-ghost" title="Reset layout" onclick={() => (pos = layout())}><RotateCcw size={12} /> Reset layout</button>
     </div>
     {#if !graph.edges.length}
-      <div class="absolute top-3 left-3 z-20 text-[12px] text-faint">This table has no foreign keys and no other table references it.</div>
+      <div class="absolute top-3 left-3 z-sticky text-sm text-faint">This table has no foreign keys and no other table references it.</div>
     {/if}
-    <div class="absolute inset-0 overflow-auto" bind:this={scroller}>
+    <div class="absolute inset-0 isolate overflow-auto" bind:this={scroller}>
     <div style="width:{size.w * zoom}px;height:{size.h * zoom}px">
-    <div class="relative origin-top-left" style="width:{size.w}px;height:{size.h}px;transform:scale({zoom})">
+    <div class="relative isolate origin-top-left" style="width:{size.w}px;height:{size.h}px;transform:scale({zoom})">
       <svg class="pointer-events-none absolute inset-0 text-faint" width={size.w} height={size.h} aria-hidden="true">
         {#each graph.edges as e, i (i)}
           {@const p = path(e)}
@@ -244,8 +244,8 @@
         {@const cols = colsOf(n.key)}
         {#if p}
           <div
-            class="absolute flex flex-col overflow-hidden rounded-md border bg-surface text-[12px] shadow-sm {n.self ? 'border-accent' : 'border-line'}"
-            style="left:{p.x}px;top:{p.y}px;width:{W}px;height:{heightOf(n.key)}px;z-index:{top === n.key ? 2 : 1}"
+            class="absolute flex flex-col overflow-hidden rounded-md border bg-surface text-sm shadow-sm {n.self ? 'border-accent' : 'border-line'} {top === n.key ? 'z-sticky' : ''}"
+            style="left:{p.x}px;top:{p.y}px;width:{W}px;height:{heightOf(n.key)}px"
           >
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
@@ -261,15 +261,15 @@
               <span class="truncate">{displayName(n.ref)}</span>
             </div>
             {#if typeof cols === 'string'}
-              <div class="truncate px-2 text-red-600 dark:text-red-400" style="line-height:{ROW}px" title={cols}>{cols}</div>
+              <div class="truncate px-2 text-danger" style="line-height:{ROW}px" title={cols}>{cols}</div>
             {:else}
               {#each cols as c (c.name)}
                 <div class="flex items-center gap-1.5 px-2 {litCol(n.key, c.name) ? 'bg-accent/12' : ''}" style="height:{ROW}px">
                   <span class="flex w-3 shrink-0 justify-center">
-                    {#if c.isPk}<KeyRound size={11} class="text-accent" />{:else if fkCols.get(n.key)?.has(c.name)}<Link size={11} class="text-faint" />{/if}
+                    {#if c.isPk}<KeyRound size={12} class="text-accent" />{:else if fkCols.get(n.key)?.has(c.name)}<Link size={12} class="text-faint" />{/if}
                   </span>
-                  <span class="min-w-0 truncate {c.isPk ? 'font-medium text-ink' : 'text-ink'}">{c.name}</span>
-                  <span class="ml-auto min-w-0 shrink truncate pl-2 font-mono text-[11px] text-faint" title={c.dataType}>{c.dataType}</span>
+                  <span class="min-w-0 truncate text-ink" class:font-medium={c.isPk}>{c.name}</span>
+                  <span class="ml-auto min-w-0 shrink truncate pl-2 font-mono text-xs text-faint" title={c.dataType}>{c.dataType}</span>
                 </div>
               {:else}
                 <div class="px-2 text-faint" style="line-height:{ROW}px">No columns</div>

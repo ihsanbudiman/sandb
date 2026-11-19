@@ -17,7 +17,10 @@ use tauri_plugin_dialog::DialogExt;
 use crate::core::ai;
 use crate::core::ai::event::ChatEvent;
 use crate::core::ai::session::{self as chat, ChatRequest};
-use crate::core::ai::settings::{self as ai_settings, AiSettings, AiSettingsView, AiTestResult};
+use crate::core::ai::settings::{
+    self as ai_settings, AiSettings, AiSettingsView, AiTestResult, MAX_ROWS_LIMIT,
+    TIMEOUT_SEC_LIMIT,
+};
 use crate::core::connections::{Connection, ConnectionInput, SslMode, TestResult};
 use crate::core::db::session::{self, TabStatus};
 use crate::core::engine::Engine;
@@ -26,11 +29,12 @@ use crate::core::export_file::ExportFile;
 use crate::core::mcp::{self, McpSettings, McpStatus};
 use crate::core::mongo::conn::parse_uri;
 use crate::core::ops;
+use crate::core::redis::conn::{self as redis_conn, RedisUriParts};
 use crate::core::result::{
     AiReadResult, ApplyEditsRequest, ApplyEditsResult, CellValueRequest, ColumnInfo,
     DocumentExportRequest, DocumentFormat, EditableRequest, EditableResult, ExportRequest,
-    ExportResult, GuardCheck, QueryProgress, QueryRun, RunRequest, SchemaSnapshot,
-    SqlExportRequest, TableExportRequest, TableInfo, TableProperties, WriteInfo,
+    ExportResult, GuardCheck, KeyList, QueryProgress, QueryRun, ReadLimits, RunRequest,
+    SchemaSnapshot, SqlExportRequest, TableExportRequest, TableInfo, TableProperties, WriteInfo,
 };
 use crate::core::state::AppState;
 
@@ -195,6 +199,10 @@ command_table! {
         /// Splits a MongoDB connection string as the backend saves it; `null` when it is not one.
         parse_mongo_uri ParseMongoUriArgs { uri: String } -> Option<MongoUriParts>
             => |_, a: ParseMongoUriArgs| Ok(mongo_uri_parts(&a.uri));
+
+        /// Splits a Redis connection string without returning its password.
+        parse_redis_uri ParseRedisUriArgs { uri: String } -> Option<RedisUriParts>
+            => |_, a: ParseRedisUriArgs| Ok(redis_conn::parse_uri(a.uri.trim()).ok().map(|(parts, _)| parts));
     }
 
     async {
@@ -224,6 +232,9 @@ command_table! {
 
         list_tables ListTablesArgs { conn_id: String, database: String, schema: Option<String> } -> Vec<TableInfo>
             => async |st: &AppState, a: ListTablesArgs| { ops::list_tables(st, &a.conn_id, &a.database, a.schema.as_deref()).await };
+
+        list_keys ListKeysArgs { conn_id: String, database: String, pattern: String, limit: Option<usize> } -> KeyList
+            => async |st: &AppState, a: ListKeysArgs| { ops::list_keys(st, &a.conn_id, &a.database, &a.pattern, a.limit).await };
 
         list_columns ListColumnsArgs { conn_id: String, database: String, schema: Option<String>, table: String } -> Vec<ColumnInfo>
             => async |st: &AppState, a: ListColumnsArgs| {
@@ -285,6 +296,16 @@ command_table! {
                 ops::run_ai_read(st, &a.conn_id, a.database.as_deref(), &a.sql, limits).await
             };
 
+        /// A scheduled read-only query: the read guard and the schedule's own limits.
+        run_scheduled_read RunScheduledReadArgs { conn_id: String, database: Option<String>, sql: String, max_rows: u32 } -> AiReadResult
+            => async |st: &AppState, a: RunScheduledReadArgs| {
+                let limits = ReadLimits {
+                    max_rows: a.max_rows.clamp(1, MAX_ROWS_LIMIT) as usize,
+                    timeout: std::time::Duration::from_secs(TIMEOUT_SEC_LIMIT),
+                };
+                ops::run_scheduled_read(st, &a.conn_id, a.database.as_deref(), &a.sql, limits).await
+            };
+
         get_ai_settings GetAiSettingsArgs {} -> AiSettingsView
             => async |st: &AppState, _| { ai_settings::get(st) };
 
@@ -329,8 +350,8 @@ command_table! {
         /// The file comes from a native save dialog, as for `export_csv`.
         export_documents,
 
-        /// One table as a `.sql` file: its DDL, plus INSERT statements when `request.data`. The file
-        /// comes from a native save dialog, as for `export_csv`.
+        /// One table as SQL, a MongoDB collection as a mongosh script, or a Redis key as commands.
+        /// The file comes from a native save dialog, as for `export_csv`.
         export_table_sql,
 
         /// Writes a PDF the UI built to a file from a native save dialog. The body is the raw PDF bytes;
@@ -528,9 +549,14 @@ pub async fn export_table_sql(
     request: TableExportRequest,
 ) -> Res<ExportResult> {
     let conn = state.connection(&request.conn_id)?;
-    // A MongoDB export is a mongosh script, not SQL.
+    // Document and key exports use the engine's command syntax, not SQL.
     let (name, label, extension) = match conn.engine {
         Engine::Mongo => (format!("{}.js", request.table), "JavaScript", "js"),
+        Engine::Redis => (
+            format!("{}.redis", request.table.replace(['/', ':', '\\'], "_")),
+            "Redis commands",
+            "redis",
+        ),
         _ => (format!("{}.sql", request.table), "SQL", "sql"),
     };
     let Some(path) = pick_save(&app, name, label, extension).await? else {

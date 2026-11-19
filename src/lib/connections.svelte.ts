@@ -1,5 +1,6 @@
 import { api, ApiError, type Connection, type Engine, type Env } from './api';
 import { notify } from './notice.svelte';
+import type { SqlEngine } from './sql/text';
 
 export type { Engine, Env };
 
@@ -13,22 +14,25 @@ export const engines: Record<Engine, { label: string; short: string; badge: stri
   pg: { label: 'PostgreSQL', short: 'PG', badge: 'text-sky-700 dark:text-sky-400', port: 5432 },
   mysql: { label: 'MySQL / MariaDB', short: 'MY', badge: 'text-orange-800 dark:text-orange-400', port: 3306 },
   sqlite: { label: 'SQLite', short: 'SL', badge: 'text-violet-700 dark:text-violet-400', port: 0 },
-  mongo: { label: 'MongoDB', short: 'MG', badge: 'text-emerald-700 dark:text-emerald-400', port: 27017 },
+  mongo: { label: 'MongoDB', short: 'MG', badge: 'text-ok', port: 27017 },
+  redis: { label: 'Redis', short: 'RD', badge: 'text-red-700 dark:text-red-400', port: 6379 },
 };
 
-/** True for the SQL engines. MongoDB connections open the editor and the chat too, but stay out of the SQL-only features (schema views, per-statement write previews, AI write settings). */
-export const isSql = (c: { engine: Engine }) => c.engine !== 'mongo';
+/** True for engines that support the SQL-only controls. */
+export const isSql = (c: { engine: Engine }): c is { engine: SqlEngine } => c.engine !== 'mongo' && c.engine !== 'redis';
+export const isMongo = (c: { engine: Engine }) => c.engine === 'mongo';
+export const isRedis = (c: { engine: Engine }) => c.engine === 'redis';
 
 export const envDot: Record<Env, string> = {
   // The ring tells production from staging without relying on hue.
-  production: 'bg-red-600 ring-2 ring-red-600/30 dark:bg-red-500 dark:ring-red-500/35',
-  staging: 'bg-amber-700 dark:bg-amber-500',
+  production: 'bg-danger ring-2 ring-danger/35',
+  staging: 'bg-warn',
   local: 'bg-stone-500 dark:bg-stone-400',
 };
 
 export const envTag: Record<Env, string> = {
-  production: 'text-red-700 dark:text-red-300',
-  staging: 'text-amber-700 dark:text-amber-400',
+  production: 'text-danger',
+  staging: 'text-warn',
   local: 'text-muted',
 };
 
@@ -68,13 +72,14 @@ export function canWrite(conn: { readOnly: boolean }): boolean {
 }
 
 /** Where a connection points: the backend's `same_target` compares the same fields, and not the database. */
-type Target = Partial<Pick<Connection, 'engine' | 'host' | 'port' | 'user' | 'file' | 'uri'>>;
+type Target = Partial<Pick<Connection, 'engine' | 'host' | 'port' | 'user' | 'file' | 'uri' | 'redis'>>;
 const targetField = (c: Target) => (c.engine === 'sqlite' ? { host: '', port: 0, user: '' } : { host: c.host ?? '', port: c.port ?? 0, user: c.user ?? '' });
 
 /** True when both point at the same server and database file. SQLite's unused host, port and user do not count. */
 export function sameTarget(a: Target, b: Target): boolean {
   const [x, y] = [targetField(a), targetField(b)];
-  return a.engine === b.engine && x.host === y.host && x.port === y.port && x.user === y.user && (a.file ?? '') === (b.file ?? '') && (a.uri ?? '') === (b.uri ?? '');
+  return a.engine === b.engine && x.host === y.host && x.port === y.port && x.user === y.user && (a.file ?? '') === (b.file ?? '') && (a.uri ?? '') === (b.uri ?? '') &&
+    JSON.stringify(a.redis ?? null) === JSON.stringify(b.redis ?? null);
 }
 
 /**

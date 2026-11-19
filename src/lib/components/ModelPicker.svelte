@@ -1,7 +1,8 @@
 <script lang="ts">
   import { Check, ChevronDown, ChevronsUpDown, LoaderCircle, RotateCw, Settings } from '@lucide/svelte';
-  import { scrollOn } from '../actions';
+  import { focusOnMount, scrollOn } from '../actions';
   import { ui, ai, aiModels, loadAiModels, setAiModel } from '../state.svelte';
+  import { placePopup } from './ui/popup';
 
   // One model for every chat. `field`: the Settings input, which names the fallback model; `chip`: the small button in the chat composer.
   type Props = { onpick?: () => void } & ({ variant: 'field'; placeholder?: string } | { variant: 'chip' });
@@ -10,8 +11,14 @@
   const placeholder = $derived(props.variant === 'field' ? (props.placeholder ?? '') : '');
 
   let menu = $state(false);
+  let trigger = $state<HTMLButtonElement>();
+  const pickerId = $props.id();
   let filter = $state('');
   let hi = $state(0);
+
+  $effect(() => {
+    if (!isField && !ui.chatOpen) menu = false;
+  });
 
   const query = $derived(filter.trim());
   // "Not listed" only means something once the server has answered with a list.
@@ -34,8 +41,20 @@
     hi = Math.max(0, rows.findIndex((r) => r.id === ai.model));
   }
 
-  function choose(id: string) {
+  function close(refocus = false) {
     menu = false;
+    if (refocus) trigger?.focus({ preventScroll: true });
+  }
+
+  function pickerKey(e: KeyboardEvent) {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation();
+    close(true);
+  }
+
+  function choose(id: string) {
+    close(true);
     if (id !== ai.model) setAiModel(id);
     props.onpick?.();
   }
@@ -55,51 +74,54 @@
   }
 </script>
 
-<svelte:window onkeydown={(e) => { if (menu && e.key === 'Escape') menu = false; }} />
-
-<!-- The chip menu opens upward and takes the width of the nearest positioned parent (the composer row), so a narrow panel does not cut it. -->
-<div class={isField ? 'relative w-full' : 'min-w-0 max-w-44'}>
+<div class={isField ? 'w-full' : 'min-w-0 flex-1'}>
   {#if isField}
-    <button type="button" class="input flex w-full items-center gap-2 text-left font-mono text-[12.5px]" aria-haspopup="listbox" aria-expanded={menu} onclick={open}>
+    <button type="button" bind:this={trigger} class="input input-sm focus-ring flex w-full items-center gap-2 text-left font-mono" aria-expanded={menu} aria-controls={menu ? pickerId : undefined} onclick={open}>
       <span class="min-w-0 flex-1 truncate {ai.model ? '' : 'text-faint'}">{ai.model || placeholder || 'Choose a model'}</span>
       <ChevronsUpDown size={13} class="shrink-0 text-faint" />
     </button>
   {:else}
-    <button type="button" class="flex h-6 max-w-full min-w-0 items-center gap-1 rounded-md px-1.5 font-mono text-[11.5px] text-muted hover:bg-hover hover:text-ink {menu ? 'bg-hover text-ink' : ''}" aria-haspopup="listbox" aria-expanded={menu} title="Model: {ai.model || 'none'}. Click to change." onclick={open}>
+    <button type="button" bind:this={trigger} class="btn btn-sm btn-ghost ml-auto flex w-fit max-w-full min-w-0 gap-1 px-1.5 font-mono font-normal {menu ? 'bg-active text-ink' : ''}" aria-expanded={menu} aria-controls={menu ? pickerId : undefined} title="Model: {ai.model || 'none'}. Click to change." onclick={open}>
       <span class="min-w-0 truncate">{ai.model || 'Choose a model'}</span>
-      <ChevronDown size={11} class="shrink-0" />
+      <ChevronDown size={12} class="shrink-0" />
     </button>
   {/if}
 
-  {#if menu}
-    <div class="popover absolute z-50 flex max-h-80 flex-col p-1 {isField ? 'top-full mt-1 right-0 w-full min-w-80 max-w-[calc(100vw-2rem)]' : 'bottom-full mb-1 inset-x-0'}">
-      <div class="mb-1 flex shrink-0 items-center gap-1">
-        <!-- svelte-ignore a11y_autofocus -->
+  {#if menu && trigger}
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Delegates Escape from the picker's controls.) -->
+    <div id={pickerId} class="popover fixed z-menu w-80 overflow-auto p-1 scroll-pt-10 motion-safe:animate-popover-in" role="group" aria-label="Model picker" use:placePopup={{ anchor: trigger, align: 'end', matchWidth: isField, maxHeight: 320, dismiss: close }} onkeydown={pickerKey}>
+      <div class="sticky -top-1 z-sticky -m-1 mb-0 flex items-center gap-1 bg-surface p-1">
         <input
-          class="input h-7 min-w-0 flex-1 font-mono text-[12px]"
+          class="input input-sm min-w-0 flex-1 font-mono"
           placeholder="Search or type a model name"
+          role="combobox"
+          aria-expanded="true"
+          aria-autocomplete="list"
+          aria-controls={`${pickerId}-models`}
+          aria-activedescendant={rows[hi] ? `${pickerId}-model-${hi}` : undefined}
           aria-label="Search or type a model name"
           bind:value={filter}
           oninput={() => (hi = 0)}
           onkeydown={key}
-          autofocus
+          use:focusOnMount
           autocapitalize="off"
           autocorrect="off"
           autocomplete="off"
           spellcheck="false"
         />
         <button type="button" class="btn btn-ghost size-7 shrink-0 p-0" onclick={() => loadAiModels(true)} disabled={aiModels.loading} title="Load the model list again" aria-label="Load the model list again">
-          {#if aiModels.loading}<LoaderCircle size={13} class="animate-spin" />{:else}<RotateCw size={13} />{/if}
+          {#if aiModels.loading}<LoaderCircle size={13} class="motion-safe:animate-spin" />{:else}<RotateCw size={13} />{/if}
         </button>
       </div>
-      <div class="min-h-0 flex-1 overflow-auto" role="listbox" aria-label="Models">
+      <div id={`${pickerId}-models`} role="listbox" aria-label="Models">
         {#each rows as r, i (r.custom ? `custom:${r.id}` : r.id)}
           <button
             type="button"
+            id={`${pickerId}-model-${i}`}
             role="option"
+            tabindex="-1"
             aria-selected={r.id === ai.model}
-            data-hi={i === hi ? '' : undefined}
-            class="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] {i === hi ? 'bg-hover' : ''}"
+            class="menu-item {i === hi ? 'bg-active text-ink' : ''}"
             use:scrollOn={i === hi}
             onmousemove={() => (hi = i)}
             onclick={() => choose(r.id)}
@@ -107,34 +129,30 @@
             {#if r.custom}
               <span class="shrink-0 text-muted">Use</span>
               <span class="min-w-0 flex-1 truncate font-mono text-ink">{r.id}</span>
-              {#if known}<span class="shrink-0 text-[11px] text-faint">not listed</span>{/if}
+              {#if known}<span class="shrink-0 text-xs text-faint">not listed</span>{/if}
             {:else}
               <span class="min-w-0 flex-1 truncate font-mono text-ink">{r.id}</span>
-              {#if known && !aiModels.list.includes(r.id)}<span class="shrink-0 text-[11px] text-faint">not listed</span>{/if}
+              {#if known && !aiModels.list.includes(r.id)}<span class="shrink-0 text-xs text-faint">not listed</span>{/if}
               {#if r.id === ai.model}<Check size={12} class="shrink-0 text-accent" />{/if}
             {/if}
           </button>
         {/each}
-        {#if aiModels.loading && !aiModels.list.length}
-          <p class="flex items-center gap-1.5 px-2 py-1.5 text-[12px] text-muted"><LoaderCircle size={12} class="animate-spin" /> Loading models…</p>
-        {:else if aiModels.error}
-          <p class="px-2 py-1.5 text-[12px] break-words text-red-700 dark:text-red-400" role="alert">Could not load the models: {aiModels.error}</p>
-          <p class="px-2 pb-1.5 text-[11.5px] text-faint">You can still type a model name above and press Enter.</p>
-        {:else if !rows.length}
-          <p class="px-2 py-1.5 text-[12px] text-muted">{aiModels.list.length ? 'No model matches.' : 'The server lists no models. Type a model name above.'}</p>
-        {/if}
       </div>
+      {#if aiModels.loading && !aiModels.list.length}
+        <p class="flex items-center gap-1.5 px-2 py-1.5 text-sm text-muted"><LoaderCircle size={13} class="motion-safe:animate-spin" /> Loading models…</p>
+      {:else if aiModels.error}
+        <p class="px-2 py-1.5 text-sm break-words text-danger" role="alert">Could not load the models: {aiModels.error}</p>
+        <p class="px-2 pb-1.5 text-xs text-faint">You can still type a model name above and press Enter.</p>
+      {:else if !rows.length}
+        <p class="px-2 py-1.5 text-sm text-muted">{aiModels.list.length ? 'No model matches.' : 'The server lists no models. Type a model name above.'}</p>
+      {/if}
       {#if !isField}
-        <button type="button" class="mt-1 flex h-7 shrink-0 items-center gap-2 rounded-md border-t border-line px-2 pt-1 text-left text-[12px] text-muted hover:text-ink" onclick={() => { menu = false; ui.settingsSection = 'ai'; ui.page = 'settings'; }}>
+        <button type="button" class="menu-item mt-1 shrink-0 border-t border-line" onclick={() => { close(); ui.settingsSection = 'ai'; ui.page = 'settings'; }}>
           <Settings size={12} /> Provider settings…
         </button>
       {:else if aiModels.list.length}
-        <p class="shrink-0 border-t border-line px-2 pt-1.5 pb-1 text-[11px] text-faint">{aiModels.list.length.toLocaleString()} {aiModels.list.length === 1 ? 'model' : 'models'} on this server.</p>
+        <p class="shrink-0 border-t border-line px-2 pt-1.5 pb-1 text-xs text-faint">{aiModels.list.length.toLocaleString()} {aiModels.list.length === 1 ? 'model' : 'models'} on this server.</p>
       {/if}
     </div>
   {/if}
 </div>
-{#if menu}
-  <!-- Under the open menu (z-50), over everything else. -->
-  <button type="button" class="fixed inset-0 z-40 cursor-default" aria-label="Close" onclick={() => (menu = false)}></button>
-{/if}

@@ -23,12 +23,15 @@ import type {
   GuardCheckArgs,
   ListColumnsArgs,
   ListDatabasesArgs,
+  ListKeysArgs,
   ListSchemasArgs,
   ListTablesArgs,
   ParseMongoUriArgs,
+  ParseRedisUriArgs,
   ReorderConnectionsArgs,
   RollbackTransactionArgs,
   RunAiReadArgs,
+  RunScheduledReadArgs,
   RunQueryArgs,
   SaveAiSettingsArgs,
   SchemaSnapshot,
@@ -46,8 +49,10 @@ import { MAX_ROWS_LIMIT, TIMEOUT_SEC_LIMIT } from '../generated/constants';
 import { colType, mockSchema, mongoCollections, mongoSchema, nsOf, pkOf, tableData, versions } from './data';
 import { guard, classify, statementKind } from './classify';
 import { mongoProperties, mongoRun, mongoScript } from './mongo';
+import { redisColumns, redisDatabases, redisListKeys, redisProperties, redisScript, redisSnapshot } from './redis';
+import { redisAiRead, redisClassifyWrite, redisGuardCheck, redisRun } from './redisRun';
 import { applyMockEdits, editableOf, runSql } from './query';
-import { parseMongoUri, redactMongoUri } from './uri';
+import { parseMongoUri, parseRedisUri, redactMongoUri, redisDatabase, redisNodeValid, redisUriParts } from './uri';
 import { ai, all, add, find, remove, reorder, replace, sessions } from './state';
 import { chatCancel, chatStream, decideWrite } from './chat';
 
@@ -55,13 +60,13 @@ export type Emit = (e: ChatEvent) => void;
 /** The demo's answer to one command, with the arguments of that command; the table only names the commands. */
 export type Handler = (args: never, emit: Emit) => Promise<unknown>;
 
-const DEFAULT_PORTS: Record<Engine, number> = { pg: 5432, mysql: 3306, sqlite: 0, mongo: 27017 };
+const DEFAULT_PORTS: Record<Engine, number> = { pg: 5432, mysql: 3306, sqlite: 0, mongo: 27017, redis: 6379 };
 const invalid = (message: string, detail?: string) => new ApiError({ code: 'invalid_input', message, ...(detail ? { detail } : {}) });
 
 const newId = (name: string) => name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now().toString(36);
 
 /** Trims the fields and applies the same rules as the backend's `normalize`. */
-function normalize(input: ConnectionInput): Required<ConnectionInput> {
+function normalize(input: ConnectionInput, requireName = true): Required<ConnectionInput> {
   const i: Required<ConnectionInput> = {
     name: input.name.trim(),
     engine: input.engine,
@@ -78,7 +83,9 @@ function normalize(input: ConnectionInput): Required<ConnectionInput> {
     authSource: (input.authSource ?? '').trim(),
     topology: input.topology ?? null,
     version: input.version ?? null,
+    redis: null,
   };
+  if (requireName && !i.name) throw invalid('Name is required');
   if (i.readOnly) i.aiWrite = false;
   if (i.engine === 'sqlite') {
     if (!i.file) throw invalid('Database file is required');
@@ -92,6 +99,32 @@ function normalize(input: ConnectionInput): Required<ConnectionInput> {
     if (!i.user) throw invalid('User is required');
     if (!i.port) i.port = DEFAULT_PORTS[i.engine];
     i.file = '';
+  } else if (i.engine === 'redis') {
+    i.file = '';
+    const settings = { mode: 'standalone' as const, sentinelMaster: '', sentinelAuth: false };
+    i.redis = { ...settings, ...input.redis };
+    if (i.uri) {
+      const { redacted, ...fields } = redisUriParts(i.uri);
+      Object.assign(i, fields, { uri: redacted, redis: settings });
+    } else {
+      if (!i.host) throw invalid('Host is required');
+      if (i.redis.mode === 'standalone' && i.host.includes(',')) throw invalid('Standalone takes one host. Choose Cluster or Sentinel for a host list.');
+      if (!i.port) i.port = i.redis.mode === 'sentinel' ? 26379 : DEFAULT_PORTS.redis;
+      for (const raw of i.host.split(',')) {
+        const entry = raw.trim();
+        if (!redisNodeValid(entry)) throw invalid(`Host list entry "${entry}" is not host or host:port`);
+      }
+      if (i.redis.mode === 'sentinel') {
+        i.redis.sentinelMaster = i.redis.sentinelMaster.trim();
+        if (!i.redis.sentinelMaster) throw invalid('Master name is required');
+      } else {
+        i.redis.sentinelMaster = '';
+        i.redis.sentinelAuth = false;
+      }
+      if (i.ssl === 'prefer') throw invalid('Redis has no Prefer TLS mode. Choose Disable or Require.');
+    }
+    i.database = redisDatabase(i.database);
+    if (i.redis.mode === 'cluster' && i.database !== '0') throw invalid('Redis Cluster has only database 0');
   } else {
     i.file = '';
     if (i.uri) {
@@ -106,7 +139,7 @@ function normalize(input: ConnectionInput): Required<ConnectionInput> {
     if (!i.port) i.port = DEFAULT_PORTS.mongo;
   }
   if (i.engine !== 'mongo') {
-    i.uri = '';
+    if (i.engine !== 'redis') i.uri = '';
     i.authSource = '';
     i.topology = null;
   }
@@ -131,14 +164,14 @@ function build(id: string, i: Required<ConnectionInput>, prevVersion: string, pr
     uri: i.uri ?? '',
     authSource: i.authSource ?? '',
     topology: i.engine === 'mongo' ? (i.topology ?? prevTopology) : null,
+    redis: i.redis,
   };
 }
 
-/** `find` for the demo's SQL-only edit paths: the fake has no Mongo edit engine (the real backend edits Mongo cells). */
-function findSql(id: string): Connection {
-  const c = find(id);
+/** Demo grid edits work only for SQL connections. */
+function requireSqlEdit(c: Connection) {
   if (c.engine === 'mongo') throw new ApiError({ code: 'unsupported', message: 'The demo build cannot edit MongoDB collections' });
-  return c;
+  if (c.engine === 'redis') throw new ApiError({ code: 'unsupported', message: 'Redis edits need a live connection' });
 }
 
 // Foreign keys guessed from names: `<x>_id` points at `<x>s.id` or `<x>.id` in the same mock schema (and PG namespace).
@@ -183,34 +216,34 @@ function mockProperties(c: Connection, table: string): TableProperties {
   };
 }
 
+/** Copy the Redis settings as a transport round trip would. */
+const viewOf = (c: Connection): Connection => ({ ...c, redis: c.redis ? { ...c.redis } : null });
+
 export async function listConnections() {
-  return all().map((c) => ({ ...c }));
+  return all().map(viewOf);
 }
 
 export async function createConnection(args: CreateConnectionArgs) {
   const i = normalize(args.input);
-  if (!i.name) throw invalid('Name is required');
   const c = build(newId(i.name), i, versions[i.engine], i.engine === 'mongo' ? 'replica_set' : null);
   add(c);
-  return { ...c };
+  return viewOf(c);
 }
 
 export async function updateConnection(args: UpdateConnectionArgs) {
   const cur = find(args.id);
   const i = normalize(args.input);
-  if (!i.name) throw invalid('Name is required');
   const c = build(cur.id, i, cur.version, cur.topology);
   replace(c);
-  return { ...c };
+  return viewOf(c);
 }
 
 export async function duplicateConnection(args: DuplicateConnectionArgs) {
   const src = find(args.id);
   const i = normalize(args.input ?? { ...src, name: `${src.name} (copy)`, aiWrite: false });
-  if (!i.name) throw invalid('Name is required');
   const c = build(newId(i.name), i, src.version, src.topology);
   add(c);
-  return { ...c };
+  return viewOf(c);
 }
 
 export async function deleteConnection(args: DeleteConnectionArgs) {
@@ -220,16 +253,17 @@ export async function deleteConnection(args: DeleteConnectionArgs) {
 
 export async function reorderConnections(args: ReorderConnectionsArgs) {
   reorder(args.ids);
-  return all().map((c) => ({ ...c }));
+  return all().map(viewOf);
 }
 
 export async function testConnection(args: TestConnectionArgs) {
-  const i = normalize(args.input);
+  const i = normalize(args.input, false);
   return { serverVersion: versions[i.engine], latencyMs: 12, ...(i.engine === 'mongo' ? { topology: 'replica_set' as const } : {}) };
 }
 
 export async function listDatabases(args: ListDatabasesArgs) {
   const c = find(args.connId);
+  if (c.engine === 'redis') return redisDatabases(c);
   if (c.engine === 'mongo') return ['analytics', 'shop_staging'];
   return [c.database];
 }
@@ -242,6 +276,7 @@ export async function listSchemas(args: ListSchemasArgs) {
 
 export async function listTables(args: ListTablesArgs) {
   const c = find(args.connId);
+  if (c.engine === 'redis') return redisListKeys(c, args.database, '*').keys;
   if (c.engine === 'mongo') return mongoCollections[args.database] ?? [];
   const schema = args.schema;
   return Object.keys(mockSchema(c))
@@ -249,9 +284,16 @@ export async function listTables(args: ListTablesArgs) {
     .map((name) => ({ name, kind: 'table' as const }));
 }
 
+export async function listKeys(args: ListKeysArgs) {
+  const c = find(args.connId);
+  if (c.engine !== 'redis') throw invalid('Key search needs a Redis connection');
+  return redisListKeys(c, args.database, args.pattern, args.limit);
+}
+
 export async function listColumns(args: ListColumnsArgs) {
   const c = find(args.connId);
   const table = args.table;
+  if (c.engine === 'redis') return redisColumns(c, args.database, table);
   if (c.engine === 'mongo') {
     const cols = mongoSchema[table];
     if (!cols) throw new ApiError({ code: 'not_found', message: `Collection ${table} not found` });
@@ -266,6 +308,7 @@ export async function listColumns(args: ListColumnsArgs) {
 export async function tableProperties(args: TablePropertiesArgs) {
   const c = find(args.connId);
   const table = args.table;
+  if (c.engine === 'redis') return redisProperties(c, args.database, table);
   if (c.engine === 'mongo') return mongoProperties(args.database, table);
   const s = mockSchema(c);
   if (!s[table]) throw new ApiError({ code: 'not_found', message: `Table ${table} not found` });
@@ -275,6 +318,7 @@ export async function tableProperties(args: TablePropertiesArgs) {
 export async function schemaSnapshot(args: SchemaSnapshotArgs) {
   const c = find(args.connId);
   const database = args.database;
+  if (c.engine === 'redis') return redisSnapshot(c, database);
   if (c.engine === 'mongo') {
     const tables = mongoCollections[database] ?? [];
     return { database, truncated: false, tables: tables.map((t) => ({ name: t.name, kind: t.kind, columns: (mongoSchema[t.name] ?? []).map((col) => ({ name: col.name, dataType: col.dataType })) })) } satisfies SchemaSnapshot;
@@ -291,9 +335,14 @@ export async function parseMongoUriCommand(args: ParseMongoUriArgs) {
   return parseMongoUri(args.uri);
 }
 
+async function parseRedisUriCommand(args: ParseRedisUriArgs) {
+  return parseRedisUri(args.uri);
+}
+
 export async function runQuery(args: RunQueryArgs) {
   const request = args.request;
   const c = find(request.connId);
+  if (c.engine === 'redis') return redisRun(c, request);
   const limit = request.limit ?? undefined;
   if (c.engine === 'mongo') return mongoRun(c, request.sql, limit, request.sort ?? undefined);
   const statements = runSql(c, request.sql, limit, request.sort ?? undefined);
@@ -314,12 +363,15 @@ export async function editableResult(args: EditableResultArgs) {
   const request = args.request;
   const c = find(request.connId);
   if (c.engine === 'mongo') return { pk: [], reason: 'MongoDB edits need a live connection' };
+  if (c.engine === 'redis') return { pk: [], reason: 'Redis edits need a live connection' };
   return editableOf(c, request.sql);
 }
 
 export async function applyEdits(args: ApplyEditsArgs) {
   const request = args.request;
-  const c = findSql(request.connId);
+  const c = find(request.connId);
+  if (c.engine === 'redis' && c.readOnly) throw new ApiError({ code: 'connection_read_only', message: `Connection "${c.name}" is read-only` });
+  requireSqlEdit(c);
   if (c.readOnly) throw new ApiError({ code: 'connection_read_only', message: `Connection "${c.name}" is read-only: writes are refused` });
   const out = applyMockEdits(c, request.sql, request.operations);
   if (!out.failed && request.tabId && c.env === 'production') sessions.set(request.tabId, c.id);
@@ -328,7 +380,8 @@ export async function applyEdits(args: ApplyEditsArgs) {
 
 export async function cellValue(args: CellValueArgs) {
   const request = args.request;
-  const c = findSql(request.connId);
+  const c = find(request.connId);
+  requireSqlEdit(c);
   const meta = editableOf(c, request.sql);
   if (meta.reason || !meta.table) throw invalid(meta.reason ?? 'Result is not editable');
   const d = tableData(mockSchema(c), meta.table);
@@ -365,6 +418,7 @@ export async function tableDdl(args: TableDdlArgs) {
   const table = args.table;
   const database = args.database;
   if (c.engine === 'mongo') return mongoScript(database, table);
+  if (c.engine === 'redis') return redisScript(c, database, table);
   const s = mockSchema(c);
   if (!s[table]) throw new ApiError({ code: 'not_found', message: `Table ${table} not found` });
   const pk = pkOf(table);
@@ -374,24 +428,33 @@ export async function tableDdl(args: TableDdlArgs) {
 }
 
 export async function guardCheck(args: GuardCheckArgs) {
+  if (args.engine === 'redis') return redisGuardCheck(args.sql);
   return guard(args.engine, args.sql);
 }
 
 export async function classifyWrite(args: ClassifyWriteArgs) {
+  if (args.engine === 'redis') return redisClassifyWrite(args.sql, args.database);
   return classify(args.engine, args.sql, args.database);
 }
 
-export async function runAiRead(args: RunAiReadArgs) {
-  const connId = args.connId;
-  const sql = args.sql;
+function guardedRead(connId: string, database: string | null, sql: string, maxRows: number, origin: 'assistant' | 'schedule'): AiReadResult {
   const c = find(connId);
+  if (c.engine === 'redis') return redisAiRead(c, database, sql, maxRows, origin);
   const g = guard(c.engine, sql);
   if (!g.allowed) throw new ApiError({ code: 'guard_rejected', message: `Blocked by the read-only guard: ${g.reason}` });
-  const run = c.engine === 'mongo' ? mongoRun(c, sql, ai.settings.maxRows) : { statements: runSql(c, sql, ai.settings.maxRows), elapsedMs: 0 };
+  const run = c.engine === 'mongo' ? mongoRun(c, sql, maxRows) : { statements: runSql(c, sql, maxRows), elapsedMs: 0 };
   const s = run.statements[0];
   const out: AiReadResult = { columns: s.columns, rows: s.rows, truncated: s.truncated, elapsedMs: s.elapsedMs };
   if (s.documents) out.documents = s.documents;
   return out;
+}
+
+export async function runAiRead(args: RunAiReadArgs) {
+  return guardedRead(args.connId, args.database, args.sql, ai.settings.maxRows, 'assistant');
+}
+
+export async function runScheduledRead(args: RunScheduledReadArgs) {
+  return guardedRead(args.connId, args.database, args.sql, args.maxRows, 'schedule');
 }
 
 export async function getAiSettings() {
@@ -439,10 +502,12 @@ export const handlers: Partial<Record<CommandName, Handler>> = {
   list_databases: listDatabases,
   list_schemas: listSchemas,
   list_tables: listTables,
+  list_keys: listKeys,
   list_columns: listColumns,
   table_properties: tableProperties,
   schema_snapshot: schemaSnapshot,
   parse_mongo_uri: parseMongoUriCommand,
+  parse_redis_uri: parseRedisUriCommand,
   run_query: runQuery,
   editable_result: editableResult,
   apply_edits: applyEdits,
@@ -457,6 +522,7 @@ export const handlers: Partial<Record<CommandName, Handler>> = {
   guard_check: guardCheck,
   classify_write: classifyWrite,
   run_ai_read: runAiRead,
+  run_scheduled_read: runScheduledRead,
   get_ai_settings: getAiSettings,
   save_ai_settings: saveAiSettings,
   set_ai_key: setAiKey,

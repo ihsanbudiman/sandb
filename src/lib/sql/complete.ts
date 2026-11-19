@@ -35,6 +35,8 @@ export interface SqlCompletionOptions {
   columns: (path: string[]) => Promise<Column[]>;
   /** Foreign keys of one table; null when unknown. */
   links?: (path: string[]) => Promise<Links | null>;
+  /** Where the table list stands: still loading, failed (with the reason), or loaded. */
+  tablesState?: { status: 'loading' | 'error' | 'ok'; error?: string };
 }
 
 /** A completion with the table it comes from, drawn on the right of the row. */
@@ -86,6 +88,61 @@ const AFTER_EXPR: Record<string, string[]> = {
 };
 /** Keywords after which completion opens again by itself, because a table or a column comes next. */
 const REOPEN = /^(?:SELECT|FROM|(?:\w+ )*JOIN|UPDATE|INSERT INTO|DELETE FROM|WHERE|ON|AND|OR|GROUP BY|ORDER BY|HAVING|SET|TRUNCATE TABLE|ALTER TABLE|DROP TABLE|SELECT \* FROM|DESCRIBE)$/;
+
+/** Short words that expand to a statement start at the beginning of a statement (`sel` → `SELECT * FROM `). */
+export const SNIPPETS: { label: string; text: string }[] = [
+  { label: 'sel', text: 'SELECT * FROM ' },
+  { label: 'selc', text: 'SELECT COUNT(*) FROM ' },
+  { label: 'ins', text: 'INSERT INTO ' },
+  { label: 'upd', text: 'UPDATE ' },
+  { label: 'del', text: 'DELETE FROM ' },
+];
+// Above the fitting keywords, so `sel` picks the snippet before `SELECT`.
+const B_SNIPPET = 15;
+
+/** Wait after a typed space, comma or `(` before the list opens by itself. */
+export const AUTO_OPEN_DELAY = 200;
+
+/**
+ * True when the list should open by itself, as Ctrl+Space would, after the text typed up to `pos`:
+ * a space, comma or `(` right after a word or symbol, with nothing but a line end, space or `)` after
+ * the cursor. It stays shut for indentation, a second space, text in the middle of a line, after `;`,
+ * and after `AS` (a new alias name comes next). Strings and comments get no list from the source.
+ */
+export function shouldAutoOpen(doc: string, pos: number, dialect: Dialect): boolean {
+  const last = doc.slice(pos - 1, pos);
+  if (last !== ' ' && last !== ',' && last !== '(') return false;
+  const prev = doc.slice(pos - 2, pos - 1);
+  if (last === ' ' && (!prev || /\s/.test(prev) || prev === ';')) return false;
+  // Only at the end of what is written on the line (closing brackets aside): never while editing in the middle.
+  const lineEnd = doc.indexOf('\n', pos);
+  if (!/^[\s)]*$/.test(doc.slice(pos, lineEnd < 0 ? doc.length : lineEnd))) return false;
+  const range = statementRangeAt(doc, pos, dialect);
+  const before = doc.slice(range?.[0] ?? 0, pos);
+  if (!before.trim()) return false;
+  return scan(before, dialect).context !== 'alias';
+}
+
+function snippet(s: { label: string; text: string }): SqlCompletion {
+  return {
+    label: s.label,
+    detail: s.text.trim(),
+    type: 'snippet',
+    boost: B_SNIPPET,
+    apply: (view: EditorView, completion: Completion, from: number, to: number) => {
+      view.dispatch({ ...insertCompletionText(view.state, s.text, from, to), annotations: pickedCompletion.of(completion) });
+      // A table comes next: show the table list at once.
+      startCompletion(view);
+    },
+  };
+}
+
+/** The one row the list shows when no table is known, so an empty list says why. Picking it inserts nothing. */
+function tablesNote(opts: SqlCompletionOptions): SqlCompletion {
+  const s = opts.tablesState;
+  const label = s?.status === 'loading' ? 'Loading tables…' : s?.status === 'error' ? `Tables could not load: ${s.error ?? 'unknown error'}` : 'No tables in this database';
+  return { label, type: 'text', apply: () => {} };
+}
 
 const COMMON_FUNCTIONS = ['count', 'sum', 'avg', 'min', 'max', 'coalesce', 'nullif', 'lower', 'upper', 'length', 'trim', 'replace', 'substr', 'round', 'abs', 'row_number', 'rank', 'dense_rank', 'lag', 'lead'];
 const FUNCTIONS: Record<Dialect, string[]> = {
@@ -389,25 +446,29 @@ export async function sqlCompletion(ctx: CompletionContext, opts: SqlCompletionO
   const { context, clause } = scan(doc.slice(start, wordFrom), opts.dialect);
   const d = opts.dialect;
   const kw = () => dialectKeywords(ctx, d);
-  const phrases = (list: string[]) => list.map((l) => keyword(l, B_FIT));
+  // A small falling boost keeps the written order (most used first, e.g. `WHERE` before `CROSS JOIN`) instead of A–Z.
+  const phrases = (list: string[]) => list.map((l, i) => keyword(l, B_FIT - i * 0.01));
   let options: SqlCompletion[];
   switch (context) {
     case 'alias':
       return null;
     case 'start':
-      options = merge(phrases(STATEMENTS[d]), kw());
+      // Snippets match only their own short word, so they do not crowd the list on `s` or `d`.
+      options = merge(word && SNIPPETS.some((s) => s.label.startsWith(word.text.toLowerCase()) && word.text.length >= 3) ? SNIPPETS.map(snippet) : [], phrases(STATEMENTS[d]), kw());
       break;
     case 'table':
       options = tableOptions(opts);
+      if (!options.length) options = [tablesNote(opts)];
       break;
     case 'join':
       options = merge(await joinClauses(relations, opts), tableOptions(opts));
+      if (!options.length) options = [tablesNote(opts)];
       break;
     case 'on':
       options = merge(await onConditions(relations, opts), await scopeColumns(relations, opts, ctx.explicit, B_COLUMN), qualifiers(relations), FUNCTIONS[d].map(fn));
       break;
     case 'afterTable': {
-      const next = clause === 'join' ? ['ON', 'USING', 'AS', ...AFTER_FROM] : clause === 'update' ? ['SET', 'AS'] : clause === 'into' ? ['VALUES', 'SELECT', 'DEFAULT VALUES'] : clause === 'table' ? [] : ['AS', ...AFTER_FROM];
+      const next = clause === 'join' ? ['ON', 'USING', ...AFTER_FROM, 'AS'] : clause === 'update' ? ['SET', 'AS'] : clause === 'into' ? ['VALUES', 'SELECT', 'DEFAULT VALUES'] : clause === 'table' ? [] : [...AFTER_FROM, 'AS'];
       options = merge(phrases(next), kw());
       break;
     }
@@ -428,5 +489,6 @@ export async function sqlCompletion(ctx: CompletionContext, opts: SqlCompletionO
       options = merge(await scopeColumns(relations, opts, ctx.explicit, B_COLUMN), tableOptions(opts).map((o) => ({ ...o, boost: B_QUALIFIER })), FUNCTIONS[d].map(fn), kw());
   }
   if (ctx.aborted || !options.length) return null;
-  return { from: wordFrom, options, validFor: IDENT };
+  // At a statement start the snippets depend on the typed word, so the list asks again on each key.
+  return { from: wordFrom, options, validFor: context === 'start' ? undefined : IDENT };
 }

@@ -1,14 +1,33 @@
 <script lang="ts">
+  import type { Snippet } from 'svelte';
   import { Plus, X, Check, ChevronRight, LoaderCircle } from '@lucide/svelte';
   import { catalog, loadDatabases } from '../catalog.svelte';
-  import { db, defaultDb, engines, envDot, connOf, dbOf, sameSource, type Conn, type Source } from '../connections.svelte';
+  import { db, defaultDb, envDot, connOf, dbOf, sameSource, type Conn, type Source } from '../connections.svelte';
+  import { chatDatabaseLabel } from '../chatParts';
+  import { ui } from '../state.svelte';
   import { MAX_SOURCES } from '../api/generated/constants';
+  import { focusOnMount } from '../actions';
+  import EngineBadge from './ui/EngineBadge.svelte';
+  import { placePopup } from './ui/popup';
 
-  let { sources, disabled = false, onchange }: { sources: Source[]; disabled?: boolean; onchange: (list: Source[]) => void } = $props();
+  let {
+    sources,
+    disabled = false,
+    onchange,
+    placement = 'up',
+    note = 'A change applies from the next question.',
+    children,
+  }: { sources: Source[]; disabled?: boolean; onchange: (list: Source[]) => void; placement?: 'up' | 'down'; note?: string; children?: Snippet } = $props();
 
   let menu = $state(false);
+  let trigger = $state<HTMLButtonElement>();
+  const pickerId = $props.id();
   let filter = $state('');
   const expanded = $state<Record<string, boolean>>({});
+
+  $effect(() => {
+    if (disabled || (placement === 'up' && !ui.chatOpen)) menu = false;
+  });
 
   const full = $derived(sources.length >= MAX_SOURCES);
   const query = $derived(filter.trim().toLowerCase());
@@ -28,10 +47,9 @@
     const chosen = sources.filter((s) => s.connId === c.id).map((s) => dbOf(s, c));
     // An empty connection database (possible on MongoDB) is not a choice.
     const all = [...new Set([defaultDb(c), ...(catalog.databases[c.id]?.items ?? []), ...chosen])].filter((n) => n !== '');
-    return query && !c.name.toLowerCase().includes(query) ? all.filter((n) => n.toLowerCase().includes(query)) : all;
+    return query && !c.name.toLowerCase().includes(query) ? all.filter((n) => n.toLowerCase().includes(query) || chatDatabaseLabel(c, n).toLowerCase().includes(query)) : all;
   }
 
-  // SQL and MongoDB databases; the engine badge tells them apart. A Mongo source always names a database.
   const conns = $derived(db.connections);
   const shown = $derived(query ? conns.filter((c) => c.name.toLowerCase().includes(query) || dbList(c).length > 0) : conns);
 
@@ -50,73 +68,94 @@
     // Connections that already have a chosen database open with it, so the user sees the choice.
     if (menu) for (const c of conns) if (c.engine !== 'sqlite' && chosenIn(c) && expanded[c.id] === undefined) toggleConn(c);
   }
+
+  function dismiss() {
+    menu = false;
+  }
+
+  function pickerKey(e: KeyboardEvent) {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation();
+    dismiss();
+    trigger?.focus({ preventScroll: true });
+  }
 </script>
 
-<svelte:window onkeydown={(e) => { if (menu && e.key === 'Escape') menu = false; }} />
+{#snippet picker()}
+  <div class={placement === 'up' ? 'sticky -top-1 z-sticky -m-1 mb-0 bg-surface p-1' : 'mb-1 shrink-0'}>
+    <input class="input input-sm" placeholder="Filter connections and databases" aria-label="Filter connections and databases" bind:value={filter} use:focusOnMount autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" />
+  </div>
+  <div class={placement === 'down' ? 'min-h-0 flex-1 overflow-auto' : ''}>
+    {#each shown as c (c.id)}
+      {@const n = chosenIn(c)}
+      {#if c.engine === 'sqlite'}
+        {@const own = defaultDb(c)}
+        {@const on = has(c, own)}
+        <button type="button" class="menu-item" disabled={!on && full} onclick={() => toggle(c, own)} aria-pressed={on}>
+          <span class="w-3"></span>
+          <EngineBadge engine={c.engine} class="w-5" />
+          <span class="min-w-0 flex-1 truncate text-ink">{c.name}</span>
+          <span class="grid size-3.5 shrink-0 place-items-center rounded-sm border {on ? 'border-accent bg-accent text-accent-fg' : 'border-line'}">{#if on}<Check size={12} />{/if}</span>
+        </button>
+      {:else}
+        {@const openRow = expanded[c.id] || !!query}
+        <button type="button" class="menu-item" aria-expanded={openRow} onclick={() => toggleConn(c)}>
+          <ChevronRight size={12} class="w-3 shrink-0 text-faint motion-safe:transition-transform motion-safe:duration-150 {openRow ? 'rotate-90' : ''}" />
+          <EngineBadge engine={c.engine} class="w-5" />
+          <span class="min-w-0 flex-1 truncate text-ink">{c.name}</span>
+          {#if catalog.databases[c.id]?.status === 'loading'}<LoaderCircle size={12} class="shrink-0 text-faint motion-safe:animate-spin" />{/if}
+          {#if n}<span class="shrink-0 text-xs text-accent tabular-nums">{n}</span>{/if}
+        </button>
+        {#if openRow}
+          {#each dbList(c) as name (name)}
+            {@const on = has(c, name)}
+            <button type="button" class="menu-item pl-12" disabled={!on && full} onclick={() => toggle(c, name)} aria-pressed={on}>
+              <span class="min-w-0 flex-1 truncate font-mono text-ink">{chatDatabaseLabel(c, name)}</span>
+              <span class="grid size-3.5 shrink-0 place-items-center rounded-sm border {on ? 'border-accent bg-accent text-accent-fg' : 'border-line'}">{#if on}<Check size={12} />{/if}</span>
+            </button>
+          {/each}
+          {#if catalog.databases[c.id]?.status === 'error'}<p class="py-1 pr-2 pl-12 text-sm text-danger" role="alert">{catalog.databases[c.id].error}</p>{/if}
+        {/if}
+      {/if}
+    {:else}
+      <p class="px-2 py-1.5 text-sm text-muted">{conns.length ? 'Nothing matches the filter.' : 'Add a connection first.'}</p>
+    {/each}
+  </div>
+  <p class="shrink-0 border-t border-line px-2 pt-1.5 pb-1 text-xs text-faint">{sources.length} of {MAX_SOURCES} databases.{note ? ` ${note}` : ''}</p>
+{/snippet}
 
-<div class="relative flex flex-wrap items-center gap-1 pb-1.5">
+<div class="flex flex-wrap items-center gap-1 pb-1.5">
   {#each sources as s, i (i)}
     {@const c = connOf(s)}
-    <span class="flex h-6 max-w-full min-w-0 items-center gap-1 rounded-md border border-line bg-surface pr-0.5 pl-1.5 text-[11.5px]" title={c ? `${c.name}${c.engine === 'sqlite' ? '' : ` / ${dbOf(s, c)}`} (${c.env})` : 'This connection was deleted'}>
+    {@const database = chatDatabaseLabel(c, dbOf(s, c))}
+    <span class="chip min-w-0 pr-0.5" title={c ? `${c.name}${c.engine === 'sqlite' ? '' : ` / ${database}`} (${c.env})` : 'This connection was deleted'}>
       {#if c}
         <span class="size-1.5 shrink-0 rounded-full {envDot[c.env]}" title={c.env}></span><span class="sr-only">{c.env}</span>
         <span class="min-w-0 truncate text-ink">{c.name}</span>
-        {#if c.engine !== 'sqlite'}<span class="text-faint">/</span><span class="min-w-0 truncate font-mono text-muted">{dbOf(s, c)}</span>{/if}
+        {#if c.engine !== 'sqlite'}<span class="text-faint">/</span><span class="min-w-0 truncate font-mono text-muted">{database}</span>{/if}
       {:else}
         <span class="truncate text-faint italic">Deleted connection</span>
       {/if}
-      <button class="grid size-4.5 shrink-0 place-items-center rounded text-faint hover:bg-hover hover:text-ink disabled:opacity-40" {disabled} onclick={() => onchange(sources.filter((_, j) => j !== i))} aria-label="Remove {c ? `${c.name} ${dbOf(s, c)}` : 'deleted connection'} from the chat"><X size={11} /></button>
+      <button type="button" class="btn btn-sm btn-ghost size-4.5 shrink-0 p-0" {disabled} onclick={() => onchange(sources.filter((_, j) => j !== i))} aria-label="Remove {c ? `${c.name} ${database}` : 'deleted connection'} from the chat"><X size={12} /></button>
     </span>
   {/each}
-  <button class="flex h-6 items-center gap-1 rounded-md px-1.5 text-[11.5px] text-muted hover:bg-hover hover:text-ink disabled:opacity-40 {menu ? 'bg-hover text-ink' : ''}" {disabled} aria-expanded={menu} title={disabled ? 'Wait for the reply to finish' : 'Choose the databases that the assistant can use'} onclick={open}>
+  {@render children?.()}
+  <button type="button" bind:this={trigger} class="btn btn-sm btn-ghost px-1.5 {menu ? 'bg-active text-ink' : ''}" {disabled} aria-expanded={menu} aria-controls={menu ? pickerId : undefined} title={disabled ? 'Wait for the reply to finish' : 'Choose the databases that the assistant can use'} onclick={open}>
     <Plus size={12} /> {sources.length ? 'Database' : 'Add a database'}
   </button>
+</div>
 
-  {#if menu}
-    <div class="popover absolute bottom-full left-0 z-50 mb-1 flex max-h-80 w-full min-w-60 flex-col p-1">
-      <!-- svelte-ignore a11y_autofocus -->
-      <input class="input mb-1 h-7 shrink-0 text-[12px]" placeholder="Filter connections and databases" aria-label="Filter connections and databases" bind:value={filter} autofocus autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" />
-      <div class="min-h-0 flex-1 overflow-auto">
-        {#each shown as c (c.id)}
-          {@const n = chosenIn(c)}
-          {#if c.engine === 'sqlite'}
-            {@const own = defaultDb(c)}
-            {@const on = has(c, own)}
-            <button class="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12.5px] hover:bg-hover disabled:opacity-40" disabled={!on && full} onclick={() => toggle(c, own)} aria-pressed={on}>
-              <span class="w-3"></span>
-              <span class="w-5 shrink-0 font-mono text-[10.5px] font-semibold {engines[c.engine].badge}">{engines[c.engine].short}</span>
-              <span class="min-w-0 flex-1 truncate text-ink">{c.name}</span>
-              <span class="grid size-3.5 shrink-0 place-items-center rounded-sm border {on ? 'border-accent bg-accent text-white' : 'border-line'}">{#if on}<Check size={10} />{/if}</span>
-            </button>
-          {:else}
-            {@const openRow = expanded[c.id] || !!query}
-            <button class="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12.5px] hover:bg-hover" aria-expanded={openRow} onclick={() => toggleConn(c)}>
-              <ChevronRight size={12} class="w-3 shrink-0 text-faint transition-transform {openRow ? 'rotate-90' : ''}" />
-              <span class="w-5 shrink-0 font-mono text-[10.5px] font-semibold {engines[c.engine].badge}">{engines[c.engine].short}</span>
-              <span class="min-w-0 flex-1 truncate text-ink">{c.name}</span>
-              {#if catalog.databases[c.id]?.status === 'loading'}<LoaderCircle size={11} class="shrink-0 animate-spin text-faint" />{/if}
-              {#if n}<span class="shrink-0 text-[11px] text-accent tabular-nums">{n}</span>{/if}
-            </button>
-            {#if openRow}
-              {#each dbList(c) as name (name)}
-                {@const on = has(c, name)}
-                <button class="flex h-7 w-full items-center gap-2 rounded-md pr-2 pl-12 text-left hover:bg-hover disabled:opacity-40" disabled={!on && full} onclick={() => toggle(c, name)} aria-pressed={on}>
-                  <span class="min-w-0 flex-1 truncate font-mono text-[12px] text-ink">{name}</span>
-                  <span class="grid size-3.5 shrink-0 place-items-center rounded-sm border {on ? 'border-accent bg-accent text-white' : 'border-line'}">{#if on}<Check size={10} />{/if}</span>
-                </button>
-              {/each}
-              {#if catalog.databases[c.id]?.status === 'error'}<p class="py-1 pr-2 pl-12 text-[12px] text-red-700 dark:text-red-400" role="alert">{catalog.databases[c.id].error}</p>{/if}
-            {/if}
-          {/if}
-        {:else}
-          <p class="px-2 py-1.5 text-[12px] text-muted">{conns.length ? 'Nothing matches the filter.' : 'Add a connection first.'}</p>
-        {/each}
-      </div>
-      <p class="shrink-0 border-t border-line px-2 pt-1.5 pb-1 text-[11px] text-faint">{sources.length} of {MAX_SOURCES} databases. A change applies from the next question.</p>
+{#if menu}
+  {#if placement === 'down'}
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Delegates Escape from the picker's controls.) -->
+    <div id={pickerId} class="popover mt-1 flex max-h-80 w-full flex-col p-1" role="group" aria-label="Chat databases" onkeydown={pickerKey}>
+      {@render picker()}
+    </div>
+  {:else if trigger}
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions (Delegates Escape from the picker's controls.) -->
+    <div id={pickerId} class="popover fixed z-menu w-72 overflow-auto p-1 motion-safe:animate-popover-in" role="group" aria-label="Chat databases" use:placePopup={{ anchor: trigger, maxHeight: 320, dismiss }} onkeydown={pickerKey}>
+      {@render picker()}
     </div>
   {/if}
-</div>
-{#if menu}
-  <!-- Under the open menu (z-50), over everything else. -->
-  <button class="fixed inset-0 z-40 cursor-default" aria-label="Close" onclick={() => (menu = false)}></button>
 {/if}

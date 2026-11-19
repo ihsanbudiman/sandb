@@ -1,6 +1,6 @@
 import { api, ApiError, type DocumentExportFormat, type EjsonFlavor, type ExportResult, type QueryResult, type SqlOptions } from './api';
 import { ask } from './ask.svelte';
-import type { Conn } from './connections.svelte';
+import { isSql, type Conn } from './connections.svelte';
 import { prepareEdit } from './edits';
 import { csvCell } from './results';
 import { relationsIn } from './sql/columns';
@@ -50,6 +50,7 @@ export async function exportDocuments(result: QueryResult, conn: Conn, tabId: st
  * `current` answers the grid's shown result, so a result that changed while the metadata loaded stops.
  */
 export async function exportSql(result: QueryResult, conn: Conn, tabId: string, current: () => QueryResult | null): Promise<ExportMessage | null> {
+  if (!isSql(conn)) return { ok: false, text: 'INSERT statement export needs a SQL connection' };
   if (!api.capabilities.fileExport) return { ok: false, text: 'SQL export to a file needs the desktop app' };
   if (!result.sql || !result.isRead || result.summary) return { ok: false, text: 'SQL export needs the result of one SELECT' };
   // A result that cannot be edited has no primary key to offer; the export still works.
@@ -57,9 +58,7 @@ export async function exportSql(result: QueryResult, conn: Conn, tabId: string, 
   if (current() !== result) return null;
   const rels = result.edit?.table
     ? [[...(result.edit.schema ? [result.edit.schema] : []), result.edit.table]]
-    : conn.engine === 'mongo'
-      ? []
-      : relationsIn(result.sql, conn.engine).map((x) => x.path);
+    : relationsIn(result.sql, conn.engine).map((x) => x.path);
   // `db.schema.table` keeps the last two parts; with no single table the user names it.
   const path = rels.length === 1 ? rels[0].slice(-2) : [''];
   const key = (result.edit?.pk ?? []).map((k) => result.columns.indexOf(k)).filter((i) => i >= 0);

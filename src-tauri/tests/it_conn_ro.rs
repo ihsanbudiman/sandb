@@ -128,7 +128,7 @@ async fn pre_check_refuses_session_mode_changes() {
             Engine::Pg => &["SET default_transaction_read_only = off"],
             Engine::Mysql => &["SET SESSION TRANSACTION READ WRITE"],
             Engine::Sqlite => &["PRAGMA query_only = 0"],
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         for sql in escapes {
             let e = must_fail(l, sql, editor(&c, sql).await);
@@ -142,7 +142,7 @@ async fn pre_check_refuses_session_mode_changes() {
             (Engine::Mysql, "mariadb") => "SELECT @@session.tx_read_only AS ro",
             (Engine::Mysql, _) => "SELECT @@session.transaction_read_only AS ro",
             (Engine::Sqlite, _) => "PRAGMA query_only",
-            (Engine::Mongo, _) => unreachable!("SQL engines only"),
+            (Engine::Mongo | Engine::Redis, _) => unreachable!("SQL engines only"),
         };
         let r = unchecked(&c, probe)
             .await

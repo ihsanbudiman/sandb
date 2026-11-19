@@ -209,7 +209,7 @@ async fn slow_reads_time_out_and_the_next_call_works() {
             Engine::Sqlite => {
                 "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000000000) SELECT count(*) FROM n"
             }
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         let limits = ReadLimits {
             max_rows: 500,
@@ -416,7 +416,7 @@ async fn allowed_statement_kinds_run() {
                 "SELECT * FROM pragma_table_info('orders')",
                 "SELECT ';DELETE FROM orders' AS a",
             ],
-            Engine::Mongo => unreachable!("SQL engines only"),
+            Engine::Mongo | Engine::Redis => unreachable!("SQL engines only"),
         };
         for sql in sqls {
             let r = ai(&c, sql, ReadLimits::default())

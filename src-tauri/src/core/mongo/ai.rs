@@ -221,6 +221,7 @@ pub async fn read(
         truncated: end != run::PageEnd::Stream,
         elapsed_ms: started.elapsed().as_millis() as u64,
         documents: Some(documents),
+        notice: None,
     })
 }
 
@@ -280,7 +281,7 @@ pub async fn run_approved(
         }
     };
     Ok(WriteResult {
-        affected,
+        affected: Some(affected),
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }
@@ -578,6 +579,7 @@ mod tests {
             uri: String::new(),
             auth_source: String::new(),
             topology: None,
+            redis: None,
         }
     }
 

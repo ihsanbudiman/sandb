@@ -1,7 +1,7 @@
 import type { Row } from './api';
-import { connOf, dbOf, type Source } from './connections.svelte';
+import { connOf, dbOf, isSql, type Conn, type Source } from './connections.svelte';
 import type { Msg, Part, ToolPart } from './chatModel';
-import { isChartTool, isDescribeTool, isReadTool, mongoStep } from './chatTools';
+import { isChartTool, isDescribeTool, isReadTool, mongoStep, redisStep } from './chatTools';
 import { skillTitle } from './skills';
 
 /** Consecutive tool steps of one reply form one timeline; `at` is the index of each part in the message. */
@@ -60,16 +60,18 @@ export function numeric(rows: Row[]) {
 }
 
 /** The model's arguments; steps saved before they were kept fall back to the query text or table name. */
-export const argsOf = (p: ToolPart) => p.args ?? (p.sql === undefined ? {} : isDescribeTool(p) ? { table: p.sql } : { sql: p.sql });
+export const argsOf = (p: ToolPart) => p.args ?? (p.sql === undefined ? {} : isDescribeTool(p) ? { table: p.sql } : redisStep(p) ? { command: p.sql } : { sql: p.sql });
 
 export const busy = (parts: Part[], pending: boolean) => parts.some((x) => x.kind === 'tool' && (x.status === 'running' || (x.status === 'awaiting' && pending)));
 
 export const afterStep = (parts: Part[], pending: boolean) => (parts.at(-1)?.kind === 'tool' || parts.at(-1)?.kind === 'chart') && !busy(parts, pending);
 
+export const chatDatabaseLabel = (c: Conn | undefined, database: string) => c?.engine === 'redis' ? `db${database}` : database;
+
 export function sourceLabel(s: Source): string {
   const c = connOf(s);
   if (!c) return 'Deleted connection';
-  return c.engine === 'sqlite' ? c.name : `${c.name} / ${dbOf(s, c)}`;
+  return c.engine === 'sqlite' ? c.name : `${c.name} / ${chatDatabaseLabel(c, dbOf(s, c))}`;
 }
 
 /** How long ago `t` was. `year`: the short saved-query date, with the year once the entry is old. */
@@ -98,11 +100,18 @@ export function replySource(m: Msg, scope: Source[], active?: Source): Source | 
 export const mongoInReply = (m: Msg, scope: Source[]) => scope.some((s) => mongoSource(s)) || m.parts.some((p) => p.kind === 'tool' && mongoStep(p));
 
 /** The source a code block runs on: the reply's last step of that engine, else a scope connection of it, else the reply's usual source. */
-export function fenceSource(m: Msg, scope: Source[], active: Source | undefined, wantMongo: boolean): Source | undefined {
+export function fenceSource(m: Msg, scope: Source[], active: Source | undefined, language: 'sql' | 'mongo' | 'redis'): Source | undefined {
+  const fits = (s: Source) => {
+    const c = connOf(s);
+    return !!c && (language === 'sql' ? isSql(c) : c.engine === language);
+  };
   for (let i = m.parts.length - 1; i >= 0; i--) {
     const p = m.parts[i];
-    if (p.kind === 'tool' && p.source && mongoSource(p.source) === wantMongo) return p.source;
+    if (p.kind === 'tool' && p.source && fits(p.source)) return p.source;
   }
-  const scoped = scope.find((s) => mongoSource(s) === wantMongo);
-  return scoped ?? replySource(m, scope, active);
+  const scoped = scope.find(fits);
+  if (scoped) return scoped;
+  if (language === 'redis') return active && fits(active) ? active : undefined;
+  const fallback = replySource(m, scope, active);
+  return fallback && connOf(fallback)?.engine === 'redis' ? (active && fits(active) ? active : undefined) : fallback;
 }

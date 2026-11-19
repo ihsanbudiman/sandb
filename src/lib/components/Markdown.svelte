@@ -4,9 +4,14 @@
   import { fenceDialect, sqlHtml } from '../highlight';
   import { flashOnce } from '../flash.svelte';
 
-  let { text, onrunsql, mongo = false }: { text: string; onrunsql?: (code: string, anchor: HTMLElement, mongo: boolean) => void; mongo?: boolean } = $props();
+  let { text, onrunsql, mongo = false, redis = false }: {
+    text: string;
+    onrunsql?: (code: string, anchor: HTMLElement, language: 'sql' | 'mongo' | 'redis') => void;
+    mongo?: boolean;
+    redis?: boolean;
+  } = $props();
 
-  // SQL code blocks are colored like the editor; mongosh fences stay plain but get the same Run menu on a Mongo source.
+  // SQL fences are colored; mongosh and Redis fences stay plain but can also open the Run menu.
   const mongoFence = new Set(['javascript', 'js', 'mongodb', 'mongosh', 'mongo']);
   const md = new Marked({
     gfm: true,
@@ -15,7 +20,8 @@
       code({ text: code, lang }: Tokens.Code) {
         const name = lang?.trim().split(/\s/)[0].toLowerCase();
         // Mongosh fences (the prompt puts mongosh in ```javascript) stay plain but get the Run menu when the reply has a Mongo source.
-        if (mongo && name && mongoFence.has(name)) return `<pre class="mongo-code code-mongo"><code>${code.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}\n</code></pre>\n`;
+        if (mongo && name && mongoFence.has(name)) return `<pre class="mongo-code"><code>${sqlHtml(code, 'mongo')}\n</code></pre>\n`;
+        if (redis && name === 'redis') return `<pre class="redis-code"><code>${sqlHtml(code, 'redis')}\n</code></pre>\n`;
         const dialect = fenceDialect(lang, code);
         return dialect ? `<pre class="sql-code"><code class="language-sql">${sqlHtml(code, dialect)}\n</code></pre>\n` : false;
       },
@@ -28,14 +34,15 @@
   const copyIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
   const checkIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
   const playIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
-  /** A code block with its actions. Runnable blocks (SQL, and mongosh on a Mongo reply) add Run; others only copy. Both wrap, so their `pre` is marked; `code-mongo` tells mongosh from SQL. */
-  const codeBox = (sql: boolean, run: boolean, mongoBlock = false) =>
-    `<div class="code-box${run ? ' code-box-run' : ''}"><span class="code-actions"><button type="button" class="code-copy" title="Copy code" aria-label="Copy code">${copyIcon}</button>` +
-    (run ? `<button type="button" class="code-run" title="Run query" aria-label="Run query" aria-haspopup="menu">${playIcon}</button>` : '') +
-    `</span><pre${sql ? ` class="code-sql${mongoBlock ? ' code-mongo' : ''}"` : ''}>`;
+  /** Runnable blocks wrap and carry their language to the Run menu; others only copy. */
+  const codeBox = (run: boolean, language?: 'sql' | 'mongo' | 'redis') =>
+    `<div class="code-box${run ? ' code-box-run' : ''}"><span class="code-actions"><button type="button" class="btn btn-sm btn-ghost size-6 p-0 code-copy" title="Copy code" aria-label="Copy code">${copyIcon}</button>` +
+    (run ? `<button type="button" class="btn btn-sm btn-ghost size-6 p-0 code-run" title="Run query" aria-label="Run query" aria-haspopup="menu" aria-expanded="false">${playIcon}</button>` : '') +
+    `</span><pre${language ? ` class="code-sql${language === 'sql' ? '' : ` code-${language}`}"` : ''}>`;
   // Placeholders keep the second replaceAll from wrapping the <pre> of the first one.
   const SQL_PRE = '\u0001sql-pre\u0001';
   const MONGO_PRE = '\u0001mongo-pre\u0001';
+  const REDIS_PRE = '\u0001redis-pre\u0001';
   const CODE_PRE = '\u0001code-pre\u0001';
   const html = $derived(
     DOMPurify.sanitize(md.parse(text, { async: false }), {
@@ -45,11 +52,13 @@
       .replaceAll('<table>', '<div class="table-box"><table>')
       .replaceAll('</table>', '</table></div>')
       .replaceAll('<pre class="sql-code">', SQL_PRE)
-      .replaceAll('<pre class="mongo-code code-mongo">', MONGO_PRE)
+      .replaceAll('<pre class="mongo-code">', MONGO_PRE)
+      .replaceAll('<pre class="redis-code">', REDIS_PRE)
       .replaceAll('<pre>', CODE_PRE)
-      .replaceAll(SQL_PRE, codeBox(true, !!onrunsql))
-      .replaceAll(MONGO_PRE, codeBox(true, !!onrunsql, true))
-      .replaceAll(CODE_PRE, codeBox(false, false))
+      .replaceAll(SQL_PRE, codeBox(!!onrunsql, 'sql'))
+      .replaceAll(MONGO_PRE, codeBox(!!onrunsql, 'mongo'))
+      .replaceAll(REDIS_PRE, codeBox(!!onrunsql, 'redis'))
+      .replaceAll(CODE_PRE, codeBox(false))
       .replaceAll('</pre>', '</pre></div>'),
   );
 
@@ -62,7 +71,8 @@
       const code = pre?.textContent?.trimEnd();
       if (code == null) return;
       if (btn.classList.contains('code-run')) {
-        onrunsql?.(code, btn, !!pre?.classList.contains('code-mongo'));
+        const language = pre?.classList.contains('code-redis') ? 'redis' : pre?.classList.contains('code-mongo') ? 'mongo' : 'sql';
+        onrunsql?.(code, btn, language);
         return;
       }
       if (!btn.classList.contains('code-copy')) return;
@@ -83,7 +93,7 @@
 
 <style>
   .chat-markdown {
-    font-size: 13px;
+    font-size: var(--text-base);
     line-height: 1.625;
     overflow-wrap: anywhere;
   }
@@ -96,7 +106,7 @@
   .chat-markdown :global(h4) {
     margin: 16px 0 6px;
     color: var(--c-ink);
-    font-size: 13px;
+    font-size: var(--text-base);
     font-weight: 650;
     line-height: 1.4;
   }
@@ -114,7 +124,7 @@
     background: var(--c-active);
     padding: 1px 4px;
     font-family: 'JetBrains Mono Variable', ui-monospace, monospace;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
   }
   .chat-markdown :global(pre) {
     margin: 0 0 10px;
@@ -124,7 +134,7 @@
     background: var(--c-sunken);
     padding: 10px 12px;
   }
-  .chat-markdown :global(pre) :global(code) { background: transparent; padding: 0; font-size: 11.5px; line-height: 1.6; }
+  .chat-markdown :global(pre) :global(code) { background: transparent; padding: 0; font-size: var(--text-xs); line-height: 1.6; }
   .chat-markdown :global(.code-box) { position: relative; margin: 0 0 10px; }
   .chat-markdown :global(.code-box) > :global(pre) { margin: 0; padding-right: 38px; }
   .chat-markdown :global(.code-box-run) > :global(pre) { padding-right: 66px; }
@@ -137,20 +147,15 @@
     display: flex;
     gap: 4px;
     opacity: 0;
-    transition: opacity 0.1s;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .chat-markdown :global(.code-actions) { transition: opacity 120ms; }
   }
   .chat-markdown :global(.code-box:hover .code-actions),
-  .chat-markdown :global(.code-actions:focus-within) { opacity: 1; }
-  .chat-markdown :global(.code-actions button) {
-    display: grid;
-    place-items: center;
-    width: 24px;
-    height: 24px;
-    border-radius: 4px;
-    background: var(--c-sunken);
-    color: var(--c-faint);
-  }
-  .chat-markdown :global(.code-actions button:hover) { background: var(--c-hover); color: var(--c-ink); }
+  .chat-markdown :global(.code-actions:focus-within),
+  .chat-markdown :global(.code-actions:has(.code-run[aria-expanded='true'])) { opacity: 1; }
+  .chat-markdown :global(.code-actions button) { background: var(--c-sunken); }
+  .chat-markdown :global(.code-actions button:hover) { background: var(--c-hover); }
   .chat-markdown :global(.code-actions .code-run:hover) { color: var(--c-accent); }
   @media (hover: none) {
     .chat-markdown :global(.code-actions) { opacity: 1; }
@@ -170,7 +175,7 @@
   .chat-markdown :global(table) {
     width: 100%;
     border-collapse: collapse;
-    font-size: 11.5px;
+    font-size: var(--text-xs);
     white-space: nowrap;
   }
   .chat-markdown :global(th),

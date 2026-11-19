@@ -1,9 +1,11 @@
 import { ApiError } from '../types';
-import type { CellValue, ChatEvent, ChatRequest, ToolKind, ToolResultData, WriteInfo } from '../generated/wire';
+import { CHART_ROWS, REDIS_COMMANDS, UI_ROWS } from '../generated/constants';
+import type { AppError, CellValue, ChatEvent, ChatRequest, ToolKind, ToolResultData, WriteInfo } from '../generated/wire';
 import { mockSchema, nsOf, tableData } from './data';
 import { skillTitle } from '../../skills';
 import type { Row } from '../types';
-import { find } from './state';
+import { ai, find } from './state';
+import { redisAiRead } from './redisRun';
 
 interface Script {
   cancelled: boolean;
@@ -54,16 +56,20 @@ export function decideWrite(chatId: string, id: string, ok: boolean) {
 }
 
 const WRITE = /\b(delete|remove|update|insert|drop|truncate|alter|mark)\b/i;
+const REDIS_WRITE = /\bwrite\b|^\s*(?:please\s+)?(?:add|set|change|rename|expire|flush|persist)\b/i;
+const REDIS_NAMES = new Set<string>(REDIS_COMMANDS);
+const REDIS_CHART = /\b(?:chart|graph|plot)\b/i;
 
 async function reply(request: ChatRequest, script: Script, emit: (e: ChatEvent) => void) {
+  const text = request.message;
   const conns = request.sources.map((s) => find(s.connId));
   const mongoConn = conns.find((c) => c.engine === 'mongo');
-  const conn = mongoConn ?? conns[0];
+  const redisConn = /\bredis\b/i.test(text) ? conns.find((c) => c.engine === 'redis') : undefined;
+  const conn = redisConn ?? mongoConn ?? conns[0];
   if (!conn) throw new ApiError({ code: 'not_found', message: 'No connection for this chat' });
   const sourceIndex = request.sources.findIndex((s) => s.connId === conn.id);
   const source = { source: `db${sourceIndex + 1}` };
   const allowWrites = !!request.sources[sourceIndex]?.allowWrites;
-  const text = request.message;
   const waiting = async (ms: number) => {
     if (script.cancelled) throw new Cancelled();
     await sleep(ms);
@@ -76,13 +82,13 @@ async function reply(request: ChatRequest, script: Script, emit: (e: ChatEvent) 
       await sleep(18);
     }
   };
-  const call = (kind: ToolKind, name: string, args: Record<string, unknown>) => {
+  const call = (kind: ToolKind, name: string, args: Record<string, CellValue>) => {
     const id = crypto.randomUUID();
     emit({ type: 'tool_call', id, name, kind, args: { ...args, ...source } });
     return id;
   };
-  const done = (id: string, summary: string, extra: { columns?: string[]; rows?: CellValue[][]; result?: ToolResultData; error?: { code: 'write_blocked' | 'write_denied'; message: string } } = {}) =>
-    emit({ type: 'tool_result', id, ok: !extra.error, summary, ...(extra.result ? { result: extra.result } : {}), ...(extra.error ? { error: extra.error } : {}), ...(extra.columns ? { columns: extra.columns } : {}), ...(extra.rows ? { rows: extra.rows } : {}) });
+  const done = (id: string, summary: string, extra: { columns?: string[]; rows?: CellValue[][]; result?: ToolResultData; error?: AppError; truncated?: boolean } = {}) =>
+    emit({ type: 'tool_result', id, ok: !extra.error, summary, ...extra });
   const rowsOf = (rows: Row[], columns: string[]) => rows.map((r) => columns.map((c) => r[c]));
 
   // Picked skills open the reply; asking about a skill without a pick makes the assistant load one by itself.
@@ -91,9 +97,45 @@ async function reply(request: ChatRequest, script: Script, emit: (e: ChatEvent) 
     await stream(`Using skills: ${picked.map(skillTitle).join(', ')}.\n\n`);
   } else if (/\bskill\b/i.test(text)) {
     await waiting(300);
-    const s = call('skill', 'load_skill', { name: 'data-quality' });
+    const skill = conn.engine === 'redis' ? 'redis' : 'data-quality';
+    const s = call('skill', 'load_skill', { name: skill });
     await waiting(500);
-    done(s, 'Data quality');
+    done(s, skillTitle(skill));
+  }
+
+  if (conn.engine === 'redis') {
+    const raw = text.trim();
+    const name = raw.split(/\s+/, 1)[0].toUpperCase();
+    const direct = REDIS_NAMES.has(name);
+    if (!direct && (WRITE.test(text) || REDIS_WRITE.test(text))) {
+      await stream('The demo cannot run Redis writes.');
+      return;
+    }
+
+    const chart = !direct && REDIS_CHART.test(text);
+    const spec = { type: 'bar', title: 'Leaderboard scores', x: 'member', y: ['score'], stacked: false };
+    const command = direct ? raw : chart || /\bleaderboard\b/i.test(text) ? 'ZRANGE leaderboard 0 9 REV WITHSCORES'
+      : /\buser:1\b|\bredis read\b/i.test(text) ? 'HGETALL user:1' : /\bgreeting\b/i.test(text) ? 'GET greeting'
+        : /\bhow many\b|\bcount\b/i.test(text) ? 'DBSIZE' : 'SCAN 0 COUNT 100';
+    const id = chart ? call('chart', 'render_redis_chart', { command, ...spec }) : call('read', 'run_redis_read', { command });
+    await waiting(500);
+    try {
+      const r = redisAiRead(conn, request.sources[sourceIndex].database ?? null, command, ai.settings.maxRows, 'assistant');
+      const columns = r.columns.map((c) => c.name);
+      const count = `${r.rows.length} ${r.rows.length === 1 ? 'row' : 'rows'}`;
+      const summary = `${chart ? 'Bar chart · ' : ''}${count} · ${r.elapsedMs} ms${r.notice ? ` · ${r.notice}` : ''}`;
+      if (chart) emit({ type: 'chart', id, spec, columns, rows: r.rows.slice(0, CHART_ROWS), truncated: r.truncated || r.rows.length > CHART_ROWS });
+      done(id, summary, { result: { rows: r.rows.length, ms: r.elapsedMs }, ...(chart ? {} : { columns, rows: r.rows.slice(0, UI_ROWS), truncated: r.truncated || r.rows.length > UI_ROWS }) });
+      const answer = command.toUpperCase() === 'DBSIZE' ? `This Redis database has **${r.rows[0]?.[0]} keys**.` : `Redis returned **${count}**.`;
+      await stream(`${answer}${r.notice ? ` ${r.notice}.` : ''}`);
+    } catch (e) {
+      if (e instanceof Cancelled) throw e;
+      const { code, message, detail } = ApiError.from(e);
+      const note = code === 'guard_rejected' && message.endsWith(' is not a read') ? `The demo cannot run Redis writes. ${message}` : message;
+      done(id, note, { error: { code, message: note, ...(detail ? { detail } : {}) } });
+      await stream(note);
+    }
+    return;
   }
 
   if (conn.engine === 'mongo') {

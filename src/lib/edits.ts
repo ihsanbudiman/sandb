@@ -1,30 +1,40 @@
 import { api, ApiError, type Cell, type QueryResult, type Row } from './api';
+import { confirm } from './ask.svelte';
 import { logQuery } from './audit.svelte';
 import type { Conn } from './connections.svelte';
 import { pendingCount, resetEdits, type Edits, type Stmt } from './editModel';
 import { mongoStatements } from './mongoEdit';
+import { redisEditProblem, redisStatements } from './redisEdit';
 import { isNumericText, isNumericType, isBooleanType, quoteIdent, sqlLiteral } from './sql/value';
 
 let addSeq = 0;
 
-export function confirmDiscard(e: Edits) {
+export async function confirmDiscard(e: Edits): Promise<boolean> {
   const n = pendingCount(e);
   if (n === 0) return true;
-  if (!confirm(`Discard ${n} unsaved change(s)?`)) return false;
+  const { changed, deleted, added } = e;
+  if (!await confirm({
+    title: 'Discard unsaved changes?',
+    body: `${n} unsaved ${n === 1 ? 'change will' : 'changes will'} be lost.`,
+    confirmLabel: 'Discard',
+    destructive: true,
+  })) return false;
+  // A result reset while the dialog was open starts a different set of edits.
+  if (e.changed !== changed || e.deleted !== deleted || e.added !== added) return false;
   resetEdits(e, true);
   return true;
 }
 
 /** Why the result cannot be edited, or null if it can. The backend's metadata loads on the first edit attempt. */
-export function editBlocker(r: QueryResult | null): string | null {
-  if (!r || r.error || r.note || !r.sql || r.isRead === false) return 'Run a SELECT to edit its rows';
+export function editBlocker(r: QueryResult | null, redis = false): string | null {
+  if (!r || r.error || r.note || !r.sql || r.isRead === false) return redis ? 'Run a read command to edit its result' : 'Run a SELECT to edit its rows';
   return r.editReason ?? null;
 }
 
 const editLookups = new WeakMap<QueryResult, Promise<string | null>>();
 
 export function prepareEdit(r: QueryResult, conn: Conn): Promise<string | null> {
-  const blocked = editBlocker(r);
+  const blocked = editBlocker(r, conn.engine === 'redis');
   if (blocked || r.edit) return Promise.resolve(blocked);
   const existing = editLookups.get(r);
   if (existing) return existing;
@@ -32,7 +42,7 @@ export function prepareEdit(r: QueryResult, conn: Conn): Promise<string | null> 
     .then((meta) => {
       if (meta.reason) r.editReason = meta.reason;
       else r.edit = meta;
-      return editBlocker(r);
+      return editBlocker(r, conn.engine === 'redis');
     })
     .catch((e) => {
       editLookups.delete(r);
@@ -74,6 +84,7 @@ export function parseInput(text: string, sample: Cell, dataType = ''): Cell | un
 
 export function buildStatements(r: QueryResult, conn: Conn, e: Edits): Stmt[] {
   if (conn.engine === 'mongo') return mongoStatements(e, r);
+  if (conn.engine === 'redis') return redisStatements(e, r);
   const meta = r.edit;
   if (!meta?.table) return [];
   const t = meta.table;
@@ -108,6 +119,13 @@ export function buildStatements(r: QueryResult, conn: Conn, e: Edits): Stmt[] {
  * (`partial`), the edits are cleared and true comes back so the caller loads the server state.
  */
 export async function saveEdits(r: QueryResult, conn: Conn, e: Edits, tabId?: string, queryId?: string): Promise<boolean> {
+  if (conn.engine === 'redis') {
+    const problem = redisEditProblem(e, r);
+    if (problem) {
+      e.error = problem;
+      return false;
+    }
+  }
   const stmts = buildStatements(r, conn, e);
   if (!stmts.length) return true;
   try {
@@ -139,8 +157,8 @@ export async function saveEdits(r: QueryResult, conn: Conn, e: Edits, tabId?: st
         e.error = { message: `${k} of ${stmts.length} changes saved. Change ${k + 1} failed: ${out.failed.message.replace(/\.$/, '')}. The server has no transactions, so the saved changes stay.`, key: 'partial' };
         return true;
       }
-      const noTx = conn.engine === 'mongo' && r.edit?.transactions === false;
-      const message = /rolled back/i.test(out.failed.message) ? out.failed.message : `${out.failed.message} ${noTx ? 'Nothing was saved.' : 'Transaction rolled back, nothing was saved.'}`;
+      const noRollback = conn.engine === 'redis' || (conn.engine === 'mongo' && r.edit?.transactions === false);
+      const message = /rolled back/i.test(out.failed.message) ? out.failed.message : `${out.failed.message} ${noRollback ? 'Nothing was saved.' : 'Transaction rolled back, nothing was saved.'}`;
       e.error = { message, key: failed?.key ?? stmts[0].key };
       if (failed) logQuery({ kind: 'WRITE', source: 'You', sql: failed.sql, result: { status: 'error', message: out.failed.message }, ms: 0, conn });
       return false;

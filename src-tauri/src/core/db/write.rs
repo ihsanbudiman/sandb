@@ -49,7 +49,7 @@ pub async fn run_approved(
     let implicit: Vec<bool> = stmts.iter().map(|s| commits_implicitly(engine, s)).collect();
     let affected = in_transaction(Conn::detached(&pool).await?, &stmts, &implicit, stop).await?;
     Ok(WriteResult {
-        affected,
+        affected: Some(affected),
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }
@@ -181,6 +181,7 @@ mod tests {
                 uri: String::new(),
                 auth_source: String::new(),
                 topology: None,
+                redis: None,
             },
             None,
         )
@@ -205,7 +206,7 @@ mod tests {
         let stop = CancellationToken::new();
         let sql = "DELETE FROM t WHERE id = 1; INSERT INTO t VALUES (4), (5)";
         let r = run_approved(&st, &conn, "main", sql, &stop).await.unwrap();
-        assert_eq!(r.affected, 3);
+        assert_eq!(r.affected, Some(3));
         assert_eq!(ids(&st, &conn).await, [2, 3, 4, 5]);
     }
 

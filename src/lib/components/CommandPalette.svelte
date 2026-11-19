@@ -4,13 +4,15 @@
 </script>
 
 <script lang="ts">
-  import { Search, FileCode, Play, PanelRight, PanelLeft, Settings, ScrollText, SunMoon, Plus, Table2, Database, Save } from '@lucide/svelte';
+  import { Search, FileCode, Play, PanelRight, PanelLeft, Settings, ScrollText, SunMoon, Plus, Table2, Database, Save, CalendarClock, CalendarPlus } from '@lucide/svelte';
   import { scrollOn } from '../actions';
   import Modal from './Modal.svelte';
   import { db, envDot, type Conn } from '../connections.svelte';
   import { KEYS } from '../keys';
   import { active } from '../tabs.svelte';
   import { saved, type SavedQuery } from '../saved.svelte';
+  import { describeCadence } from '../cadence';
+  import { newSchedule, openSchedule, schedules } from '../schedules.svelte';
 
   type Item = { id: string; group: string; label: string; icon?: typeof Search; dot?: string; env?: string; hint?: string; kbd?: boolean; run: () => void };
 
@@ -34,7 +36,7 @@
     onrun: () => void;
     ontogglechat: () => void;
     ontogglesidebar: () => void;
-    onpage: (p: 'settings' | 'audit') => void;
+    onpage: (p: 'settings' | 'audit' | 'scheduler') => void;
     ontoggletheme: () => void;
     onnewconnection: () => void;
     onswitch: (c: Conn) => void;
@@ -53,9 +55,12 @@
     { id: 'a-sidebar', group: 'Actions', label: 'Toggle sidebar', icon: PanelLeft, run: ontogglesidebar },
     { id: 'a-settings', group: 'Actions', label: 'Open Settings', icon: Settings, run: () => onpage('settings') },
     { id: 'a-audit', group: 'Actions', label: 'Open Audit log', icon: ScrollText, run: () => onpage('audit') },
+    { id: 'a-schedules', group: 'Actions', label: 'Open Schedules', icon: CalendarClock, run: () => onpage('scheduler') },
+    { id: 'a-new-schedule', group: 'Actions', label: 'New schedule', icon: CalendarPlus, run: () => void newSchedule() },
     { id: 'a-theme', group: 'Actions', label: 'Toggle theme', icon: SunMoon, run: ontoggletheme },
     { id: 'a-conn', group: 'Actions', label: 'New connection', icon: Plus, run: onnewconnection },
     ...saved.list.map((s) => ({ id: 's-' + s.id, group: 'Saved queries', label: s.name, icon: FileCode, hint: db.connections.find((c) => c.id === s.connId)?.name, run: () => onopensaved(s) })),
+    ...schedules.list.map((s) => ({ id: 'j-' + s.id, group: 'Schedules', label: s.name, icon: CalendarClock, hint: describeCadence(s.cadence), run: () => openSchedule(s.id) })),
     ...tables.map((t) => ({ id: 't-' + t.key, group: 'Tables', label: t.label, icon: Table2, hint: t.hint, run: t.open })),
     ...db.connections.map((c) => ({
       id: 'c-' + c.id,
@@ -94,8 +99,6 @@
     }
   });
 
-  const focus = (el: HTMLInputElement) => el.focus();
-
   function close() {
     open = false;
   }
@@ -125,11 +128,11 @@
       <div class="flex items-center gap-2.5 border-b border-line px-4">
         <Search size={15} class="shrink-0 text-faint" />
         <input
-          use:focus
+          data-autofocus
           bind:value={q}
           oninput={() => (sel = 0)}
           onkeydown={onkey}
-          class="h-12 flex-1 bg-transparent text-[14px] outline-none placeholder:text-faint"
+          class="h-page-header min-w-0 flex-1 bg-transparent text-lg outline-none placeholder:text-faint"
           placeholder="Search actions, saved queries, tables…"
           autocapitalize="off"
           autocorrect="off"
@@ -144,28 +147,27 @@
             <div class="label px-2.5 pt-2 pb-1 text-faint">{it.group}</div>
           {/if}
           <button
-            data-i={i}
-            class="flex h-8 w-full items-center gap-2.5 rounded-md px-2.5 text-left text-[13px] {i === sel ? 'bg-active text-ink' : 'text-muted'}"
+            class="menu-item gap-2.5 px-2.5 {i === sel ? 'bg-active text-ink' : ''}"
             use:scrollOn={i === sel}
             onmousemove={() => (sel = i)}
             onclick={() => exec(it)}
           >
-            {#if it.icon}<it.icon size={14} class={i === sel ? 'text-ink' : 'text-faint'} />{/if}
-            <span class="flex-1 truncate {it.group === 'Tables' ? 'font-mono text-[12.5px]' : ''}">{it.label}</span>
+            {#if it.icon}<it.icon size={13} class={i === sel ? 'text-ink' : 'text-faint'} />{/if}
+            <span class="min-w-0 flex-1 truncate {it.group === 'Tables' ? 'font-mono' : ''}">{it.label}</span>
             {#if it.dot}<span class="size-1.5 shrink-0 rounded-full {it.dot}" title={it.env}></span>{#if it.env !== it.hint}<span class="sr-only">{it.env}</span>{/if}{/if}
             {#if it.hint}
               {#if it.kbd}
                 <kbd class="kbd {i === sel ? 'text-muted' : ''}">{it.hint}</kbd>
               {:else}
-                <span class="text-[11.5px] {i === sel ? 'text-muted' : 'text-faint'}">{it.hint}</span>
+                <span class="text-xs {i === sel ? 'text-muted' : 'text-faint'}">{it.hint}</span>
               {/if}
             {/if}
           </button>
         {:else}
-          <div class="px-2 py-8 text-center text-[13px] text-faint">No results</div>
+          <div class="px-2 py-8 text-center text-base text-faint">No results</div>
         {/each}
       </div>
-      <div class="flex items-center gap-4 border-t border-line px-4 py-2 text-[11.5px] text-faint">
+      <div class="flex items-center gap-4 border-t border-line px-4 py-2 text-xs text-faint">
         <span class="flex items-center gap-1.5"><kbd class="kbd">↑↓</kbd> navigate</span>
         <span class="flex items-center gap-1.5"><kbd class="kbd">↵</kbd> open</span>
         <span class="flex items-center gap-1.5"><kbd class="kbd">esc</kbd> close</span>

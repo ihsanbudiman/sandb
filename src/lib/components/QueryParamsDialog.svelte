@@ -14,11 +14,8 @@
     if (ready) answer(Object.fromEntries(names.map((n) => [n, values[n].trim()])));
   }
 
-  // The first field takes the focus, with the remembered value selected.
-  const select = (el: HTMLInputElement, first: boolean) => {
-    if (!first) return;
-    el.focus();
-    el.select();
+  const selectInitial = (el: HTMLInputElement, first: boolean) => {
+    if (first) el.setSelectionRange(0, el.value.length);
   };
 </script>
 
@@ -28,15 +25,15 @@
   <div class="space-y-3">
     <div class="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-2">
       {#each names as n, i (n)}
-        <label class="font-mono text-[12.5px] text-muted" for="query-param-{i}">{n}</label>
-        <input id="query-param-{i}" class="input font-mono" bind:value={values[n]} use:select={i === 0} placeholder="e.g. 42 or 'paid'" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" />
+        <label class="font-mono text-sm text-muted" for="query-param-{i}">{n}</label>
+        <input id="query-param-{i}" class="input input-sm font-mono" data-autofocus={i === 0 ? '' : undefined} bind:value={values[n]} use:selectInitial={i === 0} placeholder="e.g. 42 or 'paid'" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" />
       {/each}
     </div>
-    <p class="text-[12px] leading-relaxed text-faint">Each value goes into the query as written. Put text in quotes, for example <code class="font-mono">'paid'</code>. Use <code class="font-mono">NULL</code> for no value.</p>
+    <p class="text-sm leading-relaxed text-faint">Each value goes into the query as written. Put text in quotes, for example <code class="font-mono">'paid'</code>. Use <code class="font-mono">NULL</code> for no value.</p>
   </div>
 
   {#snippet footer()}
-    <button type="button" class="btn btn-secondary" onclick={() => answer(null)}>Cancel</button>
-    <button type="submit" class="btn btn-primary" disabled={!ready}>Run <kbd class="ml-0.5 font-sans text-[11px] font-normal opacity-80" aria-hidden="true">↵</kbd></button>
+    <button type="button" class="btn btn-sm btn-secondary" onclick={() => answer(null)}>Cancel</button>
+    <button type="submit" class="btn btn-sm btn-primary" disabled={!ready}>Run <kbd class="ml-0.5 font-sans font-normal opacity-80" aria-hidden="true">↵</kbd></button>
   {/snippet}
 </Modal>

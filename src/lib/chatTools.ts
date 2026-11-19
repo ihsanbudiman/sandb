@@ -21,6 +21,8 @@ export const isDescribeTool = (p: ToolPart) => p.tool === 'describe';
 /** True when the step ran on a MongoDB source, so its text is mongosh, not SQL. */
 export const mongoStep = (p: ToolPart) => !!p.source && connOf(p.source)?.engine === 'mongo';
 
+export const redisStep = (p: ToolPart) => p.name === 'run_redis_read' || p.name === 'render_redis_chart' || p.name === 'propose_redis_write' || (!!p.source && connOf(p.source)?.engine === 'redis');
+
 /** What the model prepares while the arguments of a tool call still stream. */
 export function startingLabel(kind: ToolKind | undefined, name: string): string {
   switch (kind) {
@@ -43,6 +45,11 @@ export function startingLabel(kind: ToolKind | undefined, name: string): string 
 export function destructive(p: ToolPart): boolean {
   const sql = p.sql ?? '';
   if (mongoStep(p)) return /\.\s*(deleteMany|deleteOne|findOneAndDelete|dropIndexes|dropIndex|dropDatabase|drop|remove)\s*\(/.test(sql);
+  if (redisStep(p)) {
+    const command = p.info?.statements[0]?.kind ?? sql.trim().split(/\s+/, 1)[0].toUpperCase();
+    return ['DEL', 'UNLINK', 'FLUSHDB', 'FLUSHALL'].includes(command) ||
+      (p.info?.warnings.some((w) => w.code === 'flush' || w.code === 'server_admin' || w.code === 'unknown_command') ?? false);
+  }
   return /^\s*(delete|drop|truncate)/i.test(sql);
 }
 
@@ -55,14 +62,14 @@ export function mongoTag(p: ToolPart): string {
 }
 
 export const STATUS_TEXT: Record<string, string> = { running: 'RUNNING', done: 'OK', blocked: 'BLOCKED', awaiting: 'NEEDS APPROVAL', approved: 'APPROVED', denied: 'DENIED', failed: 'FAILED' };
-export const STATUS_TONE: Record<string, string> = {
+export const STATUS_TONE: Record<ToolPart['status'], string> = {
   running: 'text-accent',
-  done: 'text-emerald-700 dark:text-emerald-400',
-  blocked: 'text-red-700 dark:text-red-400',
-  awaiting: 'text-amber-700 dark:text-amber-400',
-  approved: 'text-emerald-700 dark:text-emerald-400',
-  denied: 'text-red-700 dark:text-red-400',
-  failed: 'text-red-700 dark:text-red-400',
+  done: 'text-ok',
+  blocked: 'text-danger',
+  awaiting: 'text-warn',
+  approved: 'text-ok',
+  denied: 'text-danger',
+  failed: 'text-danger',
 };
 
 export const STATUS_LABEL: Record<string, string> = {

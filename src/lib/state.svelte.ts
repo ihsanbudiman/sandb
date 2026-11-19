@@ -1,21 +1,37 @@
 import { api, ApiError, type AiSettings, type Provider } from './api';
 import { DEFAULT_AI_BASE_URL, DEFAULT_AI_MODEL, DEFAULT_MAX_ROWS, DEFAULT_TIMEOUT_SEC } from './api/generated/constants';
+import { autosave, readStored } from './persist.svelte';
+
+const LAYOUT_KEY = 'sandb.layout';
+const layoutDefaults = {
+  sidebarWidth: 224,
+  chatWidth: 340,
+  editorSplit: 0.34,
+  sidebarOpen: true,
+  chatOpen: true,
+  resultsOpen: true,
+  sidebarView: 'connections' as 'connections' | 'queries',
+};
+const layout = readStored(LAYOUT_KEY, layoutDefaults);
 
 export const ui = $state({
   dark: false,
-  chatOpen: true,
-  chatWidth: 340,
-  page: 'query' as 'query' | 'settings' | 'audit',
+  ...layoutDefaults,
+  ...layout,
+  page: 'query' as 'query' | 'settings' | 'audit' | 'scheduler',
   settingsSection: 'ai' as 'ai' | 'safeguards' | 'mcp' | 'appearance' | 'updates',
   theme: 'light' as 'light' | 'dark' | 'system',
-  /** Sidebar width in px; the title bar uses it too, so the tabs stay in line with the main card. */
-  sidebarWidth: 224,
-  sidebarOpen: true,
-  sidebarView: 'connections' as 'connections' | 'queries',
-  /** Editor height as a fraction of the main card; the results grid takes the rest. */
-  editorSplit: 0.34,
-  resultsOpen: true,
 });
+
+autosave(LAYOUT_KEY, () => ({
+  sidebarWidth: ui.sidebarWidth,
+  chatWidth: ui.chatWidth,
+  editorSplit: ui.editorSplit,
+  sidebarOpen: ui.sidebarOpen,
+  chatOpen: ui.chatOpen,
+  resultsOpen: ui.resultsOpen,
+  sidebarView: ui.sidebarView,
+}));
 
 /** The AI settings page's copy; the backend type is `Provider` in the wire contract. */
 export const providers: Record<Provider, { label: string; url: string; model: string }> = {

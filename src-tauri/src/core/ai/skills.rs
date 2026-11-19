@@ -18,9 +18,15 @@ pub struct Skill {
     pub body: &'static str,
 }
 
-const ALL: &[Engine] = &[Engine::Pg, Engine::Mysql, Engine::Sqlite, Engine::Mongo];
+const ALL: &[Engine] = &[
+    Engine::Pg,
+    Engine::Mysql,
+    Engine::Sqlite,
+    Engine::Mongo,
+    Engine::Redis,
+];
 
-pub static SKILLS: [Skill; 12] = [
+pub static SKILLS: [Skill; 14] = [
     Skill {
         name: "postgres",
         title: "PostgreSQL",
@@ -85,6 +91,22 @@ pub static SKILLS: [Skill; 12] = [
                       IXSCAN, the ESR index rule, $indexStats, in-memory sorts, collStats.",
         engines: &[Engine::Mongo],
         body: include_str!("skills/mongo-tuning.md"),
+    },
+    Skill {
+        name: "redis",
+        title: "Redis",
+        description: "Redis commands: key names, SCAN patterns and cursors, data types, \
+                      reply columns, and read-only Lua.",
+        engines: &[Engine::Redis],
+        body: include_str!("skills/redis.md"),
+    },
+    Skill {
+        name: "redis-tuning",
+        title: "Redis performance",
+        description: "Slow Redis commands and memory use: large keys, MEMORY USAGE, \
+                      SLOWLOG GET, LATENCY DOCTOR, INFO and key expiry.",
+        engines: &[Engine::Redis],
+        body: include_str!("skills/redis-tuning.md"),
     },
     Skill {
         name: "query-tuning",
@@ -177,6 +199,7 @@ mod tests {
                 uri: String::new(),
                 auth_source: String::new(),
                 topology: None,
+                redis: None,
             },
             database: "shop".into(),
             schema: None,
@@ -216,6 +239,51 @@ mod tests {
                 "schema-review"
             ]
         );
+    }
+
+    #[test]
+    fn redis_skills_fit_redis_alone_and_with_other_sources() {
+        let redis = [source("db1", Engine::Redis)];
+        assert_eq!(
+            names(&available(&redis)),
+            [
+                "redis",
+                "redis-tuning",
+                "query-tuning",
+                "data-quality",
+                "time-series",
+                "schema-review"
+            ]
+        );
+        let mixed = [
+            source("db1", Engine::Redis),
+            source("db2", Engine::Pg),
+            source("db3", Engine::Mongo),
+        ];
+        assert_eq!(
+            names(&available(&mixed)),
+            [
+                "postgres",
+                "postgres-tuning",
+                "mongo-aggregation",
+                "mongo-tuning",
+                "redis",
+                "redis-tuning",
+                "query-tuning",
+                "data-quality",
+                "time-series",
+                "schema-review"
+            ]
+        );
+        let selection = ["redis-tuning".into()];
+        assert_eq!(
+            names(&picked(&selection, &redis).unwrap()),
+            ["redis-tuning"]
+        );
+        let err = picked(&selection, &[source("db2", Engine::Pg)])
+            .err()
+            .unwrap();
+        assert!(err.message.contains("does not apply"));
     }
 
     #[test]

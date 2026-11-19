@@ -118,6 +118,7 @@ async fn execute(
         truncated: fetched.truncated,
         elapsed_ms: started.elapsed().as_millis() as u64,
         documents: None,
+        notice: None,
     })
 }
 
@@ -629,6 +630,7 @@ mod tests {
             uri: String::new(),
             auth_source: String::new(),
             topology: None,
+            redis: None,
         }
     }
 

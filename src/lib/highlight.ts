@@ -24,9 +24,9 @@ export function fenceDialect(lang: string | undefined, code: string): SQLDialect
   return name ? byFence[name] : looksSql.test(code) ? StandardSQL : undefined;
 }
 
-/** Escaped HTML of `code` with a span per colored token. MongoDB text is mongosh, not SQL: it gets the escape only, no token colors. */
+/** Escaped HTML of `code` with a span per SQL token; other engines get escaping only. */
 export function sqlHtml(code: string, dialect: SQLDialect | Engine = StandardSQL): string {
-  if (dialect === 'mongo') return escape(code);
+  if (dialect === 'mongo' || dialect === 'redis') return escape(code);
   const d = typeof dialect === 'string' ? byEngine[dialect] : dialect;
   let out = '';
   highlightCode(code, d.language.parser.parse(code), tokens, (s, cls) => (out += cls ? `<span class="${cls}">${escape(s)}</span>` : escape(s)), () => (out += '\n'));

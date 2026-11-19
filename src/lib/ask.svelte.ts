@@ -1,4 +1,5 @@
 import type { Component } from 'svelte';
+import ConfirmDialog from './components/ui/ConfirmDialog.svelte';
 
 /** What every asked dialog gets: `answer` closes it and resolves the caller's promise. */
 export interface Asked<A> {
@@ -34,6 +35,18 @@ export function ask<A>(dialog: Component<any>, props: Record<string, unknown> = 
       resolve: resolve as (result: unknown) => void,
     });
   });
+}
+
+export interface ConfirmOptions {
+  title: string;
+  body: string;
+  confirmLabel?: string;
+  destructive?: boolean;
+}
+
+/** Ask for a yes/no decision. Cancel and Escape both resolve as false. */
+export function confirm(options: ConfirmOptions): Promise<boolean> {
+  return ask<boolean>(ConfirmDialog, { ...options });
 }
 
 export function answerAsk(id: number, result: unknown) {

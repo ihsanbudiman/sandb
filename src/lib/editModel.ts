@@ -31,13 +31,13 @@ export function resetEdits(e: Edits, keepOn = false) {
 
 export interface Stmt {
   kind: 'UPDATE' | 'INSERT' | 'DELETE';
-  /** SQL, or the mongosh command on MongoDB. */
+  /** SQL, mongosh, or redis-cli preview text. */
   sql: string;
   /** Grid row key: `r<index>` for result rows, `a<key>` for new rows. */
   key: string;
   pk: Row;
   set: Row;
-  /** MongoDB update: the old value of each changed path. */
+  /** MongoDB and Redis: values as loaded, for the conflict check. */
   old?: Record<string, TypedValue>;
   document?: string;
 }

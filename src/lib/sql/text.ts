@@ -2,10 +2,10 @@
 
 import type { Engine } from '../api';
 
-/** The engines whose text these helpers read. MongoDB's mongosh never comes here. */
-export type SqlEngine = Exclude<Engine, 'mongo'>;
+/** The engines whose text these helpers read. */
+export type SqlEngine = Exclude<Engine, 'mongo' | 'redis'>;
 
-/** The engine of SQL text; mongosh never reaches these helpers, its text would split as plain SQL. */
+/** The engine of SQL text. */
 export type Dialect = SqlEngine;
 
 const READ_KINDS: Record<string, true> = { select: true, with: true, show: true, explain: true, describe: true };

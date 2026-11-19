@@ -8,6 +8,7 @@
 //! that read plus a preview. `propose_write` shows the statement to the user and runs it only
 //! after the user approves it.
 
+use std::borrow::Cow;
 use std::pin::Pin;
 
 use serde_json::{Map, Value, json};
@@ -41,6 +42,7 @@ enum Serves {
     All,
     Sql,
     Mongo,
+    Redis,
     /// The chat itself, not a database: the tool takes no `source`.
     Chat,
 }
@@ -49,19 +51,19 @@ impl Serves {
     fn matches(self, engine: Engine) -> bool {
         match self {
             Self::All | Self::Chat => true,
-            Self::Sql => engine != Engine::Mongo,
+            Self::Sql => engine.sql().is_some(),
             Self::Mongo => engine == Engine::Mongo,
+            Self::Redis => engine == Engine::Redis,
         }
     }
 }
 
 /// A tool's definition without `source`: the sentence the model reads and the parameters it
-/// fills. `mongo`: the chat has a MongoDB source, which changes the wording of the two schema
-/// tools.
-type Build = fn(&'static Tool, bool) -> (&'static str, Value);
+/// fills. Shared schema tools adapt their wording to the engines in the chat.
+type Build = fn(&'static Tool, Engines) -> (Cow<'static, str>, Value);
 
-/// A tool's handler. The table passes its row, so one function serves the SQL and the MongoDB
-/// tool of the same kind.
+/// A tool's handler. The table passes its row, so one function serves the tools of the same
+/// kind on different engines.
 type Handler = for<'a, 'b> fn(
     &'static Tool,
     &'a ToolContext<'b>,
@@ -75,22 +77,14 @@ struct Tool {
     serves: Serves,
     kind: ToolKind,
     build: Build,
-    /// The argument that holds the statement (`sql`, `query`); `None` for the schema tools.
+    /// The statement argument (`sql`, `query` or `command`); `None` for non-statement tools.
     text: Option<&'static str>,
-    /// The tool of the other engine that does the same thing.
-    other: Option<&'static str>,
     /// A server error message can quote a row value, so `schema` privacy hides its text.
     data: bool,
     handler: Handler,
 }
 
 impl Tool {
-    /// The other engine's twin, for a source this tool does not serve.
-    fn other(&self) -> &'static str {
-        self.other
-            .expect("every engine-specific tool names its other engine's tool")
-    }
-
     /// The statement argument's key; a table invariant.
     fn text_key(&self) -> &'static str {
         self.text
@@ -99,14 +93,13 @@ impl Tool {
 }
 
 /// Every tool, in the order the model sees the definitions.
-static TOOLS: [Tool; 9] = [
+static TOOLS: [Tool; 12] = [
     Tool {
         name: "list_tables",
         serves: Serves::All,
         kind: ToolKind::List,
         build: build_list,
         text: None,
-        other: None,
         data: false,
         handler: handle_list,
     },
@@ -116,7 +109,6 @@ static TOOLS: [Tool; 9] = [
         kind: ToolKind::Describe,
         build: build_describe,
         text: None,
-        other: None,
         data: false,
         handler: handle_describe,
     },
@@ -126,7 +118,6 @@ static TOOLS: [Tool; 9] = [
         kind: ToolKind::Read,
         build: build_read,
         text: Some("sql"),
-        other: Some("run_mongo_read"),
         data: true,
         handler: handle_read,
     },
@@ -136,7 +127,6 @@ static TOOLS: [Tool; 9] = [
         kind: ToolKind::Chart,
         build: build_chart,
         text: Some("sql"),
-        other: Some("render_mongo_chart"),
         data: true,
         handler: handle_chart,
     },
@@ -146,7 +136,6 @@ static TOOLS: [Tool; 9] = [
         kind: ToolKind::Write,
         build: build_write,
         text: Some("sql"),
-        other: Some("propose_mongo_write"),
         data: true,
         handler: handle_write,
     },
@@ -156,7 +145,6 @@ static TOOLS: [Tool; 9] = [
         kind: ToolKind::Read,
         build: build_read,
         text: Some("query"),
-        other: Some("run_read_query"),
         data: true,
         handler: handle_read,
     },
@@ -166,7 +154,6 @@ static TOOLS: [Tool; 9] = [
         kind: ToolKind::Chart,
         build: build_chart,
         text: Some("query"),
-        other: Some("render_chart"),
         data: true,
         handler: handle_chart,
     },
@@ -176,7 +163,33 @@ static TOOLS: [Tool; 9] = [
         kind: ToolKind::Write,
         build: build_write,
         text: Some("query"),
-        other: Some("propose_write"),
+        data: true,
+        handler: handle_write,
+    },
+    Tool {
+        name: "run_redis_read",
+        serves: Serves::Redis,
+        kind: ToolKind::Read,
+        build: build_read,
+        text: Some("command"),
+        data: true,
+        handler: handle_read,
+    },
+    Tool {
+        name: "render_redis_chart",
+        serves: Serves::Redis,
+        kind: ToolKind::Chart,
+        build: build_chart,
+        text: Some("command"),
+        data: true,
+        handler: handle_chart,
+    },
+    Tool {
+        name: "propose_redis_write",
+        serves: Serves::Redis,
+        kind: ToolKind::Write,
+        build: build_write,
+        text: Some("command"),
         data: true,
         handler: handle_write,
     },
@@ -186,7 +199,6 @@ static TOOLS: [Tool; 9] = [
         kind: ToolKind::Skill,
         build: build_skill,
         text: None,
-        other: None,
         data: false,
         handler: handle_skill,
     },
@@ -200,6 +212,13 @@ fn tool_named(name: &str) -> Option<&'static Tool> {
 /// streams (the UI can show it) and then fails as `not_found`.
 pub fn kind(name: &str) -> ToolKind {
     tool_named(name).map_or(ToolKind::Other, |t| t.kind)
+}
+
+fn tool_for(kind: ToolKind, serves: Serves) -> &'static Tool {
+    TOOLS
+        .iter()
+        .find(|t| t.kind == kind && t.serves == serves)
+        .expect("every family has the tool of each statement kind")
 }
 
 fn tool_of(kind: ToolKind, engine: Engine) -> &'static Tool {
@@ -216,10 +235,9 @@ pub fn catalog() -> impl Iterator<Item = (&'static str, ToolKind)> {
 }
 
 /// OpenAI function tool definitions for the engines of `sources`. The schema tools serve every
-/// source; the SQL read/chart/write tools exist when a SQL source does, the Mongo ones when a
-/// Mongo source does. Every database tool takes `source`, an enum of the ids it serves; it is
-/// required when the chat has more than one source. `load_skill` takes the skill names that fit
-/// the chat's engines instead.
+/// source; statement tools are offered for each family present. Every database tool takes
+/// `source`, an enum of the ids it serves; it is required when the chat has more than one
+/// source. `load_skill` takes the skill names that fit the chat's engines instead.
 pub fn definitions(sources: &[Source], engines: Engines) -> Value {
     let ids = |serves: Serves| -> Vec<&str> {
         sources
@@ -234,7 +252,7 @@ pub fn definitions(sources: &[Source], engines: Engines) -> Value {
         if ids.is_empty() {
             continue;
         }
-        let (base, mut params) = (t.build)(t, engines.mongo);
+        let (base, mut params) = (t.build)(t, engines);
         let description = description(t, base, engines);
         if t.serves == Serves::Chat {
             let names: Vec<&str> = skills::available(sources).iter().map(|k| k.name).collect();
@@ -267,69 +285,107 @@ pub fn definitions(sources: &[Source], engines: Engines) -> Value {
     Value::Array(defs)
 }
 
-/// The sentence the model reads for one tool: `base` from the tool's builder. A mixed SQL +
-/// MongoDB chat says which twin to use on the other engine.
-fn description(t: &Tool, base: &str, engines: Engines) -> String {
-    match t.serves {
-        Serves::Sql if engines.is_mixed() => {
-            format!("{base} SQL sources only: on MongoDB use {}.", t.other())
-        }
-        Serves::Mongo if engines.is_mixed() => {
-            format!(
-                "{base} MongoDB sources only: on SQL sources use {}.",
-                t.other()
-            )
-        }
-        _ => base.to_string(),
+/// A mixed chat's engine-specific tools name the corresponding tool for each other family.
+fn description(t: &Tool, base: Cow<'static, str>, engines: Engines) -> Cow<'static, str> {
+    if !engines.is_mixed() {
+        return base;
     }
+    let family = match t.serves {
+        Serves::Sql => "SQL",
+        Serves::Mongo => "MongoDB",
+        Serves::Redis => "Redis",
+        Serves::All | Serves::Chat => return base,
+    };
+    let mut alternatives = [
+        (Serves::Sql, "SQL sources", engines.sql),
+        (Serves::Mongo, "MongoDB", engines.mongo),
+        (Serves::Redis, "Redis", engines.redis),
+    ]
+    .into_iter()
+    .filter(|(other, _, present)| *present && *other != t.serves)
+    .map(|(other, on, _)| (on, tool_for(t.kind, other).name));
+    let (on, name) = alternatives
+        .next()
+        .expect("a mixed chat has another family");
+    match alternatives.next() {
+        Some((next_on, next_name)) => format!(
+            "{base} {family} sources only: on {on} use {name}; on {next_on} use {next_name}."
+        ),
+        None => format!("{base} {family} sources only: on {on} use {name}."),
+    }
+    .into()
 }
 
 /// One tool's description and parameters for a client outside the chat (the MCP server):
-/// worded for SQL and MongoDB both, without `source`. `None` for a name not in the table.
+/// worded for all engine families, without `source`. `None` for a name not in the table.
 pub fn definition(name: &str) -> Option<(String, Value)> {
     tool_named(name).map(|t| {
-        let (base, params) = (t.build)(t, true);
-        let both = Engines {
+        let engines = Engines {
             sql: true,
             mongo: true,
+            redis: true,
         };
-        (description(t, base, both), params)
+        let (base, params) = (t.build)(t, engines);
+        (description(t, base, engines).into_owned(), params)
     })
 }
 
-fn build_list(_: &Tool, mongo: bool) -> (&'static str, Value) {
-    let description = if mongo {
-        "List the tables and views (MongoDB: collections and views) of one database."
-    } else {
-        "List the tables and views of one database."
+const PG_SCHEMA: &str = "PostgreSQL only. Default: the selected schema, or public if none.";
+
+fn build_list(_: &Tool, engines: Engines) -> (Cow<'static, str>, Value) {
+    let base = match (engines.sql, engines.mongo) {
+        (true, true) => {
+            "Find exact object names: SQL tables and views, or MongoDB collections and views."
+        }
+        (true, false) => "Find exact SQL table and view names before writing a query.",
+        (false, true) => "Find exact MongoDB collection and view names before writing a query.",
+        (false, false) => {
+            "List up to 1000 Redis keys with their types and sizes. The list can be incomplete."
+        }
     };
-    let schema = if mongo {
-        "PostgreSQL schema. Default: the current schema. Ignored on MySQL, SQLite and MongoDB."
+    let description = if engines.redis && (engines.sql || engines.mongo) {
+        format!("{base} For Redis, list up to 1000 keys with their types and sizes.").into()
     } else {
-        "PostgreSQL schema. Default: the current schema. Ignored on MySQL and SQLite."
+        base.into()
     };
     (
         description,
         json!({
             "type": "object",
-            "properties": {"schema": {"type": "string", "description": schema}}
+            "properties": {"schema": {"type": "string", "description": PG_SCHEMA}}
         }),
     )
 }
 
-fn build_describe(_: &Tool, mongo: bool) -> (&'static str, Value) {
-    let (description, table, schema) = if mongo {
-        (
-            "List the columns of one table or view: name, type, nullable, default, primary key. On MongoDB, the fields from a sample, with their types and the share of documents that have them.",
-            "Table or collection name without schema.",
-            "PostgreSQL schema. Default: the current schema. Ignored on MongoDB.",
+fn build_describe(_: &Tool, engines: Engines) -> (Cow<'static, str>, Value) {
+    let base = match (engines.sql, engines.mongo) {
+        (true, true) => {
+            "Inspect one object before querying it. For SQL, get column types, nullability, defaults and primary key flags. For MongoDB, get sampled fields and their types."
+        }
+        (true, false) => {
+            "Inspect one SQL table or view before querying it. Get column types, nullability, defaults and primary key flags."
+        }
+        (false, true) => {
+            "Inspect one MongoDB collection or view before querying it. Get sampled fields and their types. The sample may omit fields."
+        }
+        (false, false) => {
+            "Inspect one Redis key. Get result columns and sampled hash or stream fields when available."
+        }
+    };
+    let description = if engines.redis && (engines.sql || engines.mongo) {
+        format!(
+            "{base} For Redis, get result columns and sampled hash or stream fields for one key."
         )
+        .into()
     } else {
-        (
-            "List the columns of one table or view: name, type, nullable, default, primary key.",
-            "Table name without schema.",
-            "PostgreSQL schema. Default: the current schema.",
-        )
+        base.into()
+    };
+    let table = if engines.redis {
+        "Exact object name. For Redis, keep any quotes from list_tables."
+    } else if engines.sql {
+        "Exact object name. Pass the PostgreSQL schema separately."
+    } else {
+        "Exact collection or view name."
     };
     (
         description,
@@ -337,17 +393,16 @@ fn build_describe(_: &Tool, mongo: bool) -> (&'static str, Value) {
             "type": "object",
             "properties": {
                 "table": {"type": "string", "description": table},
-                "schema": {"type": "string", "description": schema}
+                "schema": {"type": "string", "description": PG_SCHEMA}
             },
             "required": ["table"]
         }),
     )
 }
 
-/// The chart arguments, after the statement: they are the same for both engines, but MongoDB
-/// names result fields where SQL names columns.
-fn chart_params(mongo: bool) -> Value {
-    let (x, y, series) = if mongo {
+/// Chart arguments name result columns, or result fields for MongoDB.
+fn chart_params(serves: Serves) -> Value {
+    let (x, y, series) = if serves == Serves::Mongo {
         (
             "Result field for the x axis (pie: the slice labels).",
             "Result fields with the numeric values, one series each (pie: exactly one).",
@@ -370,21 +425,25 @@ fn chart_params(mongo: bool) -> Value {
     })
 }
 
-fn build_read(t: &Tool, _mongo: bool) -> (&'static str, Value) {
+fn build_read(t: &Tool, _: Engines) -> (Cow<'static, str>, Value) {
     let key = t.text_key();
-    let (description, statement) = if t.serves == Serves::Mongo {
-        (
-            "Run one read-only mongosh statement and get the result. Exactly one statement: db.<collection>.find(...), aggregate([...]), countDocuments, distinct, findOne, estimatedDocumentCount, or a read runCommand. Writes are refused.",
-            "Exactly one read-only mongosh statement, for example db.orders.find({status: \"paid\"}, {total: 1}).sort({_id: -1}).limit(20) or db.orders.aggregate([...]).",
-        )
-    } else {
-        (
-            "Run one read-only SQL statement (SELECT, SHOW, DESCRIBE, EXPLAIN, PRAGMA) and get the result. Writes are refused.",
-            "Exactly one read-only statement.",
-        )
+    let (description, statement) = match t.serves {
+        Serves::Mongo => (
+            "Read one MongoDB database. Submit one read-only mongosh statement. For example, use find, aggregate, countDocuments or distinct. Filter early and return only the fields you need. Do not use $out, $merge or JavaScript code.",
+            "One read-only mongosh statement, such as db.orders.find({status: \"paid\"}, {total: 1}).limit(20) or db.orders.aggregate([...]).",
+        ),
+        Serves::Redis => (
+            "Read one Redis database with one command in redis-cli syntax. Use a range or selected fields instead of reading a large key. Use SCAN with MATCH and COUNT, not KEYS. Use a nonzero cursor from notice for the next page. Do not send writes or blocking commands.",
+            "One read-only Redis command, such as ZRANGE leaderboard 0 9 REV WITHSCORES. Quote keys and arguments that contain spaces.",
+        ),
+        Serves::Sql => (
+            "Read one SQL database. Use one read-only statement in the dialect of that database. Select only the columns you need. Use a filter and a limit for samples, or aggregate for totals. Use EXPLAIN without ANALYZE for a plan.",
+            "One read-only SQL statement. For PostgreSQL, qualify table names with their schema.",
+        ),
+        Serves::All | Serves::Chat => unreachable!("a read tool names its family"),
     };
     (
-        description,
+        description.into(),
         json!({
             "type": "object",
             "properties": {key: {"type": "string", "description": statement}},
@@ -393,20 +452,24 @@ fn build_read(t: &Tool, _mongo: bool) -> (&'static str, Value) {
     )
 }
 
-fn build_chart(t: &Tool, _mongo: bool) -> (&'static str, Value) {
+fn build_chart(t: &Tool, _: Engines) -> (Cow<'static, str>, Value) {
     let key = t.text_key();
-    let mongo = t.serves == Serves::Mongo;
-    let description = if mongo {
-        "Run one read-only mongosh statement and show its result to the user as a chart in the chat. This is the only way to show a chart on MongoDB: call it every time the user asks for a chart, graph or plot. The chart is also in the PDF export of the reply. Shape the data in the pipeline: one document per point, sorted, already aggregated; $project flat fields. x, y and series name result fields (flattened paths such as _id or month)."
-    } else {
-        "Run one read-only SQL statement and show its result to the user as a chart in the chat. This is the only way to show a chart: call it every time the user asks for a chart, graph or plot. The chart is also in the PDF export of the reply. Shape the data in SQL: one row per point, sorted, already aggregated."
+    let (description, statement) = match t.serves {
+        Serves::Mongo => (
+            "Run one read-only mongosh statement and show its result to the user as a chart in the chat. This is the only way to show a chart on MongoDB: call it every time the user asks for a chart, graph or plot. The chart is also in the PDF export of the reply. Shape the data in the pipeline: one document per point, sorted, already aggregated; $project flat fields. x, y and series name result fields (flattened paths such as _id or month).",
+            "Exactly one read-only mongosh statement whose result has one document per point.",
+        ),
+        Serves::Redis => (
+            "Run one read-only Redis command and show its reply to the user as a chart in the chat. This is the only way to show a chart on Redis: call it every time the user asks for a chart, graph or plot. The chart is also in the PDF export of the reply. Use a command whose reply has a label and a number per row, for example ZRANGE key 0 9 REV WITHSCORES (columns member, score) or HGETALL (field, value). x, y and series name reply columns.",
+            "Exactly one read-only Redis command.",
+        ),
+        Serves::Sql => (
+            "Run one read-only SQL statement and show its result to the user as a chart in the chat. This is the only way to show a chart: call it every time the user asks for a chart, graph or plot. The chart is also in the PDF export of the reply. Shape the data in SQL: one row per point, sorted, already aggregated.",
+            "Exactly one read-only statement.",
+        ),
+        Serves::All | Serves::Chat => unreachable!("a chart tool names its family"),
     };
-    let statement = if mongo {
-        "Exactly one read-only mongosh statement whose result has one document per point."
-    } else {
-        "Exactly one read-only statement."
-    };
-    let mut properties = match chart_params(mongo) {
+    let mut properties = match chart_params(t.serves) {
         Value::Object(map) => map,
         _ => unreachable!(),
     };
@@ -415,7 +478,7 @@ fn build_chart(t: &Tool, _mongo: bool) -> (&'static str, Value) {
         json!({"type": "string", "description": statement}),
     );
     (
-        description,
+        description.into(),
         json!({
             "type": "object",
             "properties": properties,
@@ -424,21 +487,25 @@ fn build_chart(t: &Tool, _mongo: bool) -> (&'static str, Value) {
     )
 }
 
-fn build_write(t: &Tool, _mongo: bool) -> (&'static str, Value) {
+fn build_write(t: &Tool, _: Engines) -> (Cow<'static, str>, Value) {
     let key = t.text_key();
-    let (description, statement) = if t.serves == Serves::Mongo {
-        (
+    let (description, statement) = match t.serves {
+        Serves::Mongo => (
             "Propose one mongosh write: insert, update, replace, delete, bulkWrite, findOneAnd*, index, drop, dropDatabase, rename, createCollection or a runCommand that writes. The user sees it and approves or denies it; only then does it run, and the result says whether it ran and how many documents changed. A single statement is atomic on one document only; multi-document operations are not one transaction.",
             "Exactly one mongosh write statement.",
-        )
-    } else {
-        (
+        ),
+        Serves::Redis => (
+            "Propose one Redis write command (redis-cli syntax), for example HSET, DEL, EXPIRE or EVAL. The user sees it and approves or denies it; only then does it run, and the result says whether it ran. One command is atomic; there is no rollback after it ran.",
+            "Exactly one Redis write command.",
+        ),
+        Serves::Sql => (
             "Propose SQL that changes data or schema. The user sees it and approves or denies it. The approved statements run in one transaction, except on MySQL: a statement that commits implicitly (DDL, LOCK TABLES, SET autocommit, CALL, GRANT) commits the earlier ones as it runs, and the preview warns about that. The result says whether it ran and how many rows changed.",
             "The SQL to propose.",
-        )
+        ),
+        Serves::All | Serves::Chat => unreachable!("a write tool names its family"),
     };
     (
-        description,
+        description.into(),
         json!({
             "type": "object",
             "properties": {key: {"type": "string", "description": statement}},
@@ -447,10 +514,11 @@ fn build_write(t: &Tool, _mongo: bool) -> (&'static str, Value) {
     )
 }
 
-fn build_skill(_: &Tool, _mongo: bool) -> (&'static str, Value) {
+fn build_skill(_: &Tool, _: Engines) -> (Cow<'static, str>, Value) {
     (
         "Get the instructions of one skill from the system prompt's skill list. Call it before \
-         you work on a question that a skill's description matches.",
+         you work on a question that a skill's description matches."
+            .into(),
         json!({
             "type": "object",
             "properties": {"name": {"type": "string", "description": "Skill name."}},
@@ -659,16 +727,22 @@ pub async fn finish_write(
             ops::run_approved_write(ctx.state, &w.conn_id, &w.database, &w.sql, stop)
                 .await
                 .map(|r| {
-                    let mut done = Done::plain(
-                        format!(
-                            "{} · committed · {} ms",
-                            count(r.affected as usize, "row changed", "rows changed"),
-                            r.elapsed_ms
+                    let mut done = match r.affected {
+                        Some(n) => Done::plain(
+                            format!(
+                                "{} · committed · {} ms",
+                                count(n as usize, "row changed", "rows changed"),
+                                r.elapsed_ms
+                            ),
+                            json!({"status": "committed", "rowsAffected": n}),
                         ),
-                        json!({"status": "committed", "rowsAffected": r.affected}),
-                    );
+                        None => Done::plain(
+                            format!("Command ran · {} ms", r.elapsed_ms),
+                            json!({"status": "committed"}),
+                        ),
+                    };
                     done.result = Some(ToolResultData {
-                        rows: Some(r.affected),
+                        rows: r.affected,
                         ms: Some(r.elapsed_ms),
                         committed: Some(true),
                     });
@@ -779,7 +853,7 @@ fn statement<'a>(
 ) -> Result<(&'a Source, &'a str), AppError> {
     let src = ctx.source(args)?;
     if !t.serves.matches(src.conn.engine) {
-        return Err(wrong_engine(src, t.other()));
+        return Err(wrong_engine(src, t));
     }
     Ok((src, req_str(args, t.text_key())?))
 }
@@ -791,18 +865,19 @@ fn opt_str<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// The error for calling an engine's tool on a source of the other engine; `use_instead` is
-/// the tool the model should call.
-fn wrong_engine(src: &Source, use_instead: &str) -> AppError {
-    let language = if src.conn.engine == Engine::Mongo {
-        "a mongosh query"
-    } else {
-        "SQL"
+/// The error for calling a statement tool on a source of a different family.
+fn wrong_engine(src: &Source, t: &Tool) -> AppError {
+    let engine = src.conn.engine;
+    let use_instead = tool_of(t.kind, engine).name;
+    let language = match engine {
+        Engine::Mongo => "a mongosh query",
+        Engine::Redis => "a Redis command",
+        _ => "SQL",
     };
     AppError::invalid(format!(
         "Source {} is {}. Use {use_instead} with {language}.",
         src.id,
-        src.conn.engine.label()
+        engine.label()
     ))
 }
 
@@ -930,7 +1005,7 @@ impl Read {
     }
 }
 
-/// The model's view of a read. `schema` privacy: names and counts only, never a row value.
+/// The model's view of a read. `schema` privacy: metadata only, never a row value.
 /// A MongoDB read also has `documents`: the whole documents, not the flattened rows.
 fn read_content(r: &AiReadResult, privacy: Privacy) -> Value {
     let columns: Vec<Value> = r
@@ -943,6 +1018,9 @@ fn read_content(r: &AiReadResult, privacy: Privacy) -> Value {
         "rowCount": r.rows.len(),
         "truncated": r.truncated,
     });
+    if let Some(notice) = r.notice.as_deref().filter(|s| !s.trim().is_empty()) {
+        out["notice"] = json!(notice);
+    }
     if privacy == Privacy::Schema {
         out["note"] = json!("Row values are hidden by the privacy setting.");
         return out;
@@ -1255,6 +1333,7 @@ mod tests {
             truncated: false,
             elapsed_ms: 3,
             documents: None,
+            notice: None,
         }
     }
 
@@ -1265,8 +1344,26 @@ mod tests {
         assert!(!v.to_string().contains("alice"), "{v}");
         assert_eq!(v["rowCount"], 1);
         assert_eq!(v["columns"][0]["name"], "email");
+        assert!(v.get("notice").is_none());
         let v = read_content(&r, Privacy::Results);
         assert_eq!(v["rows"][0][0], "alice@example.com");
+    }
+
+    #[test]
+    fn scan_notice_is_metadata_under_either_privacy_setting() {
+        let mut r = read(vec![vec![json!("user:123")]]);
+        r.columns[0].name = "key".into();
+        r.notice = Some("Next cursor: 128".into());
+        let v = read_content(&r, Privacy::Schema);
+        assert_eq!(v["notice"], "Next cursor: 128");
+        assert_eq!(v["note"], "Row values are hidden by the privacy setting.");
+        assert!(v.get("rows").is_none(), "{v}");
+        let v = read_content(&r, Privacy::Results);
+        assert_eq!(v["notice"], "Next cursor: 128");
+        assert_eq!(v["rows"], json!([["user:123"]]));
+
+        r.notice = Some(String::new());
+        assert!(read_content(&r, Privacy::Schema).get("notice").is_none());
     }
 
     #[test]
@@ -1328,34 +1425,49 @@ mod tests {
     /// kind has one tool per engine it serves.
     #[test]
     fn the_table_is_the_one_list() {
-        let sources = [source("db1", "a"), mongo_source("db2", "m")];
+        let sources = [
+            source("db1", "a"),
+            mongo_source("db2", "m"),
+            redis_source("db3", "r"),
+        ];
         let defs = definitions(&sources, Engines::of(&sources));
         let defined = names(&defs);
         let catalogued: Vec<&str> = catalog().map(|(name, _)| name).collect();
         assert_eq!(defined, catalogued);
         for (name, k) in catalog() {
             assert_eq!(kind(name), k, "{name}");
-            assert!(tool_of(k, Engine::Pg).serves != Serves::Mongo, "{name}");
         }
-        for engine in [Engine::Pg, Engine::Mysql, Engine::Sqlite, Engine::Mongo] {
-            let write = tool_of(ToolKind::Write, engine);
-            assert!(write.serves.matches(engine), "{engine:?}");
-            assert_eq!(write.kind, ToolKind::Write);
-        }
-        assert_eq!(kind("nope"), ToolKind::Other);
-        // Every engine-specific tool names its other engine's twin.
-        for t in &TOOLS {
-            if matches!(t.serves, Serves::All | Serves::Chat) {
-                assert!(t.other.is_none() && t.text.is_none(), "{}", t.name);
-            } else {
-                assert!(t.other.is_some() && t.text.is_some(), "{}", t.name);
+        for family in [Serves::Sql, Serves::Mongo, Serves::Redis] {
+            for kind in [ToolKind::Read, ToolKind::Chart, ToolKind::Write] {
+                assert_eq!(
+                    TOOLS
+                        .iter()
+                        .filter(|t| t.kind == kind && t.serves == family)
+                        .count(),
+                    1
+                );
+                let tool = tool_for(kind, family);
+                assert!(tool.data && tool.text.is_some(), "{}", tool.name);
             }
         }
+        for engine in [
+            Engine::Pg,
+            Engine::Mysql,
+            Engine::Sqlite,
+            Engine::Mongo,
+            Engine::Redis,
+        ] {
+            assert!(
+                tool_of(ToolKind::Write, engine).serves.matches(engine),
+                "{engine:?}"
+            );
+        }
+        assert_eq!(kind("nope"), ToolKind::Other);
         assert_eq!(defined.len(), TOOLS.len());
     }
 
     #[test]
-    fn sql_only_chats_get_the_sql_tools_unchanged() {
+    fn sql_only_chats_get_only_sql_and_shared_tools() {
         let sources = [source("db1", "a")];
         let defs = definitions(&sources, Engines::of(&sources));
         assert_eq!(
@@ -1372,10 +1484,6 @@ mod tests {
         // No MongoDB wording reaches a SQL-only chat.
         assert!(!defs.to_string().contains("Mongo"), "{defs}");
         assert!(!defs.to_string().contains("mongosh"), "{defs}");
-        assert_eq!(
-            tool(&defs, "list_tables")["function"]["description"],
-            "List the tables and views of one database."
-        );
     }
 
     #[test]
@@ -1393,14 +1501,43 @@ mod tests {
                 "load_skill"
             ]
         );
-        assert_eq!(
-            tool(&defs, "list_tables")["function"]["description"],
-            "List the tables and views (MongoDB: collections and views) of one database."
-        );
         // The hints that name the other engine's tools are for mixed chats only.
         assert!(!defs.to_string().contains("run_read_query"), "{defs}");
         let read = &tool(&defs, "run_mongo_read")["function"]["parameters"];
         assert_eq!(read["required"], json!(["query"]));
+    }
+
+    #[test]
+    fn redis_only_chats_get_only_redis_and_shared_tools() {
+        let sources = [redis_source("db1", "r")];
+        let defs = definitions(&sources, Engines::of(&sources));
+        assert_eq!(
+            names(&defs),
+            [
+                "list_tables",
+                "describe_table",
+                "run_redis_read",
+                "render_redis_chart",
+                "propose_redis_write",
+                "load_skill",
+            ]
+        );
+        let read = &tool(&defs, "run_redis_read")["function"];
+        assert_eq!(read["parameters"]["required"], json!(["command"]));
+        let chart = &tool(&defs, "render_redis_chart")["function"]["parameters"];
+        assert_eq!(chart["required"], json!(["command", "type", "x", "y"]));
+        assert_eq!(
+            chart["properties"]["x"]["description"],
+            "Result column for the x axis (pie: the slice labels)."
+        );
+        let write = &tool(&defs, "propose_redis_write")["function"];
+        assert_eq!(write["parameters"]["required"], json!(["command"]));
+        assert!(
+            write["description"]
+                .as_str()
+                .unwrap()
+                .ends_with("One command is atomic; there is no rollback after it ran.")
+        );
     }
 
     #[test]
@@ -1441,11 +1578,92 @@ mod tests {
             assert!(offered.contains(&json!(name)), "{name}: {skill}");
         }
         assert!(!offered.contains(&json!("mysql")), "{skill}");
-        assert!(
-            tool(&defs, "run_read_query")["function"]["description"]
-                .as_str()
-                .unwrap()
-                .ends_with("SQL sources only: on MongoDB use run_mongo_read.")
+        assert!(!defs.to_string().contains("Redis"), "{defs}");
+        for (name, hint) in [
+            (
+                "run_read_query",
+                "SQL sources only: on MongoDB use run_mongo_read.",
+            ),
+            (
+                "run_mongo_read",
+                "MongoDB sources only: on SQL sources use run_read_query.",
+            ),
+        ] {
+            let description = &tool(&defs, name)["function"]["description"];
+            assert!(
+                description.as_str().unwrap().ends_with(hint),
+                "{description}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_and_redis_chats_name_only_the_other_present_family() {
+        let sources = [source("db1", "pg"), redis_source("db2", "r")];
+        let defs = definitions(&sources, Engines::of(&sources));
+        assert_eq!(defs.as_array().unwrap().len(), 9);
+        assert!(!defs.to_string().contains("Mongo"), "{defs}");
+        for (name, id, hint) in [
+            (
+                "render_chart",
+                "db1",
+                "SQL sources only: on Redis use render_redis_chart.",
+            ),
+            (
+                "render_redis_chart",
+                "db2",
+                "Redis sources only: on SQL sources use render_chart.",
+            ),
+        ] {
+            let function = &tool(&defs, name)["function"];
+            assert!(function["description"].as_str().unwrap().ends_with(hint));
+            let params = &function["parameters"];
+            assert_eq!(params["properties"]["source"]["enum"], json!([id]));
+            assert!(
+                params["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("source"))
+            );
+        }
+    }
+
+    #[test]
+    fn three_family_chats_name_both_alternatives_in_family_order() {
+        let sources = [
+            redis_source("db3", "r"),
+            mongo_source("db2", "m"),
+            source("db1", "pg"),
+        ];
+        let defs = definitions(&sources, Engines::of(&sources));
+        for (name, id, hint) in [
+            (
+                "run_read_query",
+                "db1",
+                "SQL sources only: on MongoDB use run_mongo_read; on Redis use run_redis_read.",
+            ),
+            (
+                "run_mongo_read",
+                "db2",
+                "MongoDB sources only: on SQL sources use run_read_query; on Redis use run_redis_read.",
+            ),
+            (
+                "run_redis_read",
+                "db3",
+                "Redis sources only: on SQL sources use run_read_query; on MongoDB use run_mongo_read.",
+            ),
+        ] {
+            let function = &tool(&defs, name)["function"];
+            assert!(function["description"].as_str().unwrap().ends_with(hint));
+            assert_eq!(
+                function["parameters"]["properties"]["source"]["enum"],
+                json!([id])
+            );
+        }
+        let list = &tool(&defs, "list_tables")["function"];
+        assert_eq!(
+            list["parameters"]["properties"]["source"]["enum"],
+            json!(["db3", "db2", "db1"])
         );
     }
 
@@ -1509,6 +1727,7 @@ mod tests {
                 uri: String::new(),
                 auth_source: String::new(),
                 topology: None,
+                redis: None,
             },
             database: "shop".into(),
             schema: None,
@@ -1520,6 +1739,16 @@ mod tests {
         let mut s = source(id, name);
         s.conn.engine = Engine::Mongo;
         s.conn.port = 27017;
+        s
+    }
+
+    fn redis_source(id: &str, name: &str) -> Source {
+        let mut s = source(id, name);
+        s.conn.engine = Engine::Redis;
+        s.conn.port = 6379;
+        s.conn.database = "0".into();
+        s.conn.redis = Some(Default::default());
+        s.database = "0".into();
         s
     }
 
@@ -1541,7 +1770,11 @@ mod tests {
         )
         .unwrap();
         let settings = AiSettings::default();
-        let sources = [source("db1", "pg"), mongo_source("db2", "m")];
+        let sources = [
+            source("db1", "pg"),
+            mongo_source("db2", "m"),
+            redis_source("db3", "r"),
+        ];
         let ctx = ToolContext {
             state: &state,
             sources: &sources,
@@ -1585,6 +1818,36 @@ mod tests {
                 "db1",
                 Engine::Pg,
             ),
+            (
+                "run_read_query",
+                r#"{"source": "db3"}"#.to_string(),
+                "db3",
+                Engine::Redis,
+            ),
+            (
+                "render_mongo_chart",
+                r#"{"source": "db3"}"#.to_string(),
+                "db3",
+                Engine::Redis,
+            ),
+            (
+                "propose_write",
+                r#"{"source": "db3"}"#.to_string(),
+                "db3",
+                Engine::Redis,
+            ),
+            (
+                "run_redis_read",
+                r#"{"source": "db1", "command": "GET greeting"}"#.to_string(),
+                "db1",
+                Engine::Pg,
+            ),
+            (
+                "propose_redis_write",
+                r#"{"source": "db2", "command": "DEL greeting"}"#.to_string(),
+                "db2",
+                Engine::Mongo,
+            ),
         ] {
             let out = execute(&ctx, "t", tool, &args).await;
             let e = error_of(&out);
@@ -1593,6 +1856,12 @@ mod tests {
             let want = tool_of(kind(tool), other_engine).name;
             assert!(e.message.contains(want), "{tool}: {}", e.message);
             assert!(e.message.contains(source), "{tool}: {}", e.message);
+            if other_engine == Engine::Redis {
+                assert_eq!(
+                    e.message,
+                    format!("Source db3 is Redis. Use {want} with a Redis command.")
+                );
+            }
         }
     }
 
@@ -1667,6 +1936,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn redis_write_stays_a_proposal_until_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            dir.path(),
+            Box::new(crate::core::secrets::MemoryStore::new()),
+        )
+        .unwrap();
+        let settings = AiSettings::default();
+        let mut writable = redis_source("db2", "cache");
+        writable.allow_writes = true;
+        let sources = [redis_source("db1", "locked"), writable];
+        let ctx = ToolContext {
+            state: &state,
+            sources: &sources,
+            settings: &settings,
+        };
+        let command = "DEL test:key";
+        let name = "propose_redis_write";
+        let args =
+            |source: &str, command: &str| json!({"source": source, "command": command}).to_string();
+        let out = execute(&ctx, "w", name, &args("db1", command)).await;
+        assert_eq!(error_of(&out).code, ErrorCode::WriteBlocked);
+        let out = execute(&ctx, "w", name, &args("db2", "GET test:key")).await;
+        assert_eq!(
+            error_of(&out).message,
+            "This is a read. Use run_redis_read."
+        );
+
+        let out = execute(&ctx, "w", name, &args("db2", command)).await;
+        match &out.events[..] {
+            [ChatEvent::WritePreview { sql, info, .. }] => {
+                assert_eq!(sql, command);
+                let [statement] = info.statements.as_slice() else {
+                    panic!("Expected one write statement: {info:?}");
+                };
+                assert_eq!(statement.kind, "DEL");
+                assert_eq!(statement.table.as_deref(), Some("test:key"));
+                assert_eq!(statement.database.as_deref(), Some("0"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(out.content.is_empty());
+        let write = out.write.unwrap();
+        assert_eq!(
+            write,
+            ProposedWrite {
+                conn_id: "c-db2".into(),
+                database: "0".into(),
+                sql: command.into(),
+                engine: Engine::Redis,
+            }
+        );
+        let out = finish_write(
+            &ctx,
+            "w",
+            &write,
+            Decision::Denied,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(error_of(&out).code, ErrorCode::WriteDenied);
+    }
+
     fn mongo_read() -> AiReadResult {
         AiReadResult {
             columns: vec![
@@ -1688,6 +2021,7 @@ mod tests {
                 "_id": {"$oid": "65a1"},
                 "customer": {"email": "alice@example.com"},
             })]),
+            notice: None,
         }
     }
 

@@ -104,19 +104,19 @@
   <TargetBadge {conn} target={table} />
   {@render fields()}
   {#if problem}
-    <p class="rounded-lg bg-amber-500/10 px-3 py-2 text-[12px] leading-relaxed text-amber-800 dark:text-amber-300">{problem}</p>
+    <p class="rounded-lg bg-warn-soft px-3 py-2 text-sm leading-relaxed text-warn">{problem}</p>
   {/if}
   {@render notes?.()}
-  <pre class="overflow-x-auto rounded-lg bg-sunken px-3 py-2 font-mono text-[12px] whitespace-pre-wrap {statement ? 'text-ink' : 'text-faint'}">{statement || preview}</pre>
+  <pre class="overflow-x-auto rounded-lg bg-sunken px-3 py-2 font-mono text-sm whitespace-pre-wrap {statement ? 'text-ink' : 'text-faint'}">{statement || preview}</pre>
 
   {#if prod}
     <ProdAck bind:checked={ack}>I want to change <b class="font-mono">{displayName(table)}</b>.</ProdAck>
   {/if}
 
   {#snippet footer()}
-    <button type="button" class="btn btn-secondary" disabled={busy} onclick={onclose}>Cancel</button>
-    <button type="submit" class="btn {destructive ? 'bg-red-600 text-white enabled:hover:bg-red-500' : 'btn-primary'}" disabled={!statement || ackBlocked(prod, ack, busy)}>
-      {#if busy}<LoaderCircle size={13} class="animate-spin" />{/if} {button}
+    <button type="button" class="btn btn-sm btn-secondary" data-autofocus={destructive ? '' : undefined} disabled={busy} onclick={onclose}>Cancel</button>
+    <button type="submit" class="btn btn-sm {destructive ? 'btn-danger' : 'btn-primary'}" disabled={!statement || ackBlocked(prod, ack, busy)}>
+      {#if busy}<LoaderCircle size={12} class="motion-safe:animate-spin" />{/if} {button}
     </button>
   {/snippet}
 </Modal>

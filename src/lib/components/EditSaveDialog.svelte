@@ -33,7 +33,8 @@
   let ack = $state(false);
   const prod = $derived(conn.env === 'production');
   const mongo = $derived(conn.engine === 'mongo');
-  const kindTint = { UPDATE: 'text-amber-700 dark:text-amber-400', INSERT: 'text-emerald-700 dark:text-emerald-400', DELETE: 'text-red-700 dark:text-red-400' };
+  const redis = $derived(conn.engine === 'redis');
+  const kindTint = { UPDATE: 'text-warn', INSERT: 'text-ok', DELETE: 'text-danger' };
   // A Mongo command starts with its collection; the method name gets the tint.
   const mongoMethod = { UPDATE: '.updateOne(', INSERT: '.insertOne(', DELETE: '.deleteOne(' };
 
@@ -50,7 +51,7 @@
 
 {#if mode}
   <Modal
-    title={mode === 'save' ? 'Save changes' : mongo ? 'Generated commands' : 'Generated SQL'}
+    title={mode === 'save' ? 'Save changes' : mongo || redis ? 'Generated commands' : 'Generated SQL'}
     width="max-w-xl"
     closable
     busy={saving}
@@ -62,22 +63,29 @@
     {/snippet}
 
     <TargetBadge {conn}>
-      <span class="ml-auto text-[12px] text-faint">{stmts.length} {mongo ? 'command' : 'statement'}{stmts.length === 1 ? '' : 's'}{transactions ? ' · one transaction' : ''}</span>
+      <span class="ml-auto text-xs text-faint">{stmts.length} {redis ? 'change' : mongo ? 'command' : 'statement'}{stmts.length === 1 ? '' : 's'}{transactions && !redis ? ' · one transaction' : ''}</span>
     </TargetBadge>
-    {#if !transactions}
-      <p class="mt-2 flex items-start gap-2 rounded-lg bg-amber-400/12 px-3 py-2 text-[12.5px] text-amber-800 dark:text-amber-300">
+    {#if redis}
+      <p class="mt-2 text-sm text-muted">One Lua script checks all changes before it saves. If any value changed, it saves nothing. Redis cannot undo a write that already ran.</p>
+      {#if stmts.some((s) => s.sql.startsWith('LREM '))}
+        <p class="mt-1 text-sm text-faint">List delete commands are for preview only. The save removes the selected indexes, even if values repeat.</p>
+      {/if}
+    {:else if !transactions}
+      <p class="mt-2 flex items-start gap-2 rounded-lg bg-warn-soft px-3 py-2 text-sm text-warn">
         <TriangleAlert size={13} class="mt-0.5 shrink-0" />
         <span>This server is standalone and has no transactions. Changes run one by one; if one fails, the earlier ones stay saved.</span>
       </p>
     {/if}
 
-    <div class="mt-2.5 max-h-72 overflow-auto rounded-lg border border-line bg-sunken px-3 py-2.5 font-mono text-[12px] leading-relaxed">
+    <div class="mt-2.5 max-h-72 overflow-auto rounded-lg border border-line bg-sunken px-3 py-2.5 font-mono text-sm leading-relaxed">
       {#each stmts as s, i}
         <div class="flex gap-2.5">
-          <span aria-hidden="true" class="w-4 shrink-0 text-right text-faint select-none">{i + 1}</span>
+          <span aria-hidden="true" class="w-4 shrink-0 text-right text-2xs text-faint select-none">{i + 1}</span>
           {#if mongo}
             {@const at = s.sql.indexOf(mongoMethod[s.kind]) + 1}
             <span class="min-w-0 whitespace-pre-wrap">{s.sql.slice(0, at)}<span class={kindTint[s.kind]}>{mongoMethod[s.kind].slice(1, -1)}</span>{s.sql.slice(at + mongoMethod[s.kind].length - 2)}</span>
+          {:else if redis}
+            <span class="min-w-0 whitespace-pre-wrap">{s.sql}</span>
           {:else}
             <span class="min-w-0 whitespace-pre-wrap"><span class={kindTint[s.kind]}>{s.kind}</span>{s.sql.slice(s.kind.length)}</span>
           {/if}
@@ -94,15 +102,15 @@
     {#snippet footer()}
       {#if mode === 'save'}
         {#if saving}
-          <span class="mr-auto flex items-center gap-2 text-[12.5px] text-muted"><LoaderCircle size={13} class="animate-spin text-accent" /> Saving changes…</span>
-          <button class="btn btn-secondary" onclick={oncancel}>Cancel</button>
+          <span class="mr-auto flex items-center gap-2 text-sm text-muted"><LoaderCircle size={13} class="motion-safe:animate-spin text-accent" /> Saving changes…</span>
+          <button class="btn btn-sm btn-secondary" data-autofocus onclick={oncancel}>Cancel</button>
         {:else}
-          <button class="btn btn-secondary" onclick={() => (mode = null)}>Cancel</button>
-          <button class="btn btn-primary" disabled={ackBlocked(prod, ack, false)} onclick={onsave}>Save {stmts.length} change{stmts.length === 1 ? '' : 's'}</button>
+          <button class="btn btn-sm btn-secondary" data-autofocus onclick={() => (mode = null)}>Cancel</button>
+          <button class="btn btn-sm btn-primary" disabled={ackBlocked(prod, ack, false)} onclick={onsave}>Save {stmts.length} change{stmts.length === 1 ? '' : 's'}</button>
         {/if}
       {:else}
-        <button class="btn btn-secondary" onclick={() => (mode = null)}>Close</button>
-        <button class="btn btn-primary" onclick={() => (mode = 'save')}>Save…</button>
+        <button class="btn btn-sm btn-secondary" data-autofocus onclick={() => (mode = null)}>Close</button>
+        <button class="btn btn-sm btn-primary" onclick={() => (mode = 'save')}>Save…</button>
       {/if}
     {/snippet}
   </Modal>

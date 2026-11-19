@@ -57,10 +57,7 @@ impl<'a> ExportFile<'a> {
         Self::write_to(path, Some((query_id, run))).await
     }
 
-    async fn write_to(
-        path: &Path,
-        run: Option<(String, RunGuard<'a>)>,
-    ) -> Result<Self, AppError> {
+    async fn write_to(path: &Path, run: Option<(String, RunGuard<'a>)>) -> Result<Self, AppError> {
         check_path(path)?;
         let tmp = temp_path(path);
         let out = BufWriter::new(tokio::fs::File::create(&tmp).await?);
@@ -82,6 +79,10 @@ impl<'a> ExportFile<'a> {
         self.run.as_ref().map(|(id, _)| id.as_str())
     }
 
+    pub(crate) fn cancellation_token(&self) -> Option<&tokio_util::sync::CancellationToken> {
+        self.run.as_ref().map(|(_, run)| &run.cancelled)
+    }
+
     pub async fn finish(mut self, rows: u64) -> Result<ExportResult, AppError> {
         let cancelled = self
             .run
@@ -92,6 +93,12 @@ impl<'a> ExportFile<'a> {
         }
         self.out.flush().await?;
         self.out.get_ref().sync_all().await?;
+        if self
+            .cancellation_token()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(AppError::cancelled());
+        }
         tokio::fs::rename(&self.tmp, &self.path).await?;
         self.done = true;
         Ok(ExportResult {

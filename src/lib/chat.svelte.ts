@@ -15,7 +15,7 @@ const KEY = 'sandb.chat.v1';
 const MAX_SESSIONS = 50;
 
 /** Kinds of steps saved before the backend sent them on the wire; a name from a newer build is `other`. */
-const LEGACY_KIND: Record<string, ToolKind> = { list_tables: 'list', describe_table: 'describe', run_read_query: 'read', run_mongo_read: 'read', render_chart: 'chart', render_mongo_chart: 'chart', propose_write: 'write', propose_mongo_write: 'write' };
+const LEGACY_KIND: Record<string, ToolKind> = { list_tables: 'list', describe_table: 'describe', run_read_query: 'read', run_mongo_read: 'read', run_redis_read: 'read', render_chart: 'chart', render_mongo_chart: 'chart', render_redis_chart: 'chart', propose_write: 'write', propose_mongo_write: 'write', propose_redis_write: 'write' };
 
 // A saved session can stop in the middle of a reply (the app closed). Its open steps can never finish.
 function normalize(list: (Session & { connId?: string })[]): Session[] {
@@ -180,6 +180,7 @@ export async function rerun(t: ToolPart) {
     t.rows = r.rows.slice(0, UI_ROWS).map((x) => Object.fromEntries(cols.map((c, i) => [c, x[i] as Cell])));
     t.truncated = r.truncated || r.rows.length > UI_ROWS;
     t.note = `${r.rows.length}${r.truncated ? ' (row limit reached)' : ''} row${r.rows.length === 1 ? '' : 's'} · ${r.elapsedMs} ms`;
+    if (r.notice) t.note += ` · ${r.notice}`;
     finish(t);
     logQuery({ conn, kind: 'READ', source: 'AI', sql: t.sql, result: { status: 'ok', rows: r.rows.length }, ms: t.ms ?? 0 });
   } catch (e) {
@@ -192,6 +193,16 @@ export async function rerun(t: ToolPart) {
   }
 }
 
+/** Puts a new chat first in the history and drops the oldest one past the cap. */
+function addSession(s: Session): Session {
+  chat.sessions.unshift(s);
+  if (chat.sessions.length > MAX_SESSIONS) {
+    const oldest = [...chat.sessions].sort((a, b) => a.updated - b.updated)[0];
+    chat.sessions = chat.sessions.filter((x) => x !== oldest);
+  }
+  return chat.sessions[0];
+}
+
 export async function send(text: string, skills?: string[]) {
   if (!text.trim() || chat.live) return;
   let s = current();
@@ -201,14 +212,9 @@ export async function send(text: string, skills?: string[]) {
   const picked = skills ?? skillsOf(s);
   const names = applicable(picked, sources.map((x) => connOf(x)!.engine));
   if (!s) {
-    chat.sessions.unshift({ id: crypto.randomUUID(), sources: sources.map((x) => ({ ...x })), title: text.trim(), updated: Date.now(), messages: [], skills: [...new Set(picked)] });
-    s = chat.sessions[0];
+    s = addSession({ id: crypto.randomUUID(), sources: sources.map((x) => ({ ...x })), title: text.trim(), updated: Date.now(), messages: [], skills: [...new Set(picked)] });
     chat.draft = null;
     chat.draftSkills = null;
-    if (chat.sessions.length > MAX_SESSIONS) {
-      const oldest = [...chat.sessions].sort((a, b) => a.updated - b.updated)[0];
-      chat.sessions = chat.sessions.filter((x) => x !== oldest);
-    }
   }
   chat.open = s.id;
   chat.live = s.id;
@@ -218,11 +224,40 @@ export async function send(text: string, skills?: string[]) {
   s.messages.push({ role: 'assistant', parts: [], started: Date.now() });
   const msg = s.messages[s.messages.length - 1];
   try {
-    await liveReply(msg, text, sources, history, names);
+    await liveReply(msg, text, sources, history, names, true);
   } finally {
     msg.ended = Date.now();
     chat.live = chat.pending = chat.cancel = chat.starting = null;
   }
+}
+
+/** One unattended question in a new chat: the assistant may only read. Returns null while another reply runs. */
+export async function runScheduledPrompt(input: { scheduleId: string; title: string; prompt: string; sources: Source[]; skills: string[] }): Promise<{ sessionId: string; ok: boolean; reply: string; error: string } | null> {
+  if (chat.live) return null;
+  const sources = input.sources.filter((x) => connOf(x));
+  // Pin the panel: without an open chat, the live session is the shown one; the open chat must not jump to it after the run.
+  if (chat.open === null) chat.open = current()?.id ?? '';
+  const names = applicable(input.skills, sources.map((x) => connOf(x)!.engine));
+  const s = addSession({ id: crypto.randomUUID(), sources: sources.map((x) => ({ ...x })), title: input.title, updated: Date.now(), messages: [], skills: [...new Set(input.skills)], scheduleId: input.scheduleId });
+  chat.live = s.id;
+  s.messages.push({ role: 'user', parts: [{ kind: 'text', text: input.prompt }], ...(names.length ? { skills: names } : {}) });
+  s.messages.push({ role: 'assistant', parts: [], started: Date.now() });
+  const msg = s.messages[s.messages.length - 1];
+  try {
+    await liveReply(msg, input.prompt, sources, [], names, false);
+  } finally {
+    msg.ended = Date.now();
+    chat.live = chat.pending = chat.cancel = chat.starting = null;
+  }
+  return {
+    sessionId: s.id,
+    ok: !msg.parts.some((p) => p.kind === 'error'),
+    reply: msg.parts
+      .flatMap((p) => (p.kind === 'text' ? [p.text] : []))
+      .join('\n\n')
+      .trim(),
+    error: msg.parts.find((p) => p.kind === 'error')?.text ?? '',
+  };
 }
 
 // Earlier turns as plain text: the user's message, or the assistant's text parts. Tool steps stay out.
@@ -240,7 +275,7 @@ function historyOf(messages: Msg[]): ChatRequest['history'] {
 const BLOCKED: Partial<Record<ErrorCode, true>> = { guard_rejected: true, write_blocked: true, read_only_violation: true, connection_read_only: true };
 
 // Real backends: the Rust tool loop streams its steps; this maps each event onto the reply's parts.
-async function liveReply(msg: Msg, text: string, sources: Source[], history: ChatRequest['history'], skills: string[]) {
+async function liveReply(msg: Msg, text: string, sources: Source[], history: ChatRequest['history'], skills: string[], writes: boolean) {
   const chatId = crypto.randomUUID();
   let stopped = false;
   let ended = false;
@@ -265,7 +300,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
   const conns = sources.map((x) => connOf(x)!);
   const request: ChatRequest = {
     chatId,
-    sources: sources.map((x, i) => ({ connId: x.connId, database: x.database, schema: null, allowWrites: conns[i].aiWrite && canWrite(conns[i]) })),
+    sources: sources.map((x, i) => ({ connId: x.connId, database: x.database, schema: null, allowWrites: writes && conns[i].aiWrite && canWrite(conns[i]) })),
     history,
     message: text,
     ...(skills.length ? { skills } : {}),
@@ -291,7 +326,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
         break;
       case 'tool_call': {
         if (chat.starting?.name === e.name) chat.starting = null;
-        const sql = typeof e.args.sql === 'string' ? e.args.sql : typeof e.args.query === 'string' ? e.args.query : typeof e.args.table === 'string' ? e.args.table : undefined;
+        const sql = typeof e.args.sql === 'string' ? e.args.sql : typeof e.args.query === 'string' ? e.args.query : typeof e.args.command === 'string' ? e.args.command : typeof e.args.table === 'string' ? e.args.table : undefined;
         const started = Date.now();
         const i = sourceIn(e.args);
         const source = i < 0 ? undefined : { ...sources[i] };
@@ -307,7 +342,6 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
         part.sql = e.sql;
         part.info = e.info;
         part.status = 'awaiting';
-        ui.chatOpen = true;
         // The backend waits for this decision; its `tool_result` follows.
         chat.pending = {
           resolve: (ok) => {
@@ -348,7 +382,7 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
           const ms = e.result?.ms ?? 0;
           const result: AuditResult = e.ok ? { status: 'ok', rows } : e.error?.code === 'write_denied' ? { status: 'denied' } : blocked ? { status: 'blocked' } : { status: 'error', message: e.error?.message ?? e.summary };
           logQuery({ conn, kind: 'WRITE', source: 'AI', sql: part.sql, result, ms: e.ok ? ms : 0 });
-          // An approved write can change the schema or create a collection the tree does not list.
+          // An approved write can change the schema or add an item to the catalog.
           if (e.ok) void afterWrite(conn, part.sql, part.source, part.info);
         }
         break;

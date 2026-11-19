@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::connections::Connection;
+use crate::core::engine::Family;
 use crate::core::error::{AppError, ErrorCode};
 
 /// Rows per result set unless the caller asks for more.
@@ -110,8 +111,7 @@ pub struct StatementResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub cell_types: Option<Vec<Vec<&'static str>>>,
-    /// MongoDB only: the database the statement ran in. A `use` earlier in the same run makes it
-    /// differ from the tab's database, and reruns and grid edits must go to this one.
+    /// MongoDB and Redis: the database after `use` or `SELECT`. Reruns and edits use this database.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub database: Option<String>,
@@ -177,6 +177,10 @@ pub struct AiReadResult {
     /// More rows exist than `max_rows`; they were not fetched.
     pub truncated: bool,
     pub elapsed_ms: u64,
+    /// Redis scan commands can return a cursor for the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub notice: Option<String>,
     /// MongoDB only: each document of the page as relaxed Extended JSON, one per row.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -197,8 +201,8 @@ pub fn timeout_error(limit: Duration) -> AppError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteResult {
-    /// Rows that all statements changed together.
-    pub affected: u64,
+    /// Number of rows or elements changed, if the command reports it.
+    pub affected: Option<u64>,
     pub elapsed_ms: u64,
 }
 
@@ -381,6 +385,18 @@ pub struct TableInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub partition_of: Option<String>,
+    /// Redis only: the key type. Here `row_estimate` holds the key length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub redis_type: Option<String>,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyList {
+    pub keys: Vec<TableInfo>,
+    pub truncated: bool,
 }
 
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -402,7 +418,7 @@ pub struct ColumnInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub frequency: Option<f64>,
-    /// MongoDB only: the number of documents in the sample the fields come from.
+    /// MongoDB and Redis only: the number of sampled documents or fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub sample_size: Option<u32>,
@@ -545,6 +561,22 @@ pub struct TableProperties {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub mongo: Option<MongoCollectionInfo>,
+    /// Redis only: key metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub redis: Option<RedisKeyInfo>,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisKeyInfo {
+    pub key_type: String,
+    pub encoding: Option<String>,
+    /// Time until expiration. `None` means no expiry.
+    pub ttl_ms: Option<i64>,
+    pub length: Option<i64>,
+    pub memory_bytes: Option<i64>,
 }
 
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -705,7 +737,7 @@ pub struct EditableResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub reason: Option<String>,
-    /// MongoDB only: whether the server has transactions (replica set or sharded cluster).
+    /// MongoDB and Redis: whether a save can apply as one batch.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub transactions: Option<bool>,
@@ -749,7 +781,7 @@ pub struct EditOperation {
     pub kind: EditKind,
     pub pk: std::collections::BTreeMap<String, CellValue>,
     pub set: std::collections::BTreeMap<String, CellValue>,
-    /// MongoDB update: path → typed value of the cell as it was loaded, for the conflict check.
+    /// MongoDB and Redis update/delete: the cell as it was loaded, for the conflict check.
     #[serde(default)]
     #[cfg_attr(test, ts(optional = nullable))]
     pub old: std::collections::BTreeMap<String, TypedValue>,
@@ -824,12 +856,11 @@ pub struct WriteStatement {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub table: Option<String>,
-    /// MongoDB only: the database the statement runs on, from the tab's database and following
-    /// `use`, so the confirmation names it even when `table` is absent (`db.dropDatabase()`).
+    /// MongoDB and Redis: the database the statement uses, including `use` or `SELECT` changes.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub database: Option<String>,
-    /// MongoDB only: the statement only reads. The editor asks for a confirmation before a run on
+    /// MongoDB and Redis: the statement only reads. The editor asks for a confirmation before a run on
     /// a Production connection when any statement has `read: false`.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
@@ -855,11 +886,15 @@ pub enum WarningCode {
     ExecutableComment,
     /// MongoDB: `renameCollection` cannot be undone.
     Rename,
-    /// MongoDB: the guard cannot say what the statement does.
+    /// MongoDB or Redis: the guard cannot say what the statement does.
     UnknownCommand,
     /// MySQL: a statement that commits implicitly (DDL, LOCK TABLES, SET autocommit, CALL, …),
     /// so the approved write does not run as one transaction.
     ImplicitCommit,
+    /// Redis: the command deletes every key in one or all databases.
+    Flush,
+    /// Redis: the command changes server state, not just data.
+    ServerAdmin,
 }
 
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -963,19 +998,29 @@ impl WriteOff {
 pub struct Engines {
     pub sql: bool,
     pub mongo: bool,
+    pub redis: bool,
 }
 
 impl Engines {
     pub fn of(sources: &[Source]) -> Self {
-        Self {
-            sql: sources.iter().any(|s| s.conn.engine.sql().is_some()),
-            mongo: sources.iter().any(|s| s.conn.engine.sql().is_none()),
+        let mut engines = Self {
+            sql: false,
+            mongo: false,
+            redis: false,
+        };
+        for source in sources {
+            match source.conn.engine.family() {
+                Family::Sql(_) => engines.sql = true,
+                Family::Mongo => engines.mongo = true,
+                Family::Redis => engines.redis = true,
+            }
         }
+        engines
     }
 
-    /// A chat with both kinds of source: each tool names the engine it serves.
+    /// A chat with at least two engine families.
     pub fn is_mixed(self) -> bool {
-        self.sql && self.mongo
+        usize::from(self.sql) + usize::from(self.mongo) + usize::from(self.redis) > 1
     }
 }
 

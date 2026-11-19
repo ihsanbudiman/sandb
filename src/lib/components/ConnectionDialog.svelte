@@ -1,13 +1,16 @@
 <script lang="ts">
-  import { LoaderCircle, KeyRound } from '@lucide/svelte';
+  import { Database, LoaderCircle, KeyRound } from '@lucide/svelte';
   import { untrack } from 'svelte';
   import { db, defaultDb, engines, envDot, sameTarget, type Conn, type Engine, type Env } from '../connections.svelte';
   import { active } from '../tabs.svelte';
   import { activeTab, setTabConn } from '../tabs.svelte';
-  import { api, errorText, type Connection, type ConnectionInput, type MongoUriParts, type SslMode, type Topology } from '../api';
+  import { api, errorText, type Connection, type ConnectionInput, type MongoUriParts, type RedisMode, type RedisSettings, type RedisUriParts, type SslMode, type Topology } from '../api';
   import { ask } from '../ask.svelte';
   import Modal from './Modal.svelte';
   import SafeguardDialog from './SafeguardDialog.svelte';
+  import EngineBadge from './ui/EngineBadge.svelte';
+  import Select from './ui/Select.svelte';
+  import Switch from './ui/Switch.svelte';
 
   // `conn` set: edit it, or, if its id is not in db.connections yet, save it as a new copy (duplicate).
   let {
@@ -26,6 +29,9 @@
     canupdate: (c: Conn, dbChanged: boolean) => boolean | Promise<boolean>;
   } = $props();
 
+  const redisDefaults: RedisSettings = { mode: 'standalone', sentinelMaster: '', sentinelAuth: false };
+  const sentinelPort = 26379;
+
   let engine = $state<Engine>('pg');
   let name = $state('');
   let host = $state('localhost');
@@ -38,10 +44,11 @@
   let env = $state<Env>('local');
   let aiWrite = $state(false);
   let readOnly = $state(false);
-  // MongoDB only: connect with the fields or with a connection string (`uri`, sent as typed, password included).
+  // MongoDB and standalone Redis accept a connection string (`uri`, sent as typed, password included).
   let mode = $state<'fields' | 'uri'>('fields');
   let uri = $state('');
   let authSource = $state('');
+  let redis = $state<RedisSettings>({ ...redisDefaults });
   let test = $state<'idle' | 'testing' | 'ok' | 'error'>('idle');
   let testMsg = $state('');
   // Version and topology from the last successful test, valid only while the connection fields match `testedSig`.
@@ -50,27 +57,33 @@
   let passwordDirty = $state(false);
   let saving = $state(false);
   let saveError = $state('');
-  // Bumped on every reset, so a test that finishes after close/reopen is ignored.
+  // A newer test or reset invalidates an in-flight test.
   let run = 0;
   // The backend's split of the typed string, without its password: the saved one is compared with it.
-  let uriParts = $state<MongoUriParts | null>(null);
+  let uriPreview = $state<{ engine: Engine; text: string; parts: MongoUriParts | RedisUriParts | null } | null>(null);
 
   const existing = $derived(conn ? db.connections.find((x) => x.id === conn.id) : undefined);
   const mongo = $derived(engine === 'mongo');
-  const useUri = $derived(mongo && mode === 'uri');
+  const redisEngine = $derived(engine === 'redis');
+  const multiHost = $derived(redisEngine && redis.mode !== 'standalone');
+  const sentinel = $derived(redisEngine && redis.mode === 'sentinel');
+  const useUri = $derived((mongo || (redisEngine && !multiHost)) && mode === 'uri');
 
-  const mongoUri = (s: string) => /^mongodb(\+srv)?:\/\//i.test(s.trim());
+  const validUri = $derived((redisEngine ? /^rediss?:\/\//i : /^mongodb(\+srv)?:\/\//i).test(uri.trim()));
+  const currentUriPreview = $derived(uriPreview?.engine === engine && uriPreview.text === uri.trim() ? uriPreview : null);
 
   $effect(() => {
-    const text = useUri ? uri.trim() : '';
+    const text = open && useUri && validUri ? uri.trim() : '';
     if (!text) {
-      uriParts = null;
+      uriPreview = null;
       return;
     }
+    const atEngine = engine;
+    const parseUri = redisEngine ? api.parseRedisUri : api.parseMongoUri;
     let gone = false;
     void (async () => {
-      const p = await api.parseMongoUri({ uri: text }).catch(() => null);
-      if (!gone) uriParts = p;
+      const parts = await parseUri({ uri: text }).catch(() => null);
+      if (!gone) uriPreview = { engine: atEngine, text, parts };
     })();
     return () => {
       gone = true;
@@ -86,8 +99,8 @@
   });
 
   // SafeguardDialog answers true; the connection changes only when the user saves.
-  async function toggleAi() {
-    if (aiWrite) return (aiWrite = false);
+  async function toggleAi(next: boolean) {
+    if (!next) return (aiWrite = false);
     if (readOnly) return;
     if (await ask<boolean>(SafeguardDialog, { conn: { engine, name: name.trim() || 'new connection', env, readOnly } })) aiWrite = true;
   }
@@ -109,10 +122,11 @@
       return;
     }
     engine = c.engine;
+    redis = { ...redisDefaults, ...c.redis };
     name = c.name;
     database = c.database;
     host = c.host || 'localhost';
-    port = c.port || engines[c.engine].port;
+    port = c.port || (sentinel ? sentinelPort : engines[c.engine].port);
     user = c.user;
     // The stored password is never sent to the UI.
     password = '';
@@ -124,6 +138,7 @@
     // The saved string has no password; the stored one is kept unless the user types one into it.
     uri = c.uri;
     mode = c.uri ? 'uri' : 'fields';
+    if (multiHost) mode = 'fields';
     authSource = c.authSource;
     resetStatus();
   }
@@ -139,37 +154,80 @@
   }
 
   // A read-only connection refuses AI writes too, so turning it on also turns AI write access off.
-  function toggleReadOnly() {
-    readOnly = !readOnly;
+  function toggleReadOnly(next: boolean) {
+    readOnly = next;
     if (readOnly) aiWrite = false;
   }
 
-  const engineList: Engine[] = ['pg', 'mysql', 'sqlite', 'mongo'];
+  const engineList: Engine[] = ['pg', 'mysql', 'sqlite', 'mongo', 'redis'];
   const envs: Env[] = ['local', 'staging', 'production'];
-  // MongoDB needs no database: a server lists its own.
-  const canSave = $derived(name.trim().length > 0 && (engine === 'sqlite' ? file.trim() : useUri ? mongoUri(uri) : host.trim() && (mongo || database.trim())));
+  const sslModes = [
+    { value: 'disable', label: 'Disable' },
+    { value: 'prefer', label: 'Prefer' },
+    { value: 'require', label: 'Require' },
+  ] as const;
+  // MongoDB and Redis have no Prefer mode.
+  const tlsModes = sslModes.filter(({ value }) => value !== 'prefer');
+  const connectMethods = [
+    { value: 'fields', label: 'Fields' },
+    { value: 'uri', label: 'Connection string' },
+  ] as const;
+  const fieldMethods = [connectMethods[0], { ...connectMethods[1], disabled: true }];
+  const deployments = [
+    { value: 'standalone', label: 'Standalone' },
+    { value: 'cluster', label: 'Cluster' },
+    { value: 'sentinel', label: 'Sentinel' },
+  ] as const;
+  // MongoDB can omit the database. Redis uses 0 by default.
+  const canSave = $derived.by(() => {
+    if (!name.trim()) return false;
+    if (engine === 'sqlite') return !!file.trim();
+    // Redis waits for its preview so Test and Save compare the redacted target, not stale fields.
+    if (useUri) return validUri && (!redisEngine || currentUriPreview !== null);
+    return !!host.trim() && (mongo || redisEngine || !!database.trim()) && (!sentinel || !!redis.sentinelMaster.trim());
+  });
 
   function setEngine(e: Engine) {
-    // MongoDB has no Prefer TLS mode; it starts with Disable.
-    if (e === 'mongo') ssl = 'disable';
-    else if (engine === 'mongo') ssl = 'prefer';
+    // MongoDB and Redis start with TLS disabled.
+    if (e === 'mongo' || e === 'redis') ssl = 'disable';
+    else if (mongo || redisEngine) ssl = 'prefer';
+    if (e === 'redis' || redisEngine) {
+      mode = 'fields';
+      uri = '';
+    }
+    if (e === 'redis') redis = { ...redisDefaults };
     engine = e;
     port = engines[e].port;
     user = e === 'pg' ? 'postgres' : e === 'mysql' ? 'root' : '';
     test = 'idle';
   }
 
+  function setDeployment(next: RedisMode) {
+    if (next === 'sentinel' && port === engines.redis.port) port = sentinelPort;
+    else if (sentinel && port === sentinelPort) port = engines.redis.port;
+    redis.mode = next;
+    if (next !== 'standalone') mode = 'fields';
+  }
+
+  function redisSettings(): RedisSettings | null {
+    if (!redisEngine) return null;
+    if (!sentinel) return { ...redisDefaults, mode: redis.mode };
+    return { mode: 'sentinel', sentinelMaster: redis.sentinelMaster.trim(), sentinelAuth: redis.sentinelAuth };
+  }
+
+  function redisDatabase(): string {
+    return redis.mode === 'cluster' ? '0' : (database.trim() || '0').replace(/^0+(?=\d+$)/, '');
+  }
+
   function input(): ConnectionInput & Pick<Connection, 'uri' | 'authSource'> {
-    return { name: name.trim(), engine, env, host: host.trim(), port: Number(port) || 0, database: database.trim(), user: user.trim(), ssl, file: file.trim(), aiWrite, readOnly, uri: useUri ? uri.trim() : '', authSource: mongo && !useUri ? authSource.trim() : '' };
+    return { name: name.trim(), engine, env, host: host.trim(), port: Number(port) || 0, database: redisEngine ? redisDatabase() : database.trim(), user: user.trim(), ssl, file: file.trim(), aiWrite, readOnly, uri: useUri ? uri.trim() : '', authSource: mongo && !useUri ? authSource.trim() : '', redis: redisSettings() };
   }
 
   // Fields that decide where the connection goes; a test result is stale once any of them changes.
-  const sig = $derived(JSON.stringify([engine, useUri, host, port, database, user, ssl, file, password, uri, authSource]));
+  const sig = $derived(JSON.stringify([engine, useUri, host, port, database, user, ssl, file, password, uri, authSource, redisSettings()]));
   $effect(() => {
     sig;
-    untrack(() => {
-      if (test === 'ok' || test === 'error') test = 'idle';
-    });
+    untrack(() => (test = 'idle'));
   });
 
   // null = keep the stored secret (edit) or the source's secret (duplicate).
@@ -181,15 +239,23 @@
     return password;
   }
 
-  // The id whose stored password a test may fall back to. SQLite has no password to fall back to. A changed
-  // connection string tests without it: its password, if the server needs one, goes into the string.
-  const secretId = () => (conn && !passwordDirty && engine !== 'sqlite' && !(useUri && targetChanged()) ? (existing ? conn.id : (conn.copyOf ?? null)) : null);
+  // Reuse a stored password only for the same target; SQLite has no password to reuse.
+  const secretId = () => (conn && !passwordDirty && engine !== 'sqlite' && !targetChanged() ? (existing ? conn.id : (conn.copyOf ?? null)) : null);
 
   /** Where the fields currently point, in the shape `sameTarget` compares (engine defaults included). */
   function typedTarget() {
-    const base = { engine, host: host.trim(), port: Number(port) || engines[engine].port, user: user.trim(), file: engine === 'sqlite' ? file.trim() : '', uri: '' };
+    const base = { engine, host: host.trim(), port: Number(port) || (sentinel ? sentinelPort : engines[engine].port), user: user.trim(), file: engine === 'sqlite' ? file.trim() : '', uri: '', redis: redisSettings(), database: redisEngine ? redisDatabase() : database.trim() };
+    if (!useUri) return base;
     // A typed string decides the target, and its password is not part of the saved one.
-    return useUri && uriParts ? { engine, host: uriParts.host, port: uriParts.port, user: uriParts.user, file: '', uri: uriParts.redacted } : base;
+    if (currentUriPreview?.parts) {
+      const { host, port, user, redacted, database } = currentUriPreview.parts;
+      return { ...base, host, port, user, uri: redacted, database };
+    }
+    if (conn && uri.trim() === conn.uri) {
+      const { host, port, user, uri, database } = conn;
+      return { ...base, host, port, user, uri, database };
+    }
+    return base;
   }
 
   // The backend refuses to send a stored password to another target; say so before the round trip.
@@ -198,8 +264,7 @@
     return !!src && !sameTarget(src, typedTarget());
   }
   const needsPassword = $derived(api.capabilities.secretStorage !== 'none' && engine !== 'sqlite' && !useUri && !!conn && !passwordDirty && targetChanged());
-  // The two failures the dialog can show at once, one on each line.
-  const failed = $derived([test === 'error' && testMsg ? `Test: ${testMsg}` : '', saveError ? `Save failed: ${saveError}` : ''].filter(Boolean).join('\n') || null);
+  const failed = $derived(saveError ? `Save failed: ${saveError}` : null);
 
   async function runTest() {
     if (needsPassword) {
@@ -210,7 +275,7 @@
     test = 'testing';
     testMsg = '';
     const at = sig;
-    const mine = run;
+    const mine = ++run;
     try {
       const r = await api.testConnection({ input: input(), password: passwordArg(), id: secretId() });
       if (mine !== run || at !== sig || test !== 'testing') return;
@@ -280,9 +345,10 @@
       return;
     }
     const next = payload();
-    const nextDb = defaultDb(next);
+    const target = typedTarget();
+    const nextDb = redisEngine ? target.database : defaultDb(next);
     // Only a change of target or database touches the open result; name, env and AI access do not.
-    const dbChanged = cur.database !== nextDb || !sameTarget(cur, typedTarget());
+    const dbChanged = cur.database !== nextDb || !sameTarget(cur, target);
     if (dbChanged && cur.id === active().id && !(await canswitch())) return;
     if (!(await canupdate(cur, dbChanged))) return;
     saving = true;
@@ -308,31 +374,32 @@
   <Modal
     title={!conn ? 'New connection' : existing ? 'Edit connection' : 'Duplicate connection'}
     width="max-w-lg"
-    class="flex max-h-[calc(100dvh-2rem)] flex-col"
-    bodyClass="flex-1 space-y-4 overflow-auto pb-5"
-    footClass="border-t border-line py-3"
+    class="flex max-h-[calc(100dvh-2rem)] flex-col [&>header]:shrink-0"
+    bodyClass="min-h-0 flex-1 space-y-4 overflow-y-auto pb-5"
+    footClass="min-h-12 shrink-0 border-t border-line py-3"
     closable
     busy={saving}
     error={failed}
     onclose={close}
   >
-        <p class="-mt-2 text-[12.5px] text-muted">{conn ? `${engines[engine].label} · the engine of a saved connection cannot change.` : 'Connect to a PostgreSQL, MySQL, SQLite or MongoDB database.'}</p>
+        {#snippet head()}<Database size={15} class="text-accent" />{/snippet}
+        <p class="-mt-2 text-sm text-muted">{conn ? `${engines[engine].label} · the engine of a saved connection cannot change.` : 'Connect to a PostgreSQL, MySQL, SQLite, MongoDB or Redis database.'}</p>
 
-        <div class="grid grid-cols-4 gap-2">
+        <div class="grid grid-cols-3 gap-2">
           {#each engineList as e}
             <button
-              class="flex flex-col items-start gap-1 rounded-lg border px-3 py-2.5 text-left transition disabled:cursor-not-allowed {engine === e ? 'border-accent/70 bg-accent/6 ring-3 ring-accent/12' : conn ? 'border-line opacity-40' : 'border-line hover:bg-hover'}"
+              class="focus-ring flex flex-col items-start gap-1 rounded-lg border px-3 py-2.5 text-left motion-safe:transition-colors disabled:cursor-not-allowed {engine === e ? 'border-accent/70 bg-accent/10 ring-3 ring-accent/12' : conn ? 'border-line opacity-40' : 'border-line hover:bg-hover'}"
               disabled={!!conn}
               title={conn && engine !== e ? 'Engine cannot be changed' : undefined}
               onclick={() => setEngine(e)}
             >
-              <span class="font-mono text-[10.5px] font-semibold {engines[e].badge}">{engines[e].short}</span>
-              <span class="text-[13px] font-medium">{engines[e].label}</span>
+              <EngineBadge engine={e} />
+              <span class="text-base font-medium">{engines[e].label}</span>
             </button>
           {/each}
         </div>
 
-        <label class="block">{@render field('Name')}<input class="input" bind:value={name} placeholder="e.g. billing-prod" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+        <label class="block">{@render field('Name')}<input class="input input-sm" data-autofocus bind:value={name} placeholder="e.g. billing-prod" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
 
         <!-- Above the target fields so Environment and Read-only stay in view on short windows; the body still scrolls. -->
         <div class="space-y-2">
@@ -349,105 +416,105 @@
           <div class="flex items-center gap-3 pt-1">
             <div class="flex-1">
               <div class="font-medium">Read-only</div>
-              <div class="text-[12.5px] text-muted">Blocks all writes, including your own queries</div>
+              <div class="text-sm text-muted">Blocks all writes, including your own queries</div>
             </div>
-            <button
-              role="switch"
-              aria-checked={readOnly}
-              aria-label="Read-only connection"
-              class="relative h-5 w-9 shrink-0 rounded-full transition {readOnly ? 'bg-accent' : 'bg-stone-500'}"
-              onclick={toggleReadOnly}
-            >
-              <span class="absolute top-0.5 left-0.5 size-4 rounded-full bg-white shadow transition {readOnly ? 'translate-x-4' : ''}"></span>
-            </button>
+            <Switch checked={readOnly} aria-label="Read-only connection" onchange={toggleReadOnly} />
           </div>
-          {#if mongo && readOnly}<p class="text-[12px] text-amber-700 dark:text-amber-400">Use a database user with the read role for full protection.</p>{/if}
+          {#if mongo && readOnly}<p class="text-sm text-warn">Use a database user with the read role for full protection.</p>{/if}
+          {#if redisEngine && readOnly}<p class="text-sm text-warn">Redis has no read-only session. Use an ACL user without write commands (for example +@read) for full protection.</p>{/if}
         </div>
 
         {#if engine === 'sqlite'}
-          <label class="block">{@render field('Database file')}<input class="input font-mono" bind:value={file} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+          <label class="block">{@render field('Database file')}<input class="input input-sm" bind:value={file} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
         {:else}
-          {#if mongo}
+          {#if redisEngine}
             <div>
-              {@render field('Connect with')}
-              <div class="seg flex">
-                <button class="seg-item flex flex-1 items-center justify-center {mode === 'fields' ? 'seg-on' : ''}" aria-pressed={mode === 'fields'} onclick={() => (mode = 'fields')}>Fields</button>
-                <button class="seg-item flex flex-1 items-center justify-center {mode === 'uri' ? 'seg-on' : ''}" aria-pressed={mode === 'uri'} onclick={() => (mode = 'uri')}>Connection string</button>
-              </div>
+              <label for="redis-deployment" class="label mb-1.5 block">Deployment</label>
+              <Select id="redis-deployment" aria-label="Deployment" size="sm" value={redis.mode} options={deployments} onchange={setDeployment} />
+            </div>
+          {/if}
+          {#if mongo || redisEngine}
+            <div>
+              <label for="connection-auth" class="label mb-1.5 block">Connect with</label>
+              <Select id="connection-auth" aria-label="Connect with" size="sm" bind:value={mode} options={multiHost ? fieldMethods : connectMethods} />
+              {#if multiHost}<p class="mt-1.5 text-xs text-faint">Connection strings are available only for Standalone.</p>{/if}
             </div>
           {/if}
           {#if useUri}
-            <label class="block">{@render field('Connection string')}<input class="input font-mono" bind:value={uri} placeholder="mongodb+srv://user:password@cluster0.example.net/app" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-            {#if uri.trim() && !mongoUri(uri)}<p class="text-[12px] text-amber-700 dark:text-amber-400">The string must start with mongodb:// or mongodb+srv://.</p>{/if}
-            <p class="flex items-center gap-1.5 text-[12px] text-faint"><KeyRound size={12} class="shrink-0" /> A password in the string is saved encrypted in sandb's data folder; the connections file keeps the string without it.</p>
+            <label class="block">{@render field('Connection string')}<input class="input input-sm font-mono" bind:value={uri} placeholder={redisEngine ? 'redis://user:password@localhost:6379/0' : 'mongodb+srv://user:password@cluster0.example.net/app'} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+            {#if uri.trim() && !validUri}<p class="text-sm text-warn">{redisEngine ? 'The string must start with redis:// or rediss://.' : 'The string must start with mongodb:// or mongodb+srv://.'}</p>{/if}
+            <p class="flex items-center gap-1.5 text-xs text-faint"><KeyRound size={12} class="shrink-0" /> A password in the string is saved encrypted in sandb's data folder; the connections file keeps the string without it.</p>
           {:else}
             <div class="grid grid-cols-[1fr_96px] gap-2">
-              <label class="block">{@render field('Host')}<input class="input font-mono" bind:value={host} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-              <label class="block">{@render field('Port')}<input class="input font-mono tabular-nums" type="number" bind:value={port} /></label>
+              <label class="block">{@render field(multiHost ? 'Hosts' : 'Host')}<input class="input input-sm font-mono" bind:value={host} placeholder={multiHost ? '10.0.0.1:6379, 10.0.0.2:6379' : undefined} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+              <label class="block">{@render field('Port')}<input class="input input-sm font-mono tabular-nums" type="number" bind:value={port} /></label>
             </div>
-            <label class="block">{@render field('Database')}<input class="input font-mono" bind:value={database} placeholder={mongo ? 'optional' : 'app'} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+            {#if sentinel}
+              <label class="block">{@render field('Master name')}<input class="input input-sm" bind:value={redis.sentinelMaster} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+              <div class="flex items-center gap-3">
+                <div class="flex-1 font-medium">Sentinels use the same user and password</div>
+                <Switch checked={redis.sentinelAuth} aria-label="Sentinels use the same user and password" onchange={(next) => (redis.sentinelAuth = next)} />
+              </div>
+            {/if}
+            {#if !redisEngine || redis.mode !== 'cluster'}
+              <label class="block">{@render field('Database')}<input class="input input-sm" bind:value={database} placeholder={redisEngine ? '0' : mongo ? 'optional' : 'app'} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+            {/if}
             <div class="grid grid-cols-2 gap-2">
-              <label class="block">{@render field('User')}<input class="input font-mono" bind:value={user} placeholder={mongo ? 'optional' : undefined} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-              <label class="block">{@render field('Password')}<input class="input font-mono" type="password" bind:value={password} oninput={() => (passwordDirty = true)} placeholder={conn && !passwordDirty && api.capabilities.secretStorage !== 'none' ? 'Saved · type to replace' : '••••••••'} /></label>
+              <label class="block">{@render field('User')}<input class="input input-sm" bind:value={user} placeholder={redisEngine ? 'optional (ACL user)' : mongo ? 'optional' : undefined} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+              <label class="block">{@render field('Password')}<input class="input input-sm" type="password" bind:value={password} oninput={() => (passwordDirty = true)} placeholder={conn && !passwordDirty && api.capabilities.secretStorage !== 'none' ? 'Saved · type to replace' : '••••••••'} /></label>
             </div>
-            {#if mongo}
-              <div class="grid grid-cols-2 gap-2">
-                <label class="block">{@render field('Auth source')}<input class="input font-mono" bind:value={authSource} placeholder="optional, e.g. admin" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-                <!-- MongoDB has no Prefer mode. -->
-                <label class="block">{@render field('TLS')}
-                  <select class="input font-mono" bind:value={ssl}>
-                    <option value="disable">Disable</option>
-                    <option value="require">Require</option>
-                  </select>
-                </label>
+            {#if mongo || redisEngine}
+              <div class={mongo ? 'grid grid-cols-2 gap-2' : undefined}>
+                {#if mongo}<label class="block">{@render field('Auth source')}<input class="input input-sm" bind:value={authSource} placeholder="optional, e.g. admin" autocapitalize="off" spellcheck="false" autocomplete="off" /></label>{/if}
+                <div>
+                  <label for="connection-tls" class="label mb-1.5 block">TLS</label>
+                  <Select id="connection-tls" aria-label="TLS" size="sm" bind:value={ssl} options={tlsModes} />
+                </div>
               </div>
             {:else}
-              <label class="block">{@render field('SSL mode')}
-                <select class="input font-mono" bind:value={ssl}>
-                  <option value="disable">Disable</option>
-                  <option value="prefer">Prefer</option>
-                  <option value="require">Require</option>
-                </select>
-              </label>
+              <div>
+                <label for="connection-ssl" class="label mb-1.5 block">SSL mode</label>
+                <Select id="connection-ssl" aria-label="SSL mode" size="sm" bind:value={ssl} options={sslModes} />
+              </div>
             {/if}
-            {#if needsPassword}<p class="text-[12px] text-amber-700 dark:text-amber-400">Enter the password to test changed connection settings.</p>{/if}
-            <p class="flex items-center gap-1.5 text-[12px] text-faint"><KeyRound size={12} /> The password is saved encrypted in sandb's data folder, not in the connections file.</p>
+            {#if needsPassword}<p class="text-sm text-warn">Enter the password to test changed connection settings.</p>{/if}
+            <p class="flex items-center gap-1.5 text-xs text-faint"><KeyRound size={12} class="shrink-0" /> The password is saved encrypted in sandb's data folder, not in the connections file.</p>
           {/if}
         {/if}
 
         <div class="flex items-center gap-3 border-t border-line pt-4 {readOnly ? 'opacity-60' : ''}">
           <div class="flex-1">
             <div class="font-medium">AI write access</div>
-            <div class="text-[12.5px] text-muted">{readOnly ? 'Off while the connection is read-only.' : 'Off: the assistant can only read. On: it can propose writes, and you approve each one.'}</div>
+            <div class="text-sm text-muted">{readOnly ? 'Off while the connection is read-only.' : 'Off: the assistant can only read. On: it can propose writes, and you approve each one.'}</div>
           </div>
-          <button
-            role="switch"
-            aria-checked={aiWrite}
+          <Switch
+            checked={aiWrite}
             aria-label="AI write access"
-            class="relative h-5 w-9 shrink-0 rounded-full transition disabled:cursor-not-allowed {aiWrite ? 'bg-amber-500' : 'bg-stone-500'}"
+            tone="warn"
             disabled={readOnly}
             title={readOnly ? 'Turn off read-only to allow AI writes' : undefined}
-            onclick={toggleAi}
-          >
-            <span class="absolute top-0.5 left-0.5 size-4 rounded-full bg-white shadow transition {aiWrite ? 'translate-x-4' : ''}"></span>
-          </button>
+            onchange={toggleAi}
+          />
         </div>
 
     {#snippet footer()}
-        <button class="btn btn-secondary" onclick={runTest} disabled={test === 'testing' || saving || !canSave}>Test connection</button>
-        <span class="min-w-0 flex-1 truncate text-[12px]">
-          {#if test === 'testing'}
-            <span class="flex items-center gap-1.5 text-muted"><LoaderCircle size={13} class="animate-spin" /> Connecting…</span>
-          {:else if test === 'ok'}
-            <span class="flex items-center gap-1.5" title={testMsg}><span class="size-1.5 shrink-0 rounded-full bg-emerald-500"></span><span class="sr-only">Succeeded:</span><span class="truncate text-muted">{testMsg}</span></span>
-          {:else if test === 'error'}
-            <span class="flex items-center gap-1.5" title={testMsg}><span class="size-1.5 shrink-0 rounded-full bg-red-500"></span><span class="sr-only">Error:</span><span class="truncate text-red-700 dark:text-red-400">Connection failed</span></span>
-          {/if}
-        </span>
-        <button class="btn btn-ghost" onclick={close}>Cancel</button>
-        <button class="btn btn-primary" onclick={save} disabled={!canSave || saving}>
-          {#if saving}<LoaderCircle size={13} class="animate-spin" />{/if} Save
-        </button>
+      <button class="btn btn-sm btn-secondary" onclick={runTest} disabled={test === 'testing' || saving || !canSave}>Test connection</button>
+      <div class="min-w-0 flex-1 text-xs" role="status">
+        {#if test === 'testing'}
+          <span class="flex items-center gap-1.5 text-muted"><LoaderCircle size={12} class="shrink-0 motion-safe:animate-spin" /> Connecting…</span>
+        {:else if test === 'ok' || test === 'error'}
+          <div class="flex items-start gap-1.5 {test === 'ok' ? 'text-ok' : 'text-danger'}" title={testMsg}>
+            <span class="mt-1.5 size-1.5 shrink-0 rounded-full bg-current"></span>
+            <span class="min-w-0 max-h-16 overflow-y-auto break-words">
+              {#if test === 'error'}<span class="sr-only">Connection failed: </span>{/if}{testMsg}
+            </span>
+          </div>
+        {/if}
+      </div>
+      <button class="btn btn-sm btn-ghost" onclick={close}>Cancel</button>
+      <button class="btn btn-sm btn-primary" onclick={save} disabled={!canSave || saving}>
+        {#if saving}<LoaderCircle size={12} class="motion-safe:animate-spin" />{/if} Save
+      </button>
     {/snippet}
   </Modal>
 {/if}

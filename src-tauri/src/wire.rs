@@ -17,7 +17,7 @@ use crate::core::ai::skills::SKILLS;
 use crate::core::ai::tools::{CHART_ROWS, CHART_TYPES, UI_ROWS};
 use crate::core::cell::PREVIEW_BYTES;
 use crate::core::connections::{
-    Connection, ConnectionInput, Env, SslMode, TestResult, Topology,
+    Connection, ConnectionInput, Env, RedisMode, RedisSettings, SslMode, TestResult, Topology,
 };
 use crate::core::db::export::conflict_text;
 use crate::core::db::session::TabStatus;
@@ -26,16 +26,20 @@ use crate::core::error::{AppError, ErrorCode};
 use crate::core::mcp::{DEFAULT_MCP_PORT, McpSettings, McpStatus};
 use crate::core::mongo::parse::{COLLECTION_METHODS, CURSOR_METHODS, DB_METHODS};
 use crate::core::mongo::value::WRITABLE_TYPES;
+use crate::core::redis::VIEW_MAX_ELEMENTS;
+use crate::core::redis::command::{self, COMMANDS, Kind};
+use crate::core::redis::conn::RedisUriParts;
 use crate::core::result::{
     AiReadResult, ApplyEditsRequest, ApplyEditsResult, CellValue, CellValueRequest, ChartSpec,
     ColumnInfo, ColumnMeta, ConstraintInfo, ConstraintKind, DEFAULT_LIMIT, DEFAULT_MAX_ROWS,
     DEFAULT_TIMEOUT, DocumentExportRequest, DocumentFormat, EditFailure, EditKind, EditOperation,
     EditableRequest, EditableResult, EjsonFlavor, ExportRequest, ExportResult, ForeignKeyInfo,
-    GuardCheck, IndexInfo, InsertMode, MAX_LIMIT, MAX_ROWS_PER_STATEMENT, MongoCollectionInfo,
-    MongoCollectionKind, MongoCollectionStats, MongoIndexInfo, QueryProgress, QueryRun, RunRequest,
-    RunSort, SNAPSHOT_MAX_COLUMNS, SNAPSHOT_MAX_TABLES, SchemaSnapshot, SnapshotColumn,
-    SnapshotTable, SqlExportRequest, SqlOptions, StatementResult, TableExportRequest, TableInfo,
-    TableKind, TableProperties, TypedValue, WarningCode, WriteInfo, WriteStatement, WriteWarning,
+    GuardCheck, IndexInfo, InsertMode, KeyList, MAX_LIMIT, MAX_ROWS_PER_STATEMENT,
+    MongoCollectionInfo, MongoCollectionKind, MongoCollectionStats, MongoIndexInfo, QueryProgress,
+    QueryRun, RedisKeyInfo, RunRequest, RunSort, SNAPSHOT_MAX_COLUMNS, SNAPSHOT_MAX_TABLES,
+    SchemaSnapshot, SnapshotColumn, SnapshotTable, SqlExportRequest, SqlOptions, StatementResult,
+    TableExportRequest, TableInfo, TableKind, TableProperties, TypedValue, WarningCode, WriteInfo,
+    WriteStatement, WriteWarning,
 };
 use crate::commands::MongoUriParts;
 
@@ -82,6 +86,7 @@ fn types(cfg: &ts_rs::Config) -> Vec<(String, String)> {
         decl::<GuardCheck>(cfg),
         decl::<IndexInfo>(cfg),
         decl::<InsertMode>(cfg),
+        decl::<KeyList>(cfg),
         decl::<McpSettings>(cfg),
         decl::<McpStatus>(cfg),
         decl::<MongoCollectionInfo>(cfg),
@@ -92,6 +97,10 @@ fn types(cfg: &ts_rs::Config) -> Vec<(String, String)> {
         decl::<Privacy>(cfg),
         decl::<Provider>(cfg),
         decl::<QueryProgress>(cfg),
+        decl::<RedisKeyInfo>(cfg),
+        decl::<RedisMode>(cfg),
+        decl::<RedisSettings>(cfg),
+        decl::<RedisUriParts>(cfg),
         decl::<QueryRun>(cfg),
         decl::<RunRequest>(cfg),
         decl::<RunSort>(cfg),
@@ -165,6 +174,28 @@ fn skills() -> String {
     serde_json::Value::from(list).to_string()
 }
 
+fn redis_command_specs() -> String {
+    let specs: Vec<_> = COMMANDS
+        .iter()
+        .map(|spec| {
+            let kind = match spec.kind {
+                Kind::Read => "read",
+                Kind::Write => "write",
+                Kind::Flush => "flush",
+                Kind::Admin => "admin",
+                Kind::Script => "script",
+                Kind::Select => "select",
+                Kind::Unknown => "unknown",
+                Kind::Unsupported(reason) => {
+                    return serde_json::json!([spec.name, "unsupported", spec.first_key, reason]);
+                }
+            };
+            serde_json::json!([spec.name, kind, spec.first_key])
+        })
+        .collect();
+    format!("{} as const", serde_json::Value::Array(specs))
+}
+
 fn constants() -> String {
     [
         ("PREVIEW_BYTES", PREVIEW_BYTES.to_string()),
@@ -189,6 +220,9 @@ fn constants() -> String {
         ("MONGOSH_CURSOR_METHODS", js_strings(CURSOR_METHODS)),
         ("MONGOSH_DB_METHODS", js_strings(DB_METHODS)),
         ("MONGO_WRITABLE_TYPES", js_strings(WRITABLE_TYPES)),
+        ("REDIS_COMMANDS", js_strings(&command::names())),
+        ("REDIS_COMMAND_SPECS", redis_command_specs()),
+        ("REDIS_VIEW_MAX_ELEMENTS", VIEW_MAX_ELEMENTS.to_string()),
         ("EXPORT_CONFLICT", export_conflict()),
         ("SKILLS", skills()),
     ]

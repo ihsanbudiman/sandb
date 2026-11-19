@@ -27,13 +27,13 @@ function mongoMethod(part: string): { coll?: string; method: string } | null {
   return { coll: m[2] ?? m[1].slice(1, -1).replace(/\\(["'\\])/g, '$1'), method: m[3] };
 }
 
-function statements(engine: Engine, sql: string): string[] {
+function statements(engine: Exclude<Engine, 'redis'>, sql: string): string[] {
   return engine === 'mongo'
     ? sql.split(';').map((p) => p.trim()).filter((p) => p.replace(/\/\/.*$/gm, '').trim())
     : sql.split(';').map((p) => p.trim()).filter((p) => statementKind(p) !== 'empty');
 }
 
-export function guard(engine: Engine, sql: string): GuardCheck {
+export function guard(engine: Exclude<Engine, 'redis'>, sql: string): GuardCheck {
   const parts = statements(engine, sql);
   if (parts.length !== 1) return { allowed: false, reason: parts.length ? `Exactly one statement is allowed, found ${parts.length}` : 'The query is empty' };
   if (engine === 'mongo') {
@@ -47,7 +47,7 @@ export function guard(engine: Engine, sql: string): GuardCheck {
   return { allowed: true, kind: first === 'with' ? 'SELECT' : first.toUpperCase() };
 }
 
-export function classify(engine: Engine, sql: string, database?: string | null): WriteInfo {
+export function classify(engine: Exclude<Engine, 'redis'>, sql: string, database?: string | null): WriteInfo {
   const parts = statements(engine, sql);
   const info: WriteInfo = { statements: [], warnings: [] };
   if (parts.length > 1) info.warnings.push({ code: 'multiple_statements', message: `${parts.length} statements will run` });

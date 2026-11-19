@@ -1,6 +1,6 @@
 [package]
 name = "sandb"
-version = "0.14.0"
+version = "0.15.0"
 description = "Light database client with a BYOK AI chat"
 edition = "2024"
 rust-version = "1.90"
@@ -50,6 +50,7 @@ tauri-plugin-dialog = "2"
 libsqlite3-sys = { version = "0.30", default-features = false }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+tauri-plugin-notification = "2"
 # AI client. The same reqwest and rustls builds as the updater uses, so nothing new is compiled.
 reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -59,6 +60,8 @@ keyring = "4.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # MongoDB engine. Default features: rustls with ring (as above) and the DNS resolver for `mongodb+srv://`.
 mongodb = "3.10"
+redis = { version = "1.8", default-features = false, features = ["tokio-rustls-comp", "tls-rustls-webpki-roots", "cluster-async", "sentinel", "script"] }
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

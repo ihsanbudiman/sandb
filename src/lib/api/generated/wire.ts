@@ -11,6 +11,7 @@ export type CommandName =
   | "approve_write"
   | "deny_write"
   | "parse_mongo_uri"
+  | "parse_redis_uri"
   | "create_connection"
   | "update_connection"
   | "duplicate_connection"
@@ -20,6 +21,7 @@ export type CommandName =
   | "list_databases"
   | "list_schemas"
   | "list_tables"
+  | "list_keys"
   | "list_columns"
   | "table_properties"
   | "table_ddl"
@@ -34,6 +36,7 @@ export type CommandName =
   | "tab_status"
   | "close_tab_session"
   | "run_ai_read"
+  | "run_scheduled_read"
   | "get_ai_settings"
   | "save_ai_settings"
   | "set_ai_key"
@@ -56,6 +59,10 @@ export type AiReadResult = { columns: Array<ColumnMeta>, rows: Array<Array<JsonV
  * More rows exist than `max_rows`; they were not fetched.
  */
 truncated: boolean, elapsedMs: number, 
+/**
+ * Redis scan commands can return a cursor for the next page.
+ */
+notice?: string, 
 /**
  * MongoDB only: each document of the page as relaxed Extended JSON, one per row.
  */
@@ -197,7 +204,7 @@ pkOrdinal?: number,
  */
 frequency?: number, 
 /**
- * MongoDB only: the number of documents in the sample the fields come from.
+ * MongoDB and Redis only: the number of sampled documents or fields.
  */
 sampleSize?: number, };
 
@@ -228,7 +235,7 @@ file: string, aiWrite: boolean,
  */
 readOnly: boolean, 
 /**
- * MongoDB connection string WITHOUT the password; empty when the fields are used. The
+ * MongoDB or Redis connection string WITHOUT the password; empty when fields are used. The
  * password of the string lives in the secret store, like every other password.
  */
 uri: string, 
@@ -239,18 +246,22 @@ authSource: string,
 /**
  * MongoDB only, from the last successful test.
  */
-topology: Topology | null, };
+topology: Topology | null, 
+/**
+ * Redis only.
+ */
+redis: RedisSettings | null, };
 
 export type ConnectionInput = { name: string, engine: Engine, env?: Env, host?: string, port?: number, database?: string, user?: string, ssl?: SslMode, file?: string, aiWrite?: boolean, readOnly?: boolean, 
 /**
- * MongoDB connection string as typed, password included: `catalog::normalize` takes the
- * password out.
+ * MongoDB or Redis connection string as typed, password included: `catalog::normalize`
+ * takes the password out.
  */
 uri?: string, authSource?: string, 
 /**
  * Topology reported by a test run in the dialog. `None` keeps the stored one.
  */
-topology?: Topology | null, 
+topology?: Topology | null, redis?: RedisSettings | null, 
 /**
  * Version reported by a test run in the dialog. `None` keeps the stored one.
  */
@@ -286,7 +297,7 @@ export type EditKind = "update" | "insert" | "delete";
 
 export type EditOperation = { key: string, kind: EditKind, pk: { [key in string]: JsonValue }, set: { [key in string]: JsonValue }, 
 /**
- * MongoDB update: path → typed value of the cell as it was loaded, for the conflict check.
+ * MongoDB and Redis update/delete: the cell as it was loaded, for the conflict check.
  */
 old?: { [key in string]: TypedValue }, 
 /**
@@ -298,7 +309,7 @@ export type EditableRequest = { connId: string, database: string, sql: string, }
 
 export type EditableResult = { table?: string, schema?: string, pk: Array<string>, reason?: string, 
 /**
- * MongoDB only: whether the server has transactions (replica set or sharded cluster).
+ * MongoDB and Redis: whether a save can apply as one batch.
  */
 transactions?: boolean, };
 
@@ -306,7 +317,7 @@ export type EditableResultArgs = { request: EditableRequest, };
 
 export type EjsonFlavor = "relaxed" | "canonical";
 
-export type Engine = "pg" | "mysql" | "sqlite" | "mongo";
+export type Engine = "pg" | "mysql" | "sqlite" | "mongo" | "redis";
 
 export type Env = "production" | "staging" | "local";
 
@@ -372,6 +383,8 @@ export type InsertMode = "insert" | "skip" | "upsert";
 
 export type JsonValue = number | string | boolean | Array<JsonValue> | { [key in string]: JsonValue } | null;
 
+export type KeyList = { keys: Array<TableInfo>, truncated: boolean, };
+
 export type ListAiModelsArgs = { settings: AiSettings, key: string | null, };
 
 export type ListColumnsArgs = { connId: string, database: string, schema: string | null, table: string, };
@@ -379,6 +392,8 @@ export type ListColumnsArgs = { connId: string, database: string, schema: string
 export type ListConnectionsArgs = Record<symbol, never>;
 
 export type ListDatabasesArgs = { connId: string, };
+
+export type ListKeysArgs = { connId: string, database: string, pattern: string, limit: number | null, };
 
 export type ListSchemasArgs = { connId: string, database: string, };
 
@@ -458,6 +473,8 @@ host: string, port: number, user: string, database: string, authSource: string, 
 
 export type ParseMongoUriArgs = { uri: string, };
 
+export type ParseRedisUriArgs = { uri: string, };
+
 export type Privacy = "results" | "schema";
 
 export type Provider = "openai" | "anthropic";
@@ -467,6 +484,18 @@ export type QueryProgress = { done: number, total: number, };
 export type QueryProgressArgs = { queryId: string, };
 
 export type QueryRun = { statements: Array<StatementResult>, notices?: Array<string>, elapsedMs: number, };
+
+export type RedisKeyInfo = { keyType: string, encoding: string | null, 
+/**
+ * Time until expiration. `None` means no expiry.
+ */
+ttlMs: number | null, length: number | null, memoryBytes: number | null, };
+
+export type RedisMode = "standalone" | "cluster" | "sentinel";
+
+export type RedisSettings = { mode: RedisMode, sentinelMaster: string, sentinelAuth: boolean, };
+
+export type RedisUriParts = { redacted: string, host: string, port: number, user: string, database: string, ssl: SslMode, };
 
 export type ReorderConnectionsArgs = { ids: Array<string>, };
 
@@ -494,6 +523,8 @@ tabId?: string | null,
  * Server-side ordering for one read result. The original SQL remains the result's source.
  */
 sort?: RunSort | null, };
+
+export type RunScheduledReadArgs = { connId: string, database: string | null, sql: string, maxRows: number, };
 
 export type RunSort = { column: string, columnIndex: number, ascending: boolean, };
 
@@ -574,8 +605,7 @@ documents?: Array<JsonValue>,
  */
 cellTypes?: Array<Array<string>>, 
 /**
- * MongoDB only: the database the statement ran in. A `use` earlier in the same run makes it
- * differ from the tab's database, and reruns and grid edits must go to this one.
+ * MongoDB and Redis: the database after `use` or `SELECT`. Reruns and edits use this database.
  */
 database?: string, };
 
@@ -611,7 +641,11 @@ hasRowid?: boolean,
 /**
  * PG only: the parent table when this table is a partition.
  */
-partitionOf?: string, };
+partitionOf?: string, 
+/**
+ * Redis only: the key type. Here `row_estimate` holds the key length.
+ */
+redisType?: string, };
 
 export type TableKind = "table" | "view" | "matview";
 
@@ -627,7 +661,11 @@ references: Array<ForeignKeyInfo>,
 /**
  * MongoDB only: everything the SQL fields have no room for.
  */
-mongo?: MongoCollectionInfo, };
+mongo?: MongoCollectionInfo, 
+/**
+ * Redis only: key metadata.
+ */
+redis?: RedisKeyInfo, };
 
 export type TablePropertiesArgs = { connId: string, database: string, schema: string | null, table: string, };
 
@@ -659,7 +697,7 @@ export type TypedValue = { type: string, value?: string, };
 
 export type UpdateConnectionArgs = { id: string, input: ConnectionInput, password: string | null, };
 
-export type WarningCode = "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "multiple_statements" | "unparsable" | "executable_comment" | "rename" | "unknown_command" | "implicit_commit";
+export type WarningCode = "update_without_where" | "delete_without_where" | "drop" | "truncate" | "alter_drop" | "multiple_statements" | "unparsable" | "executable_comment" | "rename" | "unknown_command" | "implicit_commit" | "flush" | "server_admin";
 
 export type WriteInfo = { statements: Array<WriteStatement>, warnings: Array<WriteWarning>, };
 
@@ -669,12 +707,11 @@ export type WriteStatement = {
  */
 kind: string, table?: string, 
 /**
- * MongoDB only: the database the statement runs on, from the tab's database and following
- * `use`, so the confirmation names it even when `table` is absent (`db.dropDatabase()`).
+ * MongoDB and Redis: the database the statement uses, including `use` or `SELECT` changes.
  */
 database?: string, 
 /**
- * MongoDB only: the statement only reads. The editor asks for a confirmation before a run on
+ * MongoDB and Redis: the statement only reads. The editor asks for a confirmation before a run on
  * a Production connection when any statement has `read: false`.
  */
 read?: boolean, 

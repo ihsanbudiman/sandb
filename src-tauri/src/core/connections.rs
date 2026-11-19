@@ -39,6 +39,27 @@ pub enum Topology {
     Sharded,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedisMode {
+    #[default]
+    Standalone,
+    Cluster,
+    Sentinel,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisSettings {
+    pub mode: RedisMode,
+    #[serde(default)]
+    pub sentinel_master: String,
+    #[serde(default)]
+    pub sentinel_auth: bool,
+}
+
 /// A saved connection. The password is never part of it: it lives in the secret store only.
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -72,7 +93,7 @@ pub struct Connection {
     /// before phase 3b, so `false`.
     #[serde(default)]
     pub read_only: bool,
-    /// MongoDB connection string WITHOUT the password; empty when the fields are used. The
+    /// MongoDB or Redis connection string WITHOUT the password; empty when fields are used. The
     /// password of the string lives in the secret store, like every other password.
     #[serde(default)]
     pub uri: String,
@@ -82,6 +103,9 @@ pub struct Connection {
     /// MongoDB only, from the last successful test.
     #[serde(default)]
     pub topology: Option<Topology>,
+    /// Redis only.
+    #[serde(default)]
+    pub redis: Option<RedisSettings>,
 }
 
 impl Connection {
@@ -140,8 +164,8 @@ pub struct ConnectionInput {
     #[serde(default)]
     #[cfg_attr(test, ts(optional = nullable))]
     pub read_only: bool,
-    /// MongoDB connection string as typed, password included: `catalog::normalize` takes the
-    /// password out.
+    /// MongoDB or Redis connection string as typed, password included: `catalog::normalize`
+    /// takes the password out.
     #[serde(default)]
     #[cfg_attr(test, ts(optional = nullable))]
     pub uri: String,
@@ -152,6 +176,9 @@ pub struct ConnectionInput {
     #[serde(default)]
     #[cfg_attr(test, ts(optional = nullable))]
     pub topology: Option<Topology>,
+    #[serde(default)]
+    #[cfg_attr(test, ts(optional = nullable))]
+    pub redis: Option<RedisSettings>,
     /// Version reported by a test run in the dialog. `None` keeps the stored one.
     #[serde(default)]
     #[cfg_attr(test, ts(optional = nullable))]
@@ -196,6 +223,10 @@ pub(crate) fn build(
         },
         uri: i.uri,
         auth_source: i.auth_source,
+        redis: match i.engine {
+            Engine::Redis => Some(i.redis.unwrap_or_default()),
+            _ => None,
+        },
     }
 }
 
@@ -217,6 +248,7 @@ pub(crate) fn input_of(c: &Connection) -> ConnectionInput {
         uri: c.uri.clone(),
         auth_source: c.auth_source.clone(),
         topology: c.topology,
+        redis: c.redis.clone(),
     }
 }
 
@@ -246,6 +278,7 @@ pub(crate) fn same_target(src: &Connection, target: &ConnectionInput) -> bool {
         && src.user == target.user
         && src.file == target.file
         && src.uri == target.uri
+        && src.redis == target.redis
 }
 
 /// A required field of a network engine, so the dialog can say which one is missing.
@@ -279,6 +312,7 @@ mod tests {
             uri: String::new(),
             auth_source: String::new(),
             topology: None,
+            redis: None,
         }
     }
 

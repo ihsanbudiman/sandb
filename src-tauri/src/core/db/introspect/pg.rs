@@ -58,6 +58,7 @@ pub async fn tables(p: &PgPool, schema: &str) -> Result<Vec<TableInfo>, AppError
                 row_estimate: if kind == TableKind::View { None } else { est },
                 has_rowid: None,
                 partition_of: parent,
+                redis_type: None,
             }
         })
         .collect())

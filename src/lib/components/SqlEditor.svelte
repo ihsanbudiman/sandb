@@ -1,19 +1,21 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection, tooltips } from '@codemirror/view';
-  import { EditorState, Compartment, type Text } from '@codemirror/state';
+  import { EditorView, ViewPlugin, keymap, lineNumbers, highlightActiveLine, drawSelection, type ViewUpdate } from '@codemirror/view';
+  import { EditorState, Compartment, Prec, type Text } from '@codemirror/state';
   import { defaultKeymap, history, historyKeymap, indentMore, indentLess, selectAll as selectAllCmd } from '@codemirror/commands';
   import { javascript } from '@codemirror/lang-javascript';
   import { syntaxHighlighting, HighlightStyle, foldService, foldGutter, foldedRanges, foldEffect, unfoldEffect, foldAll, unfoldAll, codeFolding, indentUnit } from '@codemirror/language';
-  import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
+  import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, closeCompletion, completionStatus, selectedCompletionIndex, startCompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
   import { tags as t } from '@lezer/highlight';
-  import { sqlCompletion, SQL_DIALECTS, type Column, type Links, type SqlCompletion } from '../sql/complete';
+  import { sqlCompletion, shouldAutoOpen, AUTO_OPEN_DELAY, SQL_DIALECTS, type Column, type Links, type SqlCompletion } from '../sql/complete';
   import type { Engine, SchemaSnapshot } from '../api';
   import { snapshotSchema } from '../results';
   import { tableLabel } from '../tableId';
   import { statementRanges, maskLiterals } from '../sql/text';
   import { mongoStatementRanges } from '../mongo/text';
-  import { MONGOSH_COLLECTION_METHODS, MONGOSH_CURSOR_METHODS, MONGOSH_DB_METHODS } from '../api/generated/constants';
+  import { redisCompletionRange, redisStatementRanges } from '../redis/text';
+  import { redisLanguage } from '../redis/lang';
+  import { MONGOSH_COLLECTION_METHODS, MONGOSH_CURSOR_METHODS, MONGOSH_DB_METHODS, REDIS_COMMANDS } from '../api/generated/constants';
   import { formatSql } from '../sql/format';
   import { formatMongo } from '../mongo/format';
   import { KEYS } from '../keys';
@@ -29,6 +31,7 @@
     dialect = 'pg',
     columnsOf,
     linksOf,
+    tablesState,
   }: {
     value?: string;
     /** Runs the selection, or the statement at the cursor. */
@@ -46,19 +49,20 @@
     columnsOf?: (path: string[]) => Promise<Column[]>;
     /** Foreign keys of a table, for `JOIN` and `ON` completion; null when unknown. */
     linksOf?: (path: string[]) => Promise<Links | null>;
+    /** Whether the table list is loading, failed or loaded; an empty table list then says why. */
+    tablesState?: { status: 'loading' | 'error' | 'ok'; error?: string };
   } = $props();
 
-  /** The SQL dialect of the text; a mongosh tab gets JavaScript and the mongosh helpers instead. */
-  const sqlDialect = $derived(dialect === 'mongo' ? null : dialect);
+  /** The SQL dialect of the text; mongosh and Redis text are not SQL. */
+  const sqlDialect = $derived(dialect === 'mongo' || dialect === 'redis' ? null : dialect);
   /** Table key → column names; the mongosh completions read collections and fields from it. */
   const schema = $derived(snapshotSchema(snapshot));
   /** Table key → snapshot table, for the typed columns of a table written in the editor. */
   const byKey = $derived(new Map((snapshot?.tables ?? []).map((t) => [tableLabel(t), t])));
 
   const lang = new Compartment();
-  // A mongo tab speaks mongosh (JavaScript with `db.` calls), not SQL. The SQL language comes without
-  // lang-sql's own completion sources: `sqlCompletion` replaces them.
-  const langExt = () => (sqlDialect ? SQL_DIALECTS[sqlDialect].extension : javascript());
+  // Use the SQL language without lang-sql's completion sources; `sqlCompletion` replaces them.
+  const langExt = () => sqlDialect ? SQL_DIALECTS[sqlDialect].extension : dialect === 'mongo' ? javascript() : redisLanguage;
 
   // Fetched columns per snapshot; a new snapshot clears them.
   let fetched = new Map<string, Promise<Column[]>>();
@@ -103,7 +107,75 @@
 
   /** DataGrip-style SQL completion: the clause at the cursor decides what the list offers. */
   const sqlSource = (ctx: CompletionContext) =>
-    sqlDialect ? sqlCompletion(ctx, { dialect: sqlDialect, tables: snapshot?.tables ?? [], columns: loadColumns, links: linksOf }) : null;
+    sqlDialect ? sqlCompletion(ctx, { dialect: sqlDialect, tables: snapshot?.tables ?? [], columns: loadColumns, links: linksOf, tablesState }) : null;
+
+  // An open list asks again when the tables arrive (or fail), so "Loading tables…" turns into the tables.
+  $effect(() => {
+    void snapshot;
+    void tablesState?.status;
+    if (view && completionStatus(view.state) === 'active') startCompletion(view);
+  });
+
+  /**
+   * True while the open list is one that `autoOpen` opened and the user has not touched: Enter then
+   * makes a new line instead of inserting the first item, and Tab inserts it. Typing, an arrow key or a
+   * closed list ends it.
+   */
+  let autoOpened = false;
+
+  /**
+   * Opens the list after a typed separator, as Ctrl+Space would. More typing or a cursor move
+   * during the delay cancels it.
+   */
+  const autoOpen = ViewPlugin.fromClass(
+    class {
+      timer = 0;
+      view: EditorView;
+      constructor(view: EditorView) {
+        this.view = view;
+      }
+      update(u: ViewUpdate) {
+        if (autoOpened && (u.docChanged || !completionStatus(u.state) || (selectedCompletionIndex(u.state) ?? 0) > 0)) autoOpened = false;
+        if (!u.docChanged && !u.selectionSet) return;
+        clearTimeout(this.timer);
+        const typed = u.transactions.some((tr) => tr.isUserEvent('input') && !tr.isUserEvent('input.paste') && !tr.isUserEvent('input.complete'));
+        const sel = u.state.selection.main;
+        // The list of the word before the space may still be closing now; the timer checks it again.
+        if (!typed || !sel.empty) return;
+        const text = u.state.doc.toString();
+        if (sqlDialect) {
+          if (!shouldAutoOpen(text, sel.head, sqlDialect)) return;
+        } else if (dialect === 'redis' && /[ \t]/.test(text[sel.head - 1] ?? '')) {
+          const arg = redisCompletionRange(text, sel.head);
+          if (!arg || arg.command || arg.from !== sel.head) return;
+        } else return;
+        const head = sel.head;
+        this.timer = window.setTimeout(() => {
+          const v = this.view;
+          if (!v.hasFocus || v.state.selection.main.head !== head || !v.state.selection.main.empty || completionStatus(v.state)) return;
+          startCompletion(v);
+          autoOpened = true;
+        }, AUTO_OPEN_DELAY);
+      }
+      destroy() {
+        clearTimeout(this.timer);
+      }
+    },
+  );
+
+  /** Enter on a list that opened by itself closes it and makes the new line the user typed Enter for. */
+  const autoOpenKeys = Prec.highest(
+    keymap.of([
+      {
+        key: 'Enter',
+        run: (v) => {
+          if (autoOpened && completionStatus(v.state) === 'active') closeCompletion(v);
+          autoOpened = false;
+          return false;
+        },
+      },
+    ]),
+  );
 
   /** The table (or alias and table) a completion comes from, right-aligned in its row. */
   function originDom(c: SqlCompletion) {
@@ -114,9 +186,8 @@
     return s;
   }
 
-  /** Statement ranges of the editor text: mongosh splitting for mongo, SQL splitting otherwise. */
   const rangesOf = (doc: string, blankLines = false): { from: number; to: number }[] =>
-    sqlDialect ? statementRanges(doc, sqlDialect, blankLines).map(([from, to]) => ({ from, to })) : mongoStatementRanges(doc);
+    sqlDialect ? statementRanges(doc, sqlDialect, blankLines).map(([from, to]) => ({ from, to })) : dialect === 'mongo' ? mongoStatementRanges(doc) : redisStatementRanges(doc);
 
   /** The collection a `db.<coll>.` / `db.getCollection("<coll>").` call before `pos` targets, or ''. */
   function mongoCollectionBefore(state: EditorState, pos: number): string {
@@ -151,6 +222,17 @@
       if (opts.length) return { from: ctx.pos - word.length, options: opts, validFor: /^[\w$]*$/ };
     }
     return null;
+  }
+
+  const redisCommandOptions = REDIS_COMMANDS.map((label) => ({ label, type: 'keyword' }));
+  const redisKeyOptions = $derived(dialect === 'redis' ? (snapshot?.tables ?? []).map(({ name: label }) => ({ label, type: 'property' })) : []);
+
+  function redisCompletions(ctx: CompletionContext): CompletionResult | null {
+    const range = redisCompletionRange(ctx.state.doc.toString(), ctx.pos);
+    if (!range || (!ctx.explicit && range.from === ctx.pos)) return null;
+    const { from, to, command } = range;
+    const options = command ? redisCommandOptions : redisKeyOptions;
+    return options.length ? { from, to, options } : null;
   }
 
   /** The editor commands App uses; one handle instead of seven component exports. */
@@ -196,7 +278,7 @@
    * an unclosed string, SQL that the formatter does not know).
    */
   function format() {
-    if (!view) return;
+    if (!view || dialect === 'redis') return;
     const r = view.state.selection.main;
     const [from, to] = r.empty ? [0, view.state.doc.length] : [r.from, r.to];
     const text = view.state.sliceDoc(from, to);
@@ -215,6 +297,12 @@
     if (!view) return '';
     const doc = view.state.doc.toString();
     const head = view.state.selection.main.head;
+    if (dialect === 'redis') {
+      const { doc: lines } = view.state;
+      const ranges = rangesOf(doc);
+      const range = ranges.find(({ to }) => head <= lines.lineAt(to).to) ?? ranges.at(-1);
+      return range ? doc.slice(range.from, range.to) : '';
+    }
     const parts = rangesOf(doc, true)
       .map(({ from, to }) => ({ to, text: doc.slice(from, to).trim() }))
       .filter((p) => p.text && p.text !== ';');
@@ -236,10 +324,9 @@
     const doc = state.doc.toString();
     const out: Fold[] = [];
     for (const { from, to } of rangesOf(doc, true)) {
+      // Redis ranges already exclude comments and surrounding whitespace, including on multiline arguments.
       const raw = doc.slice(from, to);
-      // Comments and strings are blanked; a comments-only range gets nothing. Mongosh text has no SQL
-      // dialect, so it takes the plain rules (no `#` comments, no backslash escapes, no dollar quotes).
-      const masked = maskLiterals(raw, sqlDialect ?? 'sqlite');
+      const masked = dialect === 'redis' ? raw : maskLiterals(raw, sqlDialect ?? 'sqlite');
       if (!masked.trim()) continue;
       const first = state.doc.lineAt(from + masked.length - masked.trimStart().length);
       const last = from + masked.trimEnd().length;
@@ -290,7 +377,7 @@
   ]);
 
   const theme = EditorView.theme({
-    '&': { height: '100%', fontSize: '13px', backgroundColor: 'transparent', color: 'var(--c-ink)' },
+    '&': { height: '100%', fontSize: 'var(--text-base)', backgroundColor: 'transparent', color: 'var(--c-ink)' },
     '&.cm-focused': { outline: 'none' },
     '.cm-scroller': { fontFamily: "'JetBrains Mono Variable', ui-monospace, monospace", lineHeight: '1.6' },
     '.cm-content': { padding: '2px 0 8px' },
@@ -304,7 +391,7 @@
     '.cm-activeLineGutter': { backgroundColor: 'transparent', color: 'var(--c-ink)' },
     '.cm-cursor': { borderLeftColor: 'var(--c-accent)', borderLeftWidth: '2px' },
     '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: 'color-mix(in srgb, var(--c-accent) 24%, transparent) !important' },
-    '.cm-tooltip': { backgroundColor: 'var(--c-surface)', border: '1px solid var(--c-line)', borderRadius: '8px', overflow: 'hidden', boxShadow: '0 12px 32px -8px rgba(0,0,0,.3)', fontFamily: "'JetBrains Mono Variable', ui-monospace, monospace", fontSize: '12px', padding: '4px' },
+    '.cm-tooltip': { zIndex: 'var(--z-index-menu)', backgroundColor: 'var(--c-surface)', border: '1px solid var(--c-line)', borderRadius: '8px', overflow: 'hidden', boxShadow: '0 12px 32px -8px rgba(0,0,0,.3)', fontFamily: "'JetBrains Mono Variable', ui-monospace, monospace", fontSize: 'var(--text-sm)', padding: '4px' },
     '.cm-tooltip-autocomplete ul li[aria-selected]': { backgroundColor: 'var(--c-active)', color: 'var(--c-ink)' },
     '.cm-tooltip.cm-tooltip-autocomplete > ul': { minWidth: '320px', maxWidth: '640px' },
     '.cm-tooltip-autocomplete ul li': { display: 'flex', alignItems: 'center', padding: '3px 8px !important', borderRadius: '5px' },
@@ -329,6 +416,11 @@
     '.cm-completionIcon-alias, .cm-completionIcon-schema': { color: 'var(--c-ink)', backgroundColor: 'var(--c-hover)' },
     '.cm-completionIcon-alias:after': { content: "'a'" },
     '.cm-completionIcon-schema:after': { content: "'S'" },
+    '.cm-completionIcon-snippet': { color: 'var(--c-accent)', backgroundColor: 'var(--c-hover)' },
+    '.cm-completionIcon-snippet:after': { content: "'⇥'" },
+    // A list that opened by itself: a quiet highlight, as Enter does not take the item, and a key hint.
+    '.cm-tooltip-autocomplete.cm-auto-open ul li[aria-selected]': { backgroundColor: 'var(--c-hover)' },
+    '.cm-tooltip-autocomplete.cm-auto-open::after': { content: "'Tab to insert · ↵ new line · Esc to close'", display: 'block', padding: '4px 8px 2px', borderTop: '1px solid var(--c-line)', marginTop: '4px', color: 'var(--c-faint)', fontFamily: 'var(--font-sans)', fontSize: 'var(--text-2xs)' },
   });
 
   onMount(() => {
@@ -349,7 +441,7 @@
             { key: KEYS.run.combo, run: () => (onrun?.(), true) },
             { key: KEYS.runNew.combo, run: () => (onrunnew?.(), true) },
             { key: KEYS.runAll.combo, run: () => (onrunall?.(), true) },
-            { key: KEYS.format.combo, run: () => (onformat?.(), true) },
+            { key: KEYS.format.combo, run: () => { if (dialect !== 'redis') onformat?.(); return true; } },
             { key: KEYS.foldStatement.combo, run: toggleStatementFold },
             { key: KEYS.foldAll.combo, run: foldAll },
             { key: KEYS.unfoldAll.combo, run: unfoldAll },
@@ -371,13 +463,14 @@
             ...historyKeymap,
           ]),
           lang.of(langExt()),
-          autocompletion({ addToOptions: [{ render: (c) => originDom(c as SqlCompletion), position: 90 }] }),
+          // Before `autocompletion`: both keymaps are highest precedence, and the first one listed runs first.
+          autoOpenKeys,
+          autocompletion({ addToOptions: [{ render: (c) => originDom(c as SqlCompletion), position: 90 }], tooltipClass: () => (autoOpened ? 'cm-auto-open' : '') }),
+          autoOpen,
           // VS Code-style pairs: `'` gives `''` with the cursor between, and a closing bracket typed
           // over the one the editor added moves the cursor past it.
           closeBrackets(),
-          // The editor pane clips its content; tooltips live on <body> so the list can cover the results panel.
-          tooltips({ parent: document.body }),
-          EditorState.languageData.of(() => [{ autocomplete: sqlDialect ? sqlSource : mongoCompletions }]),
+          EditorState.languageData.of(() => [{ autocomplete: sqlDialect ? sqlSource : dialect === 'mongo' ? mongoCompletions : redisCompletions }]),
           syntaxHighlighting(hl),
           theme,
           EditorView.updateListener.of((u) => {

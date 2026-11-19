@@ -13,7 +13,9 @@ use mongodb::bson::Document;
 use serde_json::{Map, Value};
 
 use sandb_lib::core::ai::event::ChatEvent;
-use sandb_lib::core::connections::{Connection, ConnectionInput, Env, SslMode};
+use sandb_lib::core::connections::{
+    Connection, ConnectionInput, Env, RedisMode, RedisSettings, SslMode,
+};
 use sandb_lib::core::engine::Engine;
 use sandb_lib::core::error::AppError;
 use sandb_lib::core::result::{QueryRun, RunRequest};
@@ -106,6 +108,22 @@ pub fn mongo_rs() -> u16 {
 
 pub fn mongo_standalone() -> u16 {
     port("MONGO_STANDALONE_PORT")
+}
+
+pub fn redis() -> u16 {
+    port("REDIS_PORT")
+}
+
+pub fn redis_cluster() -> u16 {
+    port("REDIS_CLUSTER_PORT_1")
+}
+
+pub fn redis_sentinel() -> u16 {
+    port("REDIS_SENTINEL_PORT")
+}
+
+pub fn redis_sentinel_master() -> u16 {
+    port("REDIS_SENTINEL_MASTER_PORT")
 }
 
 pub fn rw_user() -> String {
@@ -219,6 +237,7 @@ fn blank(engine: Engine, port: u16) -> ConnectionInput {
         uri: String::new(),
         auth_source: String::new(),
         topology: None,
+        redis: None,
     }
 }
 
@@ -263,6 +282,31 @@ pub fn mongo_input(
     i.auth_source = "admin".into();
     i.read_only = read_only;
     i
+}
+
+pub fn redis_input(
+    label: &str,
+    port: u16,
+    user: &str,
+    mode: RedisMode,
+    read_only: bool,
+) -> ConnectionInput {
+    let mut input = blank(Engine::Redis, port);
+    input.name = format!("it-{label}");
+    input.database = "0".into();
+    input.user = user.into();
+    input.ssl = SslMode::Disable;
+    input.read_only = read_only;
+    input.redis = Some(RedisSettings {
+        mode,
+        sentinel_master: if mode == RedisMode::Sentinel {
+            "mymaster".into()
+        } else {
+            String::new()
+        },
+        sentinel_auth: false,
+    });
+    input
 }
 
 /// A saved connection plus the private state it lives in.

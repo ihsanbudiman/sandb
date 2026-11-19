@@ -1,0 +1,14 @@
+SET greeting hello
+SET counter 42
+SET bin:1 "\xff\x00\xfe"
+SET ttl:1 expires EX 86400
+EVAL "for i=1,1000 do redis.call('HSET','user:'..i,'name','User '..i,'email','user'..i..'@example.test','age',20+i%60) end return 1000" 0
+EVAL "for i=1,100000 do redis.call('HSET',KEYS[1],'field:'..i,'value:'..i) end return 100000" 1 big:hash
+EVAL "for i=1,50 do redis.call('RPUSH',KEYS[1],'job:'..i) end return 50" 1 queue:jobs
+EVAL "for i=1,20 do redis.call('SADD',KEYS[1],'tag:'..i) end return 20" 1 tags
+EVAL "for i=1,1000 do redis.call('ZADD',KEYS[1],i,'player:'..i) end return 1000" 1 leaderboard
+EVAL "for i=1,10000 do redis.call('XADD',KEYS[1],i..'-0','type','order','amount',i%100) end return 10000" 1 events
+SELECT 1
+SET db1:only yes
+SELECT 0
+SET seed:done 1

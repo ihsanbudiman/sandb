@@ -90,6 +90,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let custom_dir = std::env::var_os("SANDB_DATA_DIR").map(PathBuf::from);
             // The credential store is shared by the whole OS account. A custom data dir gets its

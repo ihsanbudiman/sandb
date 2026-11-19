@@ -4,9 +4,29 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Type: 2xs 10.5 (badges), xs 11.5 (metadata), sm 12.5 (controls), base 13 (body), lg 14 (titles).
+   Heights: page header 48, pane header 44, sub-toolbar 36, list row 26, rich menu row 32.
+   Layers, back to front: sticky 10, running 20, chat 30, menu 40, dialog 50, toast 60.
+   Icons: 12 next to xs text, 13 by default, 15 in page and dialog headers. */
 @theme {
   --font-sans: 'Inter Variable', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+  --text-2xs: 10.5px;
+  --text-xs: 11.5px;
+  --text-sm: 12.5px;
+  --text-base: 13px;
+  --text-lg: 14px;
+  --spacing-page-header: 48px;
+  --spacing-pane-header: 44px;
+  --spacing-sub-toolbar: 36px;
+  --spacing-list-row: 26px;
+  --spacing-rich-menu-row: 32px;
+  --z-index-sticky: 10;
+  --z-index-running: 20;
+  --z-index-chat: 30;
+  --z-index-menu: 40;
+  --z-index-dialog: 50;
+  --z-index-toast: 60;
   --color-canvas: var(--c-canvas);
   --color-surface: var(--c-surface);
   --color-sunken: var(--c-sunken);
@@ -20,6 +40,29 @@
   --color-faint: var(--c-faint);
   --color-accent: var(--c-accent);
   --color-accent-fg: var(--c-accent-fg);
+  --color-danger: var(--c-danger);
+  --color-danger-fg: var(--c-danger-fg);
+  --color-danger-soft: var(--c-danger-soft);
+  --color-warn: var(--c-warn);
+  --color-warn-soft: var(--c-warn-soft);
+  --color-ok: var(--c-ok);
+  --color-ok-soft: var(--c-ok-soft);
+  --animate-popover-in: popover-in 120ms ease-out;
+  --animate-dialog-backdrop-in: fade-in 150ms ease-out;
+  --animate-dialog-in: dialog-in 150ms ease-out;
+  @keyframes popover-in {
+    from { opacity: 0; scale: .98; }
+    to { opacity: 1; scale: 1; }
+  }
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  /* Opacity only: a transform or `scale` on .dialog would become the containing block of fixed popovers (Select). */
+  @keyframes dialog-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
   /* Running query: an indeterminate bar and a skeleton shimmer (ResultsGrid). */
   --animate-indeterminate: indeterminate 1.4s cubic-bezier(.65, 0, .35, 1) infinite;
   --animate-shimmer: shimmer 1.6s ease-in-out infinite;
@@ -50,6 +93,13 @@
   --c-faint: #6e6a63;
   --c-accent: #b45309;
   --c-accent-fg: #ffffff;
+  --c-danger: #b91c1c;
+  --c-danger-fg: #fff;
+  --c-danger-soft: color-mix(in srgb, var(--c-danger) 9%, transparent);
+  --c-warn: #92400e;
+  --c-warn-soft: color-mix(in srgb, var(--c-warn) 10%, transparent);
+  --c-ok: #047857;
+  --c-ok-soft: color-mix(in srgb, var(--c-ok) 9%, transparent);
   --c-syn-string: #3d7a28;
   --c-syn-number: #b2401a;
   --c-syn-type: #7b4f98;
@@ -74,6 +124,13 @@
   --c-faint: #928d85;
   --c-accent: #eda33c;
   --c-accent-fg: #1b1206;
+  --c-danger: #fca5a5;
+  --c-danger-fg: #361214;
+  --c-danger-soft: color-mix(in srgb, var(--c-danger) 11%, transparent);
+  --c-warn: #fbbf24;
+  --c-warn-soft: color-mix(in srgb, var(--c-warn) 10%, transparent);
+  --c-ok: #6ee7b7;
+  --c-ok-soft: color-mix(in srgb, var(--c-ok) 9%, transparent);
   --c-syn-string: #a9c08a;
   --c-syn-number: #e48c62;
   --c-syn-type: #c6a3d8;
@@ -84,9 +141,18 @@
 html, body, #app { height: 100%; }
 /* The app is a fixed-size window: the document itself never scrolls (wheel, rubber-band, or a focus/scrollIntoView
    jump). Every pane scrolls inside its own `overflow-auto` box. `clip` on #app also blocks programmatic scrolling. */
-html, body { overflow: hidden; overscroll-behavior: none; }
+html, body { overflow: clip; overscroll-behavior: none; }
 #app { overflow: clip; }
-body { @apply bg-canvas text-ink font-sans antialiased text-[13px]; font-feature-settings: 'cv11', 'ss01'; }
+body { @apply bg-canvas text-ink font-sans antialiased text-base; font-feature-settings: 'cv11', 'ss01'; }
+
+@layer base {
+  input:is([type='checkbox'], [type='radio'], [type='range']) { accent-color: var(--c-accent); }
+  [role='tab'] { @apply focus-ring; }
+}
+
+:is(input, select, textarea, .input)[aria-invalid='true'] {
+  @apply border-danger ring-2 ring-danger/25;
+}
 
 /* Backdrop: the body goes clear and `.app-backdrop` shows the image (or the desktop) under a canvas-colored tint. */
 html.backdrop body { background-color: transparent; }
@@ -120,8 +186,14 @@ html.glass .card .bg-sunken:not(:where(.dialog, .popover, thead.sticky) *, thead
 .tok-op { color: var(--c-muted); }
 .tok-type { color: var(--c-syn-type); }
 
+@utility focus-ring {
+  @apply focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-accent/60;
+}
 @utility btn {
-  @apply inline-flex items-center justify-center gap-1.5 h-7 px-2.5 rounded-md text-[12.5px] font-medium whitespace-nowrap transition-colors select-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed;
+  @apply focus-ring inline-flex items-center justify-center gap-1.5 h-7 px-2.5 rounded-md text-sm font-medium whitespace-nowrap transition-colors select-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed;
+}
+@utility btn-sm {
+  @apply h-6 px-2 text-xs;
 }
 /* Hover darkens in light mode: brightening would drop white-on-amber below 4.5:1. */
 @utility btn-primary {
@@ -133,11 +205,29 @@ html.glass .card .bg-sunken:not(:where(.dialog, .popover, thead.sticky) *, thead
 @utility btn-ghost {
   @apply text-muted enabled:hover:bg-hover enabled:hover:text-ink;
 }
+@utility btn-danger {
+  @apply bg-danger text-danger-fg enabled:hover:brightness-90 dark:enabled:hover:brightness-110;
+}
+@utility btn-on {
+  @apply aria-pressed:bg-active aria-pressed:text-ink aria-pressed:enabled:hover:bg-active;
+}
 @utility nav-item {
-  @apply flex w-full h-[26px] items-center gap-2 rounded-md px-2 text-left text-[12.5px] text-muted hover:bg-hover hover:text-ink cursor-pointer disabled:pointer-events-none disabled:opacity-40;
+  @apply focus-ring flex w-full h-list-row items-center gap-2 rounded-md px-2 text-left text-sm text-muted hover:bg-hover hover:text-ink cursor-pointer disabled:pointer-events-none disabled:opacity-40;
 }
 @utility nav-item-active {
   @apply bg-active text-ink font-medium hover:bg-active;
+}
+@utility nav-item-danger {
+  @apply text-danger hover:bg-danger-soft hover:text-danger enabled:hover:bg-danger-soft enabled:hover:text-danger focus-visible:text-danger;
+}
+@utility menu-item {
+  @apply focus-ring flex h-list-row w-full items-center gap-2 rounded-md px-2 text-left text-sm text-muted enabled:hover:bg-hover enabled:hover:text-ink focus-visible:bg-hover focus-visible:text-ink cursor-pointer disabled:cursor-not-allowed disabled:opacity-40;
+}
+@utility chip {
+  @apply focus-ring inline-flex h-6 max-w-full items-center gap-1 rounded-md border border-line bg-surface px-1.5 text-xs text-muted enabled:hover:bg-hover enabled:hover:text-ink disabled:opacity-40;
+}
+@utility chip-on {
+  @apply border-accent/60 bg-accent/10 text-accent enabled:hover:bg-accent/15 enabled:hover:text-accent;
 }
 /* Panels let the backdrop through by `--panel-alpha`. Popovers, dialogs and sticky headers keep the opaque surface. */
 @utility card {
@@ -146,35 +236,49 @@ html.glass .card .bg-sunken:not(:where(.dialog, .popover, thead.sticky) *, thead
 }
 /* Active title-bar tab: a small piece of the card surface on the canvas. Dark mode needs the edge, as surface and canvas are close. */
 @utility tab-on {
-  @apply bg-surface shadow-[0_1px_2px_rgba(28,27,25,.1),0_0_0_1px_rgba(28,27,25,.04)] dark:shadow-[0_0_0_1px_var(--c-line)];
+  @apply focus-ring bg-surface shadow-[0_1px_2px_rgba(28,27,25,.1),0_0_0_1px_rgba(28,27,25,.04)] dark:shadow-[0_0_0_1px_var(--c-line)];
 }
 /* Floating menus: unlike cards they need an edge, because they sit on top of other surfaces. */
 @utility popover {
   @apply bg-surface rounded-lg border border-line shadow-[0_12px_32px_-8px_rgba(0,0,0,.3)];
 }
 @utility input {
-  @apply h-8 w-full rounded-md bg-field border border-line px-2.5 text-[13px] text-ink outline-none placeholder:text-faint focus:border-accent/70 focus:ring-3 focus:ring-accent/15 transition-[border-color,box-shadow];
+  @apply h-8 w-full rounded-md bg-field border border-line px-2.5 text-base text-ink outline-none placeholder:text-faint focus:border-accent/70 focus:ring-3 focus:ring-accent/15 transition-[border-color,box-shadow];
+}
+@utility input-sm {
+  @apply h-7 text-sm;
+}
+/* Native <select> kept for long dynamic lists: same look as `input`, with our chevron. Combine with `input` (+ `input-sm`). */
+@utility select-native {
+  @apply appearance-none cursor-pointer pr-7 bg-no-repeat bg-[length:12px_12px] bg-[position:right_0.5rem_center];
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236e6a63' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  &:where(.dark, .dark *) {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23928d85' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  }
 }
 /* Small sentence-case heading for groups, form fields and table columns. */
 @utility label {
-  @apply text-[11.5px] font-medium text-muted;
+  @apply text-xs font-medium text-muted;
+}
+@utility th {
+  @apply text-2xs font-medium text-faint;
 }
 /* Segmented control: `seg` on the track, `seg-item` + `seg-on` on the options. */
 @utility seg {
   @apply inline-flex items-center gap-0.5 rounded-md bg-sunken p-0.5 shadow-[inset_0_0_0_1px_var(--c-line)];
 }
 @utility seg-item {
-  @apply h-6 rounded-[5px] px-2.5 text-[12.5px] font-medium text-muted hover:text-ink cursor-pointer;
+  @apply focus-ring h-6 rounded-[5px] px-2.5 text-sm font-medium text-muted hover:text-ink cursor-pointer;
 }
 @utility seg-on {
   @apply bg-raised text-ink shadow-[0_1px_2px_rgba(0,0,0,.12),0_0_0_1px_var(--c-line)] hover:text-ink;
 }
 @utility kbd {
-  @apply inline-flex h-[18px] min-w-[18px] items-center justify-center rounded border border-line px-1 font-sans text-[10.5px] leading-none text-faint;
+  @apply inline-flex h-[18px] min-w-[18px] items-center justify-center rounded border border-line px-1 font-sans text-2xs leading-none text-faint;
 }
-/* Quiet pill; add a text color, e.g. `tag text-red-700 dark:text-red-400`. */
+/* Quiet pill; add a text color, e.g. `tag text-danger`. */
 @utility tag {
-  @apply inline-flex h-[18px] items-center gap-1 rounded px-1.5 text-[11px] font-medium leading-none bg-hover;
+  @apply inline-flex h-[18px] items-center gap-1 rounded px-1.5 text-xs font-medium leading-none bg-hover;
 }
 /* Shows an upper-case value (READ, ERROR) in sentence case without changing the text. */
 @utility sentence {
@@ -184,13 +288,13 @@ html.glass .card .bg-sunken:not(:where(.dialog, .popover, thead.sticky) *, thead
 }
 /* Modal shell: `dialog-backdrop` > `dialog` > `dialog-head` + `dialog-body` + `dialog-foot`. */
 @utility dialog-backdrop {
-  @apply fixed inset-0 z-50 grid place-items-center bg-black/35 p-4 dark:bg-black/55;
+  @apply fixed inset-0 z-dialog grid place-items-center bg-black/35 p-4 dark:bg-black/55;
 }
 @utility dialog {
   @apply relative w-full overflow-hidden rounded-xl border border-line bg-surface shadow-[0_24px_64px_-16px_rgba(0,0,0,.45)];
 }
 @utility dialog-head {
-  @apply flex items-center gap-2.5 px-5 pt-4 pb-1 text-[14px] font-semibold;
+  @apply flex items-center gap-2.5 px-5 pt-4 pb-1 text-lg font-semibold;
 }
 @utility dialog-body {
   @apply px-5 py-3;

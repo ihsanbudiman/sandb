@@ -14,6 +14,9 @@
   import { schemaChangeSql, FK_RULES, COLUMN_TYPES, INDEX_METHODS, type TableRef } from '../tableActions';
   import type { SqlEngine } from '../sql/text';
   import SchemaFormDialog, { type SchemaDraft } from './SchemaFormDialog.svelte';
+  import Select from './ui/Select.svelte';
+
+  const fkRules = FK_RULES.map((value) => ({ value, label: value }));
 
   let {
     conn,
@@ -24,6 +27,7 @@
   }: { conn: Conn; table: TableRef; columns: ColumnInfo[]; ask: SchemaAsk; answer: (changed: boolean) => void } = $props();
 
   const e = untrack(() => conn.engine) as SqlEngine;
+  const indexMethods = [{ value: '', label: 'Default' }, ...INDEX_METHODS[e].map((value) => ({ value, label: value }))];
   const edit = untrack(() => ('edit' in ask ? ask.edit : null));
   const kind = untrack(() => ('add' in ask ? ask.add : (edit?.kind ?? null)));
   const drop = 'drop' in untrack(() => ask);
@@ -143,8 +147,6 @@
     if (built?.sql) return { sql: built.sql };
     return { sql: null, preview: edit && draft ? 'No changes.' : 'Fill in the form to see the SQL.' };
   }
-
-  const focus = (el: HTMLElement) => el.focus();
 </script>
 
 {#snippet colPicker(label: string)}
@@ -153,7 +155,7 @@
     <div class="flex flex-wrap gap-1.5">
       {#each columns as c (c.name)}
         {@const i = picked.indexOf(c.name)}
-        <button type="button" class="tag cursor-pointer gap-1 font-mono {i >= 0 ? 'bg-accent/15 text-accent' : 'hover:text-ink'}" aria-pressed={i >= 0} onclick={() => toggle(c.name)}>
+        <button type="button" class="chip font-mono" class:chip-on={i >= 0} aria-pressed={i >= 0} onclick={() => toggle(c.name)}>
           {#if i >= 0}<span class="tabular-nums">{i + 1}</span>{/if}{c.name}
         </button>
       {/each}
@@ -172,45 +174,45 @@
   ondone={() => answer(true)}
 >
   {#snippet icon()}
-    {#if drop}<Trash size={15} class="text-red-600 dark:text-red-400" />{:else if edit}<Pencil size={15} class="text-accent" />{:else}<Plus size={15} class="text-accent" />{/if}
+    {#if drop}<Trash size={15} class="text-danger" />{:else if edit}<Pencil size={15} class="text-accent" />{:else}<Plus size={15} class="text-accent" />{/if}
   {/snippet}
 
   {#snippet fields()}
     {#if kind === 'column'}
       <div class="grid grid-cols-2 gap-2">
-        <label class="block space-y-1.5"><span class="label">Name</span><input class="input font-mono" bind:value={name} use:focus autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-        <label class="block space-y-1.5"><span class="label">Type</span><input class="input font-mono" bind:value={type} list="schema-types" placeholder={COLUMN_TYPES[e][0]} disabled={nameOnly} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+        <label class="block space-y-1.5"><span class="label">Name</span><input class="input input-sm font-mono" data-autofocus bind:value={name} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+        <label class="block space-y-1.5"><span class="label">Type</span><input class="input input-sm font-mono" bind:value={type} list="schema-types" placeholder={COLUMN_TYPES[e][0]} disabled={nameOnly} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
       </div>
       <datalist id="schema-types">{#each COLUMN_TYPES[e] as t (t)}<option value={t}></option>{/each}</datalist>
-      <label class="block space-y-1.5"><span class="label">Default <span class="font-normal text-faint">· SQL expression, e.g. 0, 'new' or now()</span></span><input class="input font-mono" bind:value={def} disabled={nameOnly} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-      <label class="flex items-center gap-2 text-[12.5px]"><input type="checkbox" bind:checked={notNull} disabled={nameOnly} /> Not null</label>
-      {#if nameOnly}<p class="text-[12px] text-faint">SQLite can only rename a column.</p>{/if}
+      <label class="block space-y-1.5"><span class="label">Default <span class="font-normal text-faint">· SQL expression, e.g. 0, 'new' or now()</span></span><input class="input input-sm font-mono" bind:value={def} disabled={nameOnly} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+      <label class="flex items-center gap-2 text-sm"><input type="checkbox" bind:checked={notNull} disabled={nameOnly} /> Not null</label>
+      {#if nameOnly}<p class="text-sm text-faint">SQLite can only rename a column.</p>{/if}
     {:else if kind === 'constraint'}
       <div class="seg w-fit" role="radiogroup" aria-label="Constraint type">
         {#each [['unique', 'Unique'], ['primary', 'Primary key'], ['check', 'Check']] as const as [v, l] (v)}
-          <button type="button" class="seg-item {cKind === v ? 'seg-on' : ''}" role="radio" aria-checked={cKind === v} disabled={!!edit && cKind !== v} onclick={() => (cKind = v)}>{l}</button>
+          <button type="button" class="seg-item {cKind === v ? 'seg-on' : ''}" role="radio" aria-checked={cKind === v} data-autofocus={cKind === v ? '' : undefined} disabled={!!edit && cKind !== v} onclick={() => (cKind = v)}>{l}</button>
         {/each}
       </div>
-      <label class="block space-y-1.5"><span class="label">Name</span><input class="input font-mono" bind:value={name} placeholder={suggested} disabled={fixedName} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
-      {#if fixedName}<p class="text-[12px] text-faint">MySQL always names the primary key PRIMARY.</p>{/if}
+      <label class="block space-y-1.5"><span class="label">Name</span><input class="input input-sm font-mono" bind:value={name} placeholder={suggested} disabled={fixedName} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+      {#if fixedName}<p class="text-sm text-faint">MySQL always names the primary key PRIMARY.</p>{/if}
       {#if cKind === 'check'}
-        <label class="block space-y-1.5"><span class="label">Expression</span><textarea class="input h-20 py-1.5 font-mono" bind:value={check} placeholder="price >= 0" autocapitalize="off" spellcheck="false"></textarea></label>
+        <label class="block space-y-1.5"><span class="label">Expression</span><textarea class="input h-20 py-1.5 font-mono text-sm" bind:value={check} placeholder="price >= 0" autocapitalize="off" spellcheck="false"></textarea></label>
       {:else}
         {@render colPicker('Columns')}
       {/if}
     {:else if kind === 'foreignKey'}
-      <label class="block space-y-1.5"><span class="label">Name</span><input class="input font-mono" bind:value={name} placeholder={suggested} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+      <label class="block space-y-1.5"><span class="label">Name</span><input class="input input-sm font-mono" data-autofocus bind:value={name} placeholder={suggested} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
       {@render colPicker('Columns')}
       <div class="grid {e === 'pg' ? 'grid-cols-2' : 'grid-cols-1'} gap-2">
         {#if e === 'pg'}
           <label class="block space-y-1.5"><span class="label">Referenced schema</span>
-            <select class="input font-mono" bind:value={refSchema} onchange={loadRefTables}>
+            <select class="input input-sm select-native font-mono" bind:value={refSchema} onchange={loadRefTables}>
               {#each schemas.length ? schemas : [refSchema] as s (s)}<option value={s}>{s}</option>{/each}
             </select>
           </label>
         {/if}
         <label class="block space-y-1.5"><span class="label">Referenced table</span>
-          <select class="input font-mono" bind:value={refTable} onchange={loadRefCols}>
+          <select class="input input-sm select-native font-mono" bind:value={refTable} onchange={loadRefCols}>
             {#each refTables as t (t)}<option value={t}>{t}</option>{/each}
           </select>
         </label>
@@ -220,9 +222,9 @@
           <span class="label">Column pairs</span>
           {#each picked as c, i (c)}
             <div class="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
-              <span class="truncate font-mono text-[12px] text-ink">{c}</span>
+              <span class="truncate font-mono text-sm text-ink">{c}</span>
               <span class="text-faint">→</span>
-              <select class="input h-7 font-mono text-[12px]" aria-label="Referenced column for {c}" bind:value={refPicked[i]}>
+              <select class="input input-sm select-native font-mono" aria-label="Referenced column for {c}" bind:value={refPicked[i]}>
                 <option value="">Choose…</option>
                 {#each refCols as r (r.name)}<option value={r.name}>{r.name}</option>{/each}
               </select>
@@ -231,26 +233,30 @@
         </div>
       {/if}
       <div class="grid grid-cols-2 gap-2">
-        <label class="block space-y-1.5"><span class="label">On update</span><select class="input" bind:value={onUpdate}>{#each FK_RULES as r (r)}<option value={r}>{r}</option>{/each}</select></label>
-        <label class="block space-y-1.5"><span class="label">On delete</span><select class="input" bind:value={onDelete}>{#each FK_RULES as r (r)}<option value={r}>{r}</option>{/each}</select></label>
+        <div class="space-y-1.5">
+          <label for="schema-fk-update" class="label block">On update</label>
+          <Select id="schema-fk-update" aria-label="On update" size="sm" bind:value={onUpdate} options={fkRules} />
+        </div>
+        <div class="space-y-1.5">
+          <label for="schema-fk-delete" class="label block">On delete</label>
+          <Select id="schema-fk-delete" aria-label="On delete" size="sm" bind:value={onDelete} options={fkRules} />
+        </div>
       </div>
-      {#if schemaError}<p class="text-[12px] text-red-700 dark:text-red-400">{schemaError}</p>{/if}
-      {#if refError}<p class="text-[12px] text-red-700 dark:text-red-400">{refError}</p>{/if}
+      {#if schemaError}<p class="text-sm text-danger">{schemaError}</p>{/if}
+      {#if refError}<p class="text-sm text-danger">{refError}</p>{/if}
     {:else if kind === 'index'}
-      <label class="block space-y-1.5"><span class="label">Name</span><input class="input font-mono" bind:value={name} placeholder={suggested} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
+      <label class="block space-y-1.5"><span class="label">Name</span><input class="input input-sm font-mono" data-autofocus bind:value={name} placeholder={suggested} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" /></label>
       {#if nameOnly}
-        <p class="text-[12px] leading-relaxed text-faint">This index has parts the form cannot show, such as expressions, sort order, WHERE, INCLUDE or FULLTEXT. You can change only the name.</p>
+        <p class="text-sm leading-relaxed text-faint">This index has parts the form cannot show, such as expressions, sort order, WHERE, INCLUDE or FULLTEXT. You can change only the name.</p>
       {:else}
         {@render colPicker('Columns')}
         <div class="flex items-center gap-4">
-          <label class="flex items-center gap-2 text-[12.5px]"><input type="checkbox" bind:checked={unique} /> Unique</label>
+          <label class="flex items-center gap-2 text-sm"><input type="checkbox" bind:checked={unique} /> Unique</label>
           {#if INDEX_METHODS[e].length}
-            <label class="flex items-center gap-2 text-[12.5px]">Method
-              <select class="input h-7 w-32 font-mono text-[12px]" bind:value={method}>
-                <option value="">Default</option>
-                {#each INDEX_METHODS[e] as m (m)}<option value={m}>{m}</option>{/each}
-              </select>
-            </label>
+            <div class="flex items-center gap-2 text-sm">
+              <label for="schema-index-method">Method</label>
+              <Select id="schema-index-method" aria-label="Method" size="sm" class="w-32 font-mono" bind:value={method} options={indexMethods} />
+            </div>
           {/if}
         </div>
       {/if}
@@ -260,9 +266,9 @@
   {/snippet}
 
   {#snippet notes()}
-    <p class="text-[12px] leading-relaxed text-faint">The statement runs immediately and commits.{#if built?.atomic}{' '}All statements commit together, or none does.{/if}</p>
+    <p class="text-sm leading-relaxed text-faint">The statement runs immediately and commits.{#if built?.atomic}{' '}All statements commit together, or none does.{/if}</p>
     {#if built?.rewritesColumn}
-      <p class="rounded-lg bg-amber-500/10 px-3 py-2 text-[12px] leading-relaxed text-amber-800 dark:text-amber-300">CHANGE COLUMN writes the full column again. AUTO_INCREMENT, COMMENT and ON UPDATE are not in this form. If the column has them, they go away.</p>
+      <p class="rounded-lg bg-warn-soft px-3 py-2 text-sm leading-relaxed text-warn">CHANGE COLUMN writes the full column again. AUTO_INCREMENT, COMMENT and ON UPDATE are not in this form. If the column has them, they go away.</p>
     {/if}
   {/snippet}
 </SchemaFormDialog>

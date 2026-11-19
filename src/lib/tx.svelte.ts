@@ -1,11 +1,11 @@
 import { api, ApiError, errorText } from './api';
-import { db, canWrite, type Conn } from './connections.svelte';
+import { db, canWrite, isSql, type Conn } from './connections.svelte';
 import { activeTab, type Tab } from './tabs.svelte';
 import { ask } from './ask.svelte';
 import PendingTxDialog from './components/PendingTxDialog.svelte';
 
-/** Writable Production connections run in the tab's own session: changes wait for Commit or Rollback. */
-export const manualCommit = (c: Conn | undefined): c is Conn => !!c && c.env === 'production' && canWrite(c);
+/** Writable Production SQL connections run in the tab's own session: changes wait for Commit or Rollback. */
+export const manualCommit = (c: Conn | undefined): c is Conn => !!c && isSql(c) && c.env === 'production' && canWrite(c);
 
 /** A failed read keeps the last known status; it must never break the run that asked for it. */
 export async function refreshStatus(t: Tab) {

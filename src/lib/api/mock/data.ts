@@ -1,13 +1,14 @@
 import type { ColumnInfo, Connection, Engine, TableInfo } from '../generated/wire';
 import type { Row, Schema } from '../types';
 
-export const versions: Record<Engine, string> = { pg: 'PostgreSQL 16.4', mysql: 'MySQL 8.4', sqlite: 'SQLite 3.46', mongo: 'MongoDB 8.0.3' };
+export const versions: Record<Engine, string> = { pg: 'PostgreSQL 16.4', mysql: 'MySQL 8.4', sqlite: 'SQLite 3.46', mongo: 'MongoDB 8.0.3', redis: 'Redis 7.4.1' };
 
 export const seedConnections: Connection[] = [
-  { id: 'prod', name: 'prod-analytics', engine: 'pg', version: 'PostgreSQL 16.4', env: 'production', host: 'prod-analytics.db.internal', port: 5432, database: 'analytics_prod', user: 'analyst', ssl: 'require', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null },
-  { id: 'shop', name: 'shop-staging', engine: 'mysql', version: 'MySQL 8.4', env: 'staging', host: 'shop-staging.db.internal', port: 3306, database: 'shop', user: 'app', ssl: 'prefer', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null },
-  { id: 'notes', name: 'notes.db', engine: 'sqlite', version: 'SQLite 3.46', env: 'local', host: '', port: 0, database: 'main', user: '', ssl: 'prefer', file: '~/data/notes.db', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null },
-  { id: 'mongo', name: 'local mongo', engine: 'mongo', version: 'MongoDB 8.0.3', env: 'local', host: '127.0.0.1', port: 57017, database: 'shop_staging', user: 'sandb', ssl: 'disable', file: '', aiWrite: false, readOnly: false, uri: '', authSource: 'admin', topology: 'replica_set' },
+  { id: 'prod', name: 'prod-analytics', engine: 'pg', version: 'PostgreSQL 16.4', env: 'production', host: 'prod-analytics.db.internal', port: 5432, database: 'analytics_prod', user: 'analyst', ssl: 'require', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
+  { id: 'shop', name: 'shop-staging', engine: 'mysql', version: 'MySQL 8.4', env: 'staging', host: 'shop-staging.db.internal', port: 3306, database: 'shop', user: 'app', ssl: 'prefer', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
+  { id: 'notes', name: 'notes.db', engine: 'sqlite', version: 'SQLite 3.46', env: 'local', host: '', port: 0, database: 'main', user: '', ssl: 'prefer', file: '~/data/notes.db', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: null },
+  { id: 'mongo', name: 'local mongo', engine: 'mongo', version: 'MongoDB 8.0.3', env: 'local', host: '127.0.0.1', port: 57017, database: 'shop_staging', user: 'sandb', ssl: 'disable', file: '', aiWrite: false, readOnly: false, uri: '', authSource: 'admin', topology: 'replica_set', redis: null },
+  { id: 'redis', name: 'Local Redis', engine: 'redis', version: 'Redis 7.4.1', env: 'local', host: '127.0.0.1', port: 6379, database: '0', user: '', ssl: 'disable', file: '', aiWrite: false, readOnly: false, uri: '', authSource: '', topology: null, redis: { mode: 'standalone', sentinelMaster: '', sentinelAuth: false } },
 ];
 
 export const schemas: Record<string, Schema> = {
@@ -35,12 +36,13 @@ export const schemas: Record<string, Schema> = {
 
 // Tables outside the engine's default schema. Table names are unique across the mock data.
 const tableNs: Record<string, string> = { daily_revenue: 'analytics', events: 'analytics' };
-// MongoDB has no SQL namespace; no SQL view opens on it.
-const defaultNs = { pg: 'public', mysql: 'shop', sqlite: 'main', mongo: '' } as const;
-export const nsOf = (engine: keyof typeof defaultNs, table: string) => tableNs[table] ?? defaultNs[engine];
+const defaultNs = { pg: 'public', mysql: 'shop', sqlite: 'main' } as const;
+export const nsOf = (engine: Engine, table: string) => tableNs[table] ?? (engine === 'mongo' || engine === 'redis' ? '' : defaultNs[engine]);
 
-const mockSchemaOf: Record<Engine, string> = { pg: 'prod', mysql: 'shop', sqlite: 'notes', mongo: '' };
-export const mockSchema = (c: Connection) => schemas[mockSchemaOf[c.engine]];
+export function mockSchema(c: Connection): Schema {
+  if (c.engine === 'mongo' || c.engine === 'redis') throw new Error('SQL mock data needs a SQL connection');
+  return schemas[{ pg: 'prod', mysql: 'shop', sqlite: 'notes' }[c.engine]];
+}
 
 const names = ['Livia Saris', 'Jaydon Aminoff', 'Maria Lubin', 'Ann Press', 'John Clarkson', 'Aspen Lubin', 'Kierra Gouse', 'Omar Dias', 'Mila Novak', 'Theo Grant'];
 const statuses = ['paid', 'shipped', 'pending', 'cancelled', 'refunded'];

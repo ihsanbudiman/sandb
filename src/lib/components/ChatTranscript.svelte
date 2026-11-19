@@ -1,13 +1,13 @@
 <script lang="ts">
-  import { Ban, BookOpen, Braces, Check, ChartColumn, ChevronRight, Clock, Copy, FileCode, FileDown, FileSpreadsheet, LoaderCircle, ListTree, RotateCw, Sparkles, Table2, TriangleAlert, X } from '@lucide/svelte';
+  import { Ban, BookOpen, Braces, Check, ChartColumn, ChevronDown, ChevronRight, Clock, Copy, FileCode, FileDown, FileSpreadsheet, LoaderCircle, ListTree, RotateCw, Sparkles, Table2, TriangleAlert, X } from '@lucide/svelte';
   import Markdown from './Markdown.svelte';
   import ChartView from './ChartView.svelte';
   import TargetBadge from './TargetBadge.svelte';
   import { ApiError, type Row } from '../api';
   import { chat, decide, rerun } from '../chat.svelte';
   import type { Msg, ToolPart } from '../chatModel';
-  import { destructive, isChartTool, isDescribeTool, isReadTool, mongoStep, mongoTag, startingLabel, STATUS_LABEL, STATUS_TEXT, STATUS_TONE, TOOL_LABEL } from '../chatTools';
-  import { afterStep, argsOf, blocks, busy, duration, fenceSource, lastQuery, mongoInReply, numeric, processPart, replyMs, replyText, sourceLabel, stepTarget, toolMs, workEnd, workSteps } from '../chatParts';
+  import { destructive, isChartTool, isDescribeTool, isReadTool, mongoStep, mongoTag, redisStep, startingLabel, STATUS_LABEL, STATUS_TEXT, STATUS_TONE, TOOL_LABEL } from '../chatTools';
+  import { afterStep, argsOf, blocks, busy, chatDatabaseLabel, duration, fenceSource, lastQuery, mongoInReply, numeric, processPart, replyMs, replyText, sourceLabel, stepTarget, toolMs, workEnd, workSteps } from '../chatParts';
   import { connOf, dbOf, type Conn, type Source } from '../connections.svelte';
   import { Flash } from '../flash.svelte';
   import { exportReply } from '../report';
@@ -45,6 +45,8 @@
     onsubmit: (text: string) => void;
     onretry: (mi: number) => void;
   } = $props();
+
+  const redisEditor = $derived(!!activeSource && connOf(activeSource)?.engine === 'redis');
 
   let list = $state<HTMLDivElement>();
   let stream = $state<HTMLDivElement>();
@@ -136,11 +138,11 @@
 
 <!-- Text actions of a read: of a step, and of the "Query used" box under a reply whose steps are hidden. -->
 {#snippet sqlTools(p: ToolPart, key: string)}
-  {@const noun = mongoStep(p) ? 'query' : 'SQL'}
-  <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Copy {noun}" aria-label="Copy {noun}" onclick={() => copy(`${key}:sql`, p.sql!)}>{#if copied.current === `${key}:sql`}<Check size={13} />{:else}<Copy size={13} />{/if}</button>
-  <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Put the {noun} in the editor" aria-label="Put the {noun} in the editor" onclick={() => oninsert(p.sql!, p.source)}><FileCode size={13} /></button>
+  {@const noun = redisStep(p) ? 'command' : mongoStep(p) ? 'query' : 'SQL'}
+  <button class="btn btn-sm btn-ghost size-6 p-0" title="Copy {noun}" aria-label="Copy {noun}" onclick={() => copy(`${key}:sql`, p.sql!)}>{#if copied.current === `${key}:sql`}<Check size={13} />{:else}<Copy size={13} />{/if}</button>
+  <button class="btn btn-sm btn-ghost size-6 p-0" title="Put the {noun} in the editor" aria-label="Put the {noun} in the editor" onclick={() => oninsert(p.sql!, p.source)}><FileCode size={13} /></button>
   {#if isReadTool(p) && p.status === 'done'}
-    <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Open in the results grid (new tab)" aria-label="Open in the results grid" onclick={() => onrun(p.sql!, p.source)}><Table2 size={13} /></button>
+    <button class="btn btn-sm btn-ghost size-6 p-0" title="Open in the results grid (new tab)" aria-label="Open in the results grid" onclick={() => onrun(p.sql!, p.source)}><Table2 size={13} /></button>
   {/if}
 {/snippet}
 
@@ -148,11 +150,11 @@
   {#if messages.length === 0}
     <div class="pt-8">
       <div class="grid size-8 place-items-center rounded-lg bg-accent/12 text-accent"><Sparkles size={15} /></div>
-      <div class="mt-3 text-[14px] font-semibold">Ask about your data</div>
-      <p class="mt-1 text-[12.5px] leading-relaxed text-muted">The assistant can read the schema of the databases below and run read-only queries. Add more databases to ask across them. It cannot change data unless you turn on write mode.</p>
+      <div class="mt-3 text-lg font-semibold">Ask about your data</div>
+      <p class="mt-1 text-sm leading-relaxed text-muted">The assistant can read the schema of the databases below and run read-only queries. Add more databases to ask across them. It cannot change data unless you turn on write mode.</p>
       <div class="mt-5 space-y-1.5">
         {#each suggestions as s}
-          <button class="flex w-full items-center rounded-lg border border-line px-3 py-2 text-left text-[12.5px] text-muted hover:bg-hover hover:text-ink" onclick={() => onsubmit(s.text)}>
+          <button class="focus-ring flex w-full items-center rounded-lg border border-line px-3 py-2 text-left text-sm text-muted hover:bg-hover hover:text-ink" onclick={() => onsubmit(s.text)}>
             {s.text}
           </button>
         {/each}
@@ -170,14 +172,14 @@
           {#if m.skills?.length}
             <div class="mb-1 flex flex-wrap justify-end gap-1">
               {#each m.skills as name (name)}
-                <span class="inline-flex items-center gap-1 rounded bg-surface px-1.5 py-0.5 text-[10.5px] font-medium text-muted" title="Skill sent with this question"><BookOpen size={10} /> {skillTitle(name)}</span>
+                <span class="chip font-medium" title="Skill sent with this question"><BookOpen size={12} /> {skillTitle(name)}</span>
               {/each}
             </div>
           {/if}
           <div class="break-words whitespace-pre-wrap {long && !revealed[uk] ? 'line-clamp-8' : ''}">{text}</div>
           {#if long}
-            <button class="-ml-1 mt-1 flex h-6 items-center gap-1 rounded px-1 text-[12px] text-muted hover:bg-hover hover:text-ink" aria-expanded={!!revealed[uk]} onclick={() => (revealed[uk] = !revealed[uk])}>
-              <ChevronRight size={12} class="transition-transform {revealed[uk] ? '-rotate-90' : 'rotate-90'}" />{revealed[uk] ? 'Show less' : 'Show more'}
+            <button class="btn btn-sm btn-ghost -ml-1 mt-1 gap-1 px-1" aria-expanded={!!revealed[uk]} onclick={() => (revealed[uk] = !revealed[uk])}>
+              <ChevronDown size={12} class="motion-safe:transition-transform motion-safe:duration-150 {revealed[uk] ? 'rotate-180' : ''}" />{revealed[uk] ? 'Show less' : 'Show more'}
             </button>
           {/if}
         </div>
@@ -192,31 +194,34 @@
         <div class="space-y-2.5">
           {#if compact && work.length}
             {@const working = !!chat.live && m === messages.at(-1) && busy(m.parts, !!chat.pending)}
-            <button class="-ml-1 flex h-6 items-center gap-1.5 rounded px-1 text-[12px] text-faint hover:bg-hover hover:text-ink" aria-expanded={!hide} onclick={() => (revealed[rk] = !revealed[rk])} title="{hide ? 'Show the steps of this reply' : 'Hide the steps of this reply'}{qt !== undefined ? ` · query ${duration(qt)}` : ''}">
-              {#if working}<LoaderCircle size={12} class="animate-spin text-accent" /> Working · step {work.length}
+            <button class="btn btn-sm btn-ghost -ml-1 px-1 text-faint" aria-expanded={!hide} onclick={() => (revealed[rk] = !revealed[rk])} title="{hide ? 'Show the steps of this reply' : 'Hide the steps of this reply'}{qt !== undefined ? ` · query ${duration(qt)}` : ''}">
+              {#if working}<LoaderCircle size={12} class="text-accent motion-safe:animate-spin" /> Working · step {work.length}
               {:else}<ListTree size={12} /> {work.length} {work.length === 1 ? 'step' : 'steps'}{#if rt !== undefined} · {duration(rt)}{:else if qt !== undefined} · {duration(qt)}{/if}{/if}
-              <ChevronRight size={12} class="transition-transform {hide ? '' : 'rotate-90'}" />
+              <ChevronRight size={12} class="motion-safe:transition-transform motion-safe:duration-150 {hide ? '' : 'rotate-90'}" />
             </button>
           {/if}
           {#each blocks(m.parts, hide ? (p, at) => processPart(p, at, end, !!chat.pending) : undefined) as b}
             {#if b.kind === 'part'}
             {@const p = b.p}
             {#if p.kind === 'text'}
-              <Markdown text={p.text} mongo={mongoInReply(m, scope)} onrunsql={(sql, anchor, mongo) => onrunmenu(sql, anchor, fenceSource(m, scope, activeSource, mongo))} />
+              <Markdown text={p.text} mongo={mongoInReply(m, scope)} redis={redisEditor} onrunsql={(sql, anchor, language) => {
+                const source = fenceSource(m, scope, activeSource, language);
+                if (source || !redisEditor) onrunmenu(sql, anchor, source);
+              }} />
             {:else if p.kind === 'chart'}
               <ChartView part={p} />
             {:else if p.kind === 'error'}
-              <p class="flex items-start gap-2 leading-relaxed text-red-700 dark:text-red-400"><TriangleAlert size={13} class="mt-1 shrink-0" /><span class="min-w-0 break-words">{p.text}</span></p>
+              <p class="flex items-start gap-2 leading-relaxed text-danger"><TriangleAlert size={13} class="mt-1 shrink-0" /><span class="min-w-0 break-words">{p.text}</span></p>
             {/if}
             {:else}
               {@const running = b.steps.some((s) => s.p.status === 'running')}
               {@const asking = b.steps.some((s) => s.p.status === 'awaiting') && !!chat.pending}
               {@const danger = asking && b.steps.some((s) => s.p.status === 'awaiting' && !!s.p.sql && destructive(s.p))}
               {@const total = b.steps.reduce((n, s) => n + (s.p.ms ?? 0), 0)}
-              <div class="overflow-hidden rounded-lg border {asking ? (danger ? 'border-red-500/50 ring-3 ring-red-500/10' : 'border-amber-500/50 ring-3 ring-amber-500/10') : 'border-line'}">
-                <div class="flex h-7 items-center gap-2 bg-sunken px-2.5 text-[11.5px] text-faint">
+              <div class="overflow-hidden rounded-lg border {asking ? (danger ? 'border-danger/50 ring-3 ring-danger-soft' : 'border-warn/50 ring-3 ring-warn-soft') : 'border-line'}">
+                <div class="flex h-list-row items-center gap-2 bg-sunken px-2.5 text-xs text-faint">
                   {#if running}
-                    <LoaderCircle size={12} class="animate-spin text-accent" /> <span>Working · step {b.steps.length}</span>
+                    <LoaderCircle size={12} class="text-accent motion-safe:animate-spin" /> <span>Working · step {b.steps.length}</span>
                   {:else}
                     <span>{b.steps.length} {b.steps.length === 1 ? 'step' : 'steps'}</span>
                   {/if}
@@ -230,45 +235,45 @@
                     {@const risky = waiting && !!p.sql && destructive(p)}
                     {@const implicit = p.info?.warnings.some((w) => w.code === 'implicit_commit') ?? false}
                     {@const refused = p.status === 'blocked' || p.status === 'denied'}
-                    {@const failed = refused || p.status === 'failed'}
+                    {@const tone = STATUS_TONE[p.status]}
                     {@const sc = (p.source && connOf(p.source)) || scopeConns[0]}
                     <li class="border-t border-line">
-                      <button class="flex h-8 w-full items-center gap-2 px-2.5 text-left text-[12px] hover:bg-hover" aria-expanded={open} onclick={() => (opened[key] = !open)}>
-                        <span class="w-3.5 shrink-0 text-center text-[10.5px] text-faint tabular-nums">{si + 1}</span>
-                        {#if p.status === 'running'}<LoaderCircle size={13} class="shrink-0 animate-spin text-accent" />
-                        {:else if refused}<Ban size={13} class="shrink-0 text-red-600 dark:text-red-400" />
-                        {:else if p.status === 'failed'}<TriangleAlert size={13} class="shrink-0 text-red-600 dark:text-red-400" />
-                        {:else if p.status === 'awaiting'}<Clock size={13} class="shrink-0 text-amber-600 dark:text-amber-400" />
-                        {:else if isChartTool(p)}<ChartColumn size={13} class="shrink-0 text-emerald-600 dark:text-emerald-400" />
-                        {:else if p.tool === 'skill'}<BookOpen size={13} class="shrink-0 text-sky-600 dark:text-sky-400" />
-                        {:else}<Check size={13} class="shrink-0 text-emerald-600 dark:text-emerald-400" />{/if}
+                      <button class="focus-ring flex h-rich-menu-row w-full items-center gap-2 px-2.5 text-left text-sm hover:bg-hover focus-visible:outline-offset-[-2px]" aria-expanded={open} onclick={() => (opened[key] = !open)}>
+                        <span class="w-3.5 shrink-0 text-center text-2xs text-faint tabular-nums">{si + 1}</span>
+                        {#if p.status === 'running'}<LoaderCircle size={13} class="shrink-0 motion-safe:animate-spin {tone}" />
+                        {:else if refused}<Ban size={13} class="shrink-0 {tone}" />
+                        {:else if p.status === 'failed'}<TriangleAlert size={13} class="shrink-0 {tone}" />
+                        {:else if p.status === 'awaiting'}<Clock size={13} class="shrink-0 {tone}" />
+                        {:else if isChartTool(p)}<ChartColumn size={13} class="shrink-0 {tone}" />
+                        {:else if p.tool === 'skill'}<BookOpen size={13} class="shrink-0 text-accent" />
+                        {:else}<Check size={13} class="shrink-0 {tone}" />{/if}
                         <span class="shrink-0 font-medium text-ink">{TOOL_LABEL[p.tool] ?? p.name}</span>
-                        {#if many && p.source}<span class="max-w-24 shrink-0 truncate rounded bg-sunken px-1 font-mono text-[10.5px] text-muted" title={sourceLabel(p.source)}>{dbOf(p.source)}</span>{/if}
-                        <span class="min-w-0 flex-1 truncate font-mono text-[11.5px] text-muted">{open && !isDescribeTool(p) ? '' : stepTarget(p)}</span>
-                        <span class="shrink-0 text-[11px] text-faint tabular-nums">{duration(p.ms)}</span>
-                        {#if p.status !== 'done'}<span class="shrink-0 text-[11.5px] {STATUS_TONE[p.status]}" title={STATUS_LABEL[p.status] ?? p.status}><span class="sr-only">{STATUS_LABEL[p.status] ?? p.status}: </span><span class="sentence">{STATUS_TEXT[p.status] ?? p.status}</span></span>{/if}
-                        <ChevronRight size={13} class="shrink-0 text-faint transition-transform {open ? 'rotate-90' : ''}" />
+                        {#if many && p.source}<span class="max-w-24 shrink-0 truncate rounded bg-sunken px-1 font-mono text-2xs text-muted" title={sourceLabel(p.source)}>{chatDatabaseLabel(connOf(p.source), dbOf(p.source))}</span>{/if}
+                        <span class="min-w-0 flex-1 truncate font-mono text-xs text-muted">{open && !isDescribeTool(p) ? '' : stepTarget(p)}</span>
+                        <span class="shrink-0 text-xs text-faint tabular-nums">{duration(p.ms)}</span>
+                        {#if p.status !== 'done'}<span class="shrink-0 text-xs {tone}" title={STATUS_LABEL[p.status] ?? p.status}><span class="sr-only">{STATUS_LABEL[p.status] ?? p.status}: </span><span class="sentence">{STATUS_TEXT[p.status] ?? p.status}</span></span>{/if}
+                        <ChevronRight size={13} class="shrink-0 text-faint motion-safe:transition-transform motion-safe:duration-150 {open ? 'rotate-90' : ''}" />
                       </button>
                       {#if open}
                         {@const sqlActions = !!p.sql && !isDescribeTool(p) && !waiting}
                         {#if p.sql && !isDescribeTool(p)}
-                          <pre class="max-h-64 overflow-auto border-t border-line bg-sunken px-3 py-2 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap text-ink">{@html sqlHtml(p.sql, sc?.engine)}</pre>
+                          <pre class="max-h-64 overflow-auto border-t border-line bg-sunken px-3 py-2 font-mono text-xs leading-relaxed whitespace-pre-wrap text-ink">{@html sqlHtml(p.sql, redisStep(p) ? 'redis' : sc?.engine)}</pre>
                         {/if}
                         {#if p.rows?.length}
                           {@const cols = Object.keys(p.rows[0])}
                           {@const nums = numeric(p.rows)}
                           <div class="max-h-80 overflow-auto border-t border-line">
-                            <table class="w-full text-[12px]">
-                              <thead class="sticky top-0 bg-surface"><tr>{#each cols as c}<th class="px-3 pt-2 pb-1 text-[11.5px] font-medium whitespace-nowrap text-faint {nums[c] ? 'text-right' : 'text-left'}">{c}</th>{/each}</tr></thead>
-                              <tbody class="font-mono text-[11.5px]">
+                            <table class="w-full text-sm">
+                              <thead class="sticky top-0 z-sticky bg-surface"><tr>{#each cols as c}<th scope="col" class="th px-3 pt-2 pb-1 whitespace-nowrap {nums[c] ? 'text-right' : 'text-left'}">{c}</th>{/each}</tr></thead>
+                              <tbody class="font-mono text-xs">
                                 {#each p.rows as r, ri}
                                   <tr class="border-t border-line/60">
                                     {#each cols as c}
                                       {@const v = r[c]}
                                       {@const sel = cell?.key === `${key}:${ri}` && cell.col === c}
                                       <td class="max-w-48 p-0">
-                                        <button class="block w-full truncate px-3 py-1 whitespace-nowrap tabular-nums {nums[c] ? 'text-right' : 'text-left'} {sel ? 'bg-accent/10' : 'hover:bg-hover'}" title="Show the full value" onclick={() => (cell = sel ? null : { key: `${key}:${ri}`, col: c, value: v })}>
-                                          {#if v === null}<span class="text-[11px] text-faint italic">NULL</span>{:else}{fmt(v)}{/if}
+                                        <button class="focus-ring block w-full truncate px-3 py-1 whitespace-nowrap tabular-nums focus-visible:outline-offset-[-2px] {nums[c] ? 'text-right' : 'text-left'} {sel ? 'bg-accent/10' : 'hover:bg-hover'}" title="Show the full value" onclick={() => (cell = sel ? null : { key: `${key}:${ri}`, col: c, value: v })}>
+                                          {#if v === null}<span class="text-xs text-faint italic">NULL</span>{:else}{fmt(v)}{/if}
                                         </button>
                                       </td>
                                     {/each}
@@ -279,69 +284,77 @@
                           </div>
                           {#if cell?.key.startsWith(`${key}:`)}
                             {@const c = cell}
-                            <div class="border-t border-line bg-sunken px-3 py-2 text-[12px]">
-                              <div class="flex items-center gap-2 text-[11.5px] text-faint">
+                            <div class="border-t border-line bg-sunken px-3 py-2 text-sm">
+                              <div class="flex items-center gap-2 text-xs text-faint">
                                 <span class="min-w-0 truncate font-mono text-muted">{c.col}</span>
                                 <span>row {Number(c.key.slice(key.length + 1)) + 1}</span>
-                                <button class="ml-auto grid size-6 place-items-center rounded hover:bg-hover hover:text-ink" title="Copy value" aria-label="Copy value" onclick={() => copy('cell', c.value === null ? '' : full(c.value))}>{#if copied.current === 'cell'}<Check size={12} />{:else}<Copy size={12} />{/if}</button>
-                                <button class="grid size-6 place-items-center rounded hover:bg-hover hover:text-ink" title="Close" aria-label="Close value" onclick={() => (cell = null)}><X size={12} /></button>
+                                <button class="btn btn-sm btn-ghost ml-auto size-6 p-0" title="Copy value" aria-label="Copy value" onclick={() => copy('cell', c.value === null ? '' : full(c.value))}>{#if copied.current === 'cell'}<Check size={12} />{:else}<Copy size={12} />{/if}</button>
+                                <button class="btn btn-sm btn-ghost size-6 p-0" title="Close" aria-label="Close value" onclick={() => (cell = null)}><X size={12} /></button>
                               </div>
-                              <pre class="mt-1 max-h-40 overflow-auto font-mono text-[11.5px] break-all whitespace-pre-wrap text-ink">{#if c.value === null}<span class="text-faint italic">NULL</span>{:else}{full(c.value)}{/if}</pre>
+                              <pre class="mt-1 max-h-40 overflow-auto font-mono text-xs break-all whitespace-pre-wrap text-ink">{#if c.value === null}<span class="text-faint italic">NULL</span>{:else}{full(c.value)}{/if}</pre>
                             </div>
                           {/if}
                           {#if p.truncated}
-                            <div class="border-t border-line px-3 py-1.5 text-[12px] text-amber-700 dark:text-amber-400">More rows exist. The chat shows the first {p.rows.length}.{isReadTool(p) ? ' Open the query in the grid to see all rows.' : ''}</div>
+                            <div class="border-t border-line px-3 py-1.5 text-sm text-warn">More rows exist. The chat shows the first {p.rows.length}.{isReadTool(p) ? ' Open the query in the grid to see all rows.' : ''}</div>
                           {/if}
                         {/if}
                         {#if waiting && p.sql && sc}
                           <div class="space-y-2.5 border-t border-line px-3 py-2.5">
                             <TargetBadge bare conn={sc} name={p.source ? sourceLabel(p.source) : sc.name}>
-                              <span class="tag font-mono text-amber-700 dark:text-amber-400">{mongoStep(p) ? mongoTag(p) : p.sql.trim().split(/\s+/)[0].toUpperCase()}</span>
+                              <span class="tag font-mono text-warn">{mongoStep(p) ? mongoTag(p) : (sc.engine === 'redis' && p.info?.statements[0]?.kind) || p.sql.trim().split(/\s+/, 1)[0].toUpperCase()}</span>
                             </TargetBadge>
-                            {#if risky}
-                              <div class="flex gap-2 rounded-md bg-red-500/8 px-2.5 py-2 text-[12px] leading-relaxed text-red-700 dark:text-red-300">
+                            {#if sc.engine === 'redis'}
+                              <p class="text-sm {risky ? 'text-danger' : 'text-muted'}">Redis runs this as one command. There is no rollback after it ran.</p>
+                              {#each p.info?.warnings ?? [] as w}
+                                <div class="flex gap-2 rounded-md bg-danger-soft px-2.5 py-2 text-sm leading-relaxed text-danger">
+                                  <TriangleAlert size={13} class="mt-0.5 shrink-0" />
+                                  <span>{w.message}</span>
+                                </div>
+                              {/each}
+                            {:else if risky}
+                              <div class="flex gap-2 rounded-md bg-danger-soft px-2.5 py-2 text-sm leading-relaxed text-danger">
                                 <TriangleAlert size={13} class="mt-0.5 shrink-0" />
                                 <span>{sc.engine === 'mongo' ? 'This statement removes data. You cannot undo it after it runs.' : implicit ? 'This statement removes data. A statement in this batch may commit as it runs, so the batch cannot be fully rolled back.' : 'This statement removes data. It runs inside a transaction, but you cannot undo it after it commits.'}</span>
                               </div>
                             {:else if implicit}
-                              <div class="flex gap-2 rounded-md bg-amber-500/10 px-2.5 py-2 text-[12px] leading-relaxed text-amber-800 dark:text-amber-300">
+                              <div class="flex gap-2 rounded-md bg-warn-soft px-2.5 py-2 text-sm leading-relaxed text-warn">
                                 <TriangleAlert size={13} class="mt-0.5 shrink-0" />
                                 <span>A statement in this batch may commit as it runs, so the batch cannot be fully rolled back.</span>
                               </div>
                             {:else}
-                              <p class="text-[12px] text-muted">It runs only if you approve it.</p>
+                              <p class="text-sm text-muted">It runs only if you approve it.</p>
                             {/if}
-                            <div class="flex items-center gap-1.5">
-                              <button class="flex items-center gap-1 rounded px-1 text-[12px] font-medium text-accent hover:underline" onclick={() => oninsert(p.sql!, p.source)}><Copy size={12} /> To editor</button>
+                            <div class="flex flex-wrap items-center gap-1.5">
+                              <button class="btn btn-sm btn-ghost px-1 text-accent" onclick={() => oninsert(p.sql!, p.source)}><Copy size={12} /> To editor</button>
                               {#if risky}
-                                <button class="btn btn-secondary ml-auto h-7 px-2.5 text-[12px]" use:autofocus onclick={() => decide(false)}>Deny</button>
-                                <button class="btn h-7 bg-red-600 px-2.5 text-[12px] text-white hover:bg-red-500" onclick={() => decide(true)}>Approve and run</button>
+                                <button class="btn btn-sm btn-secondary ml-auto" use:autofocus onclick={() => decide(false)}>Deny</button>
+                                <button class="btn btn-sm btn-danger" onclick={() => decide(true)}>Approve and run</button>
                               {:else}
-                                <button class="btn btn-secondary ml-auto h-7 px-2.5 text-[12px]" onclick={() => decide(false)}>Deny</button>
-                                <button class="btn btn-primary h-7 px-2.5 text-[12px]" use:autofocus onclick={() => decide(true)}>Approve and run</button>
+                                <button class="btn btn-sm btn-secondary ml-auto" onclick={() => decide(false)}>Deny</button>
+                                <button class="btn btn-sm btn-primary" use:autofocus onclick={() => decide(true)}>Approve and run</button>
                               {/if}
                             </div>
                           </div>
                         {/if}
                         {#if p.note || sqlActions}
-                          <div class="flex items-center gap-2 border-t border-line px-3 py-1 text-[12px] text-muted">
-                            <span class="min-w-0 flex-1 {failed ? 'text-red-700 dark:text-red-400' : ''}">{p.note ?? ''}</span>
+                          <div class="flex items-center gap-2 border-t border-line px-3 py-1 text-sm text-muted">
+                            <span class="min-w-0 flex-1 {refused || p.status === 'failed' ? tone : ''}">{p.note ?? ''}</span>
                             {#if sqlActions}
                               <span class="flex shrink-0 items-center">
                                 {@render sqlTools(p, key)}
                                 {#if isReadTool(p) && p.status !== 'blocked'}
-                                  <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink disabled:opacity-40" title="Run again" aria-label="Run again" disabled={p.status === 'running'} onclick={() => rerun(p)}><RotateCw size={13} /></button>
+                                  <button class="btn btn-sm btn-ghost size-6 p-0" title="Run again" aria-label="Run again" disabled={p.status === 'running'} onclick={() => rerun(p)}><RotateCw size={13} /></button>
                                 {/if}
                                 {#if p.rows?.length}
-                                  <button class="grid size-6 place-items-center rounded text-faint hover:bg-hover hover:text-ink" title="Copy rows as CSV" aria-label="Copy rows as CSV" onclick={() => copy(`${key}:csv`, csv(p.rows!))}>{#if copied.current === `${key}:csv`}<Check size={13} />{:else}<FileSpreadsheet size={13} />{/if}</button>
+                                  <button class="btn btn-sm btn-ghost size-6 p-0" title="Copy rows as CSV" aria-label="Copy rows as CSV" onclick={() => copy(`${key}:csv`, csv(p.rows!))}>{#if copied.current === `${key}:csv`}<Check size={13} />{:else}<FileSpreadsheet size={13} />{/if}</button>
                                 {/if}
                               </span>
                             {/if}
                           </div>
                         {/if}
-                        <details class="group border-t border-line text-[11.5px]">
-                          <summary class="flex cursor-pointer list-none items-center gap-1.5 px-3 py-1.5 text-faint select-none hover:text-ink [&::-webkit-details-marker]:hidden">
-                            <Braces size={12} /> Call details <ChevronRight size={12} class="transition-transform group-open:rotate-90" />
+                        <details class="group border-t border-line text-xs">
+                          <summary class="focus-ring flex cursor-pointer list-none items-center gap-1.5 px-3 py-1.5 text-faint select-none hover:text-ink focus-visible:outline-offset-[-2px] [&::-webkit-details-marker]:hidden">
+                            <Braces size={12} /> Call details <ChevronRight size={12} class="group-open:rotate-90 motion-safe:transition-transform motion-safe:duration-150" />
                           </summary>
                           <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 px-3 pb-1.5 font-mono">
                             <dt class="text-faint">tool</dt><dd class="min-w-0 truncate">{p.name}</dd>
@@ -351,7 +364,7 @@
                             {#if p.ms !== undefined}<dt class="text-faint">duration</dt><dd>{duration(p.ms)}</dd>{/if}
                             {#if p.rows}<dt class="text-faint">rows shown</dt><dd>{p.rows.length}{p.truncated ? ' (more exist)' : ''}</dd>{/if}
                             {#if p.note}<dt class="text-faint">result</dt><dd class="min-w-0 break-words">{p.note}</dd>{/if}
-                            {#if p.error}<dt class="text-faint">error</dt><dd class="text-red-700 dark:text-red-400">{p.error}</dd>{/if}
+                            {#if p.error}<dt class="text-faint">error</dt><dd class="text-danger">{p.error}</dd>{/if}
                           </dl>
                           <div class="px-3 pb-2">
                             <div class="font-mono text-faint">arguments</div>
@@ -368,11 +381,11 @@
           {#if chat.live && m === messages.at(-1)}
             <!-- Steps show their own state; otherwise the reply waits for the model or streams text. -->
             {#if chat.starting && !busy(m.parts, !!chat.pending)}
-              <div class="flex items-center gap-2 text-[12.5px] text-muted"><LoaderCircle size={13} class="animate-spin text-accent" /> {startingLabel(chat.starting.kind, chat.starting.name)}</div>
+              <div class="flex items-center gap-2 text-sm text-muted"><LoaderCircle size={13} class="text-accent motion-safe:animate-spin" /> {startingLabel(chat.starting.kind, chat.starting.name)}</div>
             {:else if m.parts.length === 0 || afterStep(m.parts, !!chat.pending)}
-              <div class="flex items-center gap-2 text-[12.5px] text-muted"><LoaderCircle size={13} class="animate-spin text-accent" /> Thinking…</div>
+              <div class="flex items-center gap-2 text-sm text-muted"><LoaderCircle size={13} class="text-accent motion-safe:animate-spin" /> Thinking…</div>
             {:else if m.parts.at(-1)?.kind === 'text'}
-              <div class="flex items-center gap-2 text-[12.5px] text-muted"><LoaderCircle size={13} class="animate-spin text-accent" /> Writing…</div>
+              <div class="flex items-center gap-2 text-sm text-muted"><LoaderCircle size={13} class="text-accent motion-safe:animate-spin" /> Writing…</div>
             {/if}
           {:else}
             {@const text = replyText(m.parts)}
@@ -381,12 +394,12 @@
             {#if q}
               {@const qc = (q.p.source && connOf(q.p.source)) || scopeConns[0]}
               <details class="group overflow-hidden rounded-lg border border-line">
-                <summary class="flex h-7 cursor-pointer list-none items-center gap-1.5 bg-sunken px-2.5 text-[11.5px] text-faint select-none hover:text-ink [&::-webkit-details-marker]:hidden">
-                  <FileCode size={12} /> Query used
-                  {#if many && q.p.source}<span class="max-w-24 shrink-0 truncate rounded bg-surface px-1 font-mono text-[10.5px] text-muted" title={sourceLabel(q.p.source)}>{dbOf(q.p.source)}</span>{/if}
-                  <ChevronRight size={12} class="ml-auto transition-transform group-open:rotate-90" />
+                <summary class="focus-ring flex h-list-row cursor-pointer list-none items-center gap-1.5 bg-sunken px-2.5 text-xs text-faint select-none hover:text-ink focus-visible:outline-offset-[-2px] [&::-webkit-details-marker]:hidden">
+                  <FileCode size={12} /> {redisStep(q.p) ? 'Command used' : 'Query used'}
+                  {#if many && q.p.source}<span class="max-w-24 shrink-0 truncate rounded bg-surface px-1 font-mono text-2xs text-muted" title={sourceLabel(q.p.source)}>{chatDatabaseLabel(connOf(q.p.source), dbOf(q.p.source))}</span>{/if}
+                  <ChevronRight size={12} class="ml-auto group-open:rotate-90 motion-safe:transition-transform motion-safe:duration-150" />
                 </summary>
-                <pre class="max-h-64 overflow-auto border-t border-line bg-sunken px-3 py-2 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap text-ink">{@html sqlHtml(q.sql, qc?.engine)}</pre>
+                <pre class="max-h-64 overflow-auto border-t border-line bg-sunken px-3 py-2 font-mono text-xs leading-relaxed whitespace-pre-wrap text-ink">{@html sqlHtml(q.sql, redisStep(q.p) ? 'redis' : qc?.engine)}</pre>
                 <div class="flex items-center justify-end border-t border-line px-3 py-1 text-muted">
                   <span class="flex shrink-0 items-center">{@render sqlTools(q.p, `${rk}:query`)}</span>
                 </div>
@@ -394,18 +407,18 @@
             {/if}
             <div class="-ml-1 flex items-center text-faint">
               {#if text}
-                <button class="grid size-6 place-items-center rounded hover:bg-hover hover:text-ink" title="Copy reply" aria-label="Copy reply" onclick={() => copy(`${mi}:reply`, text)}>{#if copied.current === `${mi}:reply`}<Check size={13} />{:else}<Copy size={13} />{/if}</button>
+                <button class="btn btn-sm btn-ghost size-6 p-0" title="Copy reply" aria-label="Copy reply" onclick={() => copy(`${mi}:reply`, text)}>{#if copied.current === `${mi}:reply`}<Check size={13} />{:else}<Copy size={13} />{/if}</button>
               {/if}
               {#if printable}
-                <button class="flex h-6 items-center gap-1 rounded px-1.5 text-[12px] font-medium hover:bg-hover hover:text-ink disabled:opacity-40" title="Export the reply as a PDF" aria-label="Export as PDF" disabled={exporting !== null} onclick={() => exportPdf(mi)}>{#if exporting === mi}<LoaderCircle size={13} class="animate-spin" />{:else}<FileDown size={13} />{/if} Export PDF</button>
+                <button class="btn btn-sm btn-ghost gap-1 px-1.5" title="Export the reply as a PDF" aria-label="Export as PDF" disabled={exporting !== null} onclick={() => exportPdf(mi)}>{#if exporting === mi}<LoaderCircle size={13} class="motion-safe:animate-spin" />{:else}<FileDown size={13} />{/if} Export PDF</button>
               {/if}
-              <button class="grid size-6 place-items-center rounded hover:bg-hover hover:text-ink disabled:opacity-40" title="Ask again" aria-label="Ask again" disabled={!!chat.live} onclick={() => onretry(mi)}><RotateCw size={13} /></button>
+              <button class="btn btn-sm btn-ghost size-6 p-0" title="Ask again" aria-label="Ask again" disabled={!!chat.live} onclick={() => onretry(mi)}><RotateCw size={13} /></button>
               {#if !compact && work.length && rt !== undefined}
-                <span class="ml-auto pr-1 text-[11.5px] tabular-nums" title="Reply time{qt !== undefined ? ` · query ${duration(qt)}` : ''}">{duration(rt)}</span>
+                <span class="ml-auto pr-1 text-xs tabular-nums" title="Reply time{qt !== undefined ? ` · query ${duration(qt)}` : ''}">{duration(rt)}</span>
               {/if}
             </div>
             {#if exported?.mi === mi}
-              <p class="text-[12px] break-all {exported.ok ? 'text-muted' : 'text-red-700 dark:text-red-400'}">{exported.text}</p>
+              <p class="text-sm break-all {exported.ok ? 'text-muted' : 'text-danger'}">{exported.text}</p>
             {/if}
           {/if}
         </div>

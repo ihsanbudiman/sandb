@@ -27,6 +27,14 @@ x-mongo: &mongo
   volumes:
     - ./seed/mongo:/docker-entrypoint-initdb.d:ro
 
+x-redis: &redis
+  image: redis:7.4
+  env_file: .env.test
+  networks: [testnet]
+  tmpfs: [/data]
+  volumes:
+    - ./seed/redis:/seed:ro
+
 services:
   pg16:
     <<: *pg
@@ -100,6 +108,77 @@ services:
       timeout: 10s
       retries: 90
       start_period: 20s
+
+  redis:
+    <<: *redis
+    entrypoint:
+      - bash
+      - -ec
+      - |
+        redis-server --port "$$REDIS_PORT" --save '' --appendonly no &
+        until redis-cli -p "$$REDIS_PORT" PING >/dev/null 2>&1; do sleep 0.1; done
+        redis-cli -e -p "$$REDIS_PORT" < /seed/01_data.redis
+        redis-cli -e -p "$$REDIS_PORT" < /seed/02_users.redis
+        wait
+    ports: ["127.0.0.1:${REDIS_PORT}:${REDIS_PORT}"]
+    healthcheck: &redis-health
+      test: ["CMD-SHELL", "redis-cli -e -p $$REDIS_PORT --no-auth-warning --user sandb_ro --pass $$SANDB_RO_PASSWORD GET seed:done | grep -qx 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  redis-cluster:
+    <<: *redis
+    entrypoint:
+      - bash
+      - -ec
+      - |
+        ports=("$$REDIS_CLUSTER_PORT_1" "$$REDIS_CLUSTER_PORT_2" "$$REDIS_CLUSTER_PORT_3")
+        for p in "$${ports[@]}"; do
+          mkdir "/data/$$p"
+          redis-server --port "$$p" --cluster-enabled yes --cluster-config-file "/data/$$p/nodes.conf" --dir "/data/$$p" --cluster-announce-ip 127.0.0.1 --save '' --appendonly no &
+          until redis-cli -p "$$p" PING >/dev/null 2>&1; do sleep 0.1; done
+        done
+        redis-cli --cluster create "127.0.0.1:$$REDIS_CLUSTER_PORT_1" "127.0.0.1:$$REDIS_CLUSTER_PORT_2" "127.0.0.1:$$REDIS_CLUSTER_PORT_3" --cluster-replicas 0 --cluster-yes
+        until redis-cli -p "$$REDIS_CLUSTER_PORT_1" CLUSTER INFO | grep -q '^cluster_state:ok'; do sleep 0.1; done
+        redis-cli -c -e -p "$$REDIS_CLUSTER_PORT_1" < /seed/03_cluster.redis
+        for p in "$${ports[@]}"; do
+          redis-cli -e -p "$$p" < /seed/02_users.redis
+        done
+        wait
+    ports:
+      - "127.0.0.1:${REDIS_CLUSTER_PORT_1}:${REDIS_CLUSTER_PORT_1}"
+      - "127.0.0.1:${REDIS_CLUSTER_PORT_2}:${REDIS_CLUSTER_PORT_2}"
+      - "127.0.0.1:${REDIS_CLUSTER_PORT_3}:${REDIS_CLUSTER_PORT_3}"
+    healthcheck:
+      <<: *redis-health
+      test: ["CMD-SHELL", "redis-cli -c -e -p $$REDIS_CLUSTER_PORT_1 --no-auth-warning --user sandb_ro --pass $$SANDB_RO_PASSWORD GET seed:done | grep -qx 1"]
+
+  redis-sentinel:
+    <<: *redis
+    entrypoint:
+      - bash
+      - -ec
+      - |
+        redis-server --port "$$REDIS_SENTINEL_MASTER_PORT" --save '' --appendonly no &
+        until redis-cli -p "$$REDIS_SENTINEL_MASTER_PORT" PING >/dev/null 2>&1; do sleep 0.1; done
+        redis-cli -e -p "$$REDIS_SENTINEL_MASTER_PORT" < /seed/04_sentinel.redis
+        redis-cli -e -p "$$REDIS_SENTINEL_MASTER_PORT" < /seed/02_users.redis
+        cat > /tmp/sentinel.conf <<EOF
+        port $$REDIS_SENTINEL_PORT
+        protected-mode no
+        sentinel announce-ip 127.0.0.1
+        sentinel monitor mymaster 127.0.0.1 $$REDIS_SENTINEL_MASTER_PORT 1
+        sentinel auth-user mymaster default
+        sentinel auth-pass mymaster $$REDIS_ROOT_PASSWORD
+        EOF
+        exec redis-sentinel /tmp/sentinel.conf
+    ports:
+      - "127.0.0.1:${REDIS_SENTINEL_MASTER_PORT}:${REDIS_SENTINEL_MASTER_PORT}"
+      - "127.0.0.1:${REDIS_SENTINEL_PORT}:${REDIS_SENTINEL_PORT}"
+    healthcheck:
+      <<: *redis-health
+      test: ["CMD-SHELL", "redis-cli -e -p $$REDIS_SENTINEL_PORT SENTINEL get-master-addr-by-name mymaster | grep -qx 127.0.0.1"]
 
   mock-llm:
     image: node:22-alpine

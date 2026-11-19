@@ -86,6 +86,7 @@ impl ServerCode {
             Engine::Mysql => "MySQL error",
             Engine::Sqlite => "SQLite error",
             Engine::Mongo => "MongoDB error",
+            Engine::Redis => "Redis error",
         };
         format!("{prefix} {}", self.code)
     }

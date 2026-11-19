@@ -10,6 +10,7 @@ use crate::core::ai;
 use crate::core::ai::event::ChatEvent;
 use crate::core::ai::tools::ToolContext;
 use crate::core::connections::target_database;
+use crate::core::engine::Engine;
 use crate::core::error::AppError;
 use crate::core::mcp::settings::{self, McpSettings};
 use crate::core::ops;
@@ -18,11 +19,12 @@ use crate::core::state::AppState;
 
 /// The database tools, in the order the client sees them. Each keeps its chat description and
 /// parameters; MCP adds `connection` and `database`.
-const DB_TOOLS: [&str; 4] = [
+const DB_TOOLS: [&str; 5] = [
     "list_tables",
     "describe_table",
     "run_read_query",
     "run_mongo_read",
+    "run_redis_read",
 ];
 
 /// One tool, for `tools/list`.
@@ -43,15 +45,19 @@ pub fn list() -> Vec<McpTool> {
     let mut tools = vec![
         McpTool {
             name: "list_connections",
-            description: "List the database connections that sandb shares with MCP clients: id, \
-                          name, engine, environment, default database and read-only flag. Call \
-                          this first: every other tool takes a connection id from this list."
+            description: "List shared connections so you can choose the one the user wants. Each \
+                          entry has an id, name, engine, environment, default database, stored \
+                          readOnly flag and version. Pass the id as connection. MCP is read-only \
+                          regardless of the flag."
                 .into(),
             schema: json!({"type": "object", "properties": {}}),
         },
         McpTool {
             name: "list_databases",
-            description: "List the databases on the server of one connection.".into(),
+            description: "Find database names for one shared connection when you need a different \
+                          database or the connection has no default. Pass the name as database on \
+                          later calls. Redis names are database numbers as strings. SQLite uses main."
+                .into(),
             schema: json!({
                 "type": "object",
                 "properties": {"connection": connection_param()},
@@ -82,14 +88,14 @@ pub fn list() -> Vec<McpTool> {
 
 /// The `connection` argument of every database tool.
 fn connection_param() -> Value {
-    json!({"type": "string", "description": "Connection id from list_connections."})
+    json!({"type": "string", "description": "Exact id from list_connections. Do not pass the connection name or a chat source id."})
 }
 
 /// The `database` argument: MongoDB needs it when the connection has no default database.
 fn database_param() -> Value {
     json!({
         "type": "string",
-        "description": "Database name. Default: the connection's own database. Required for a MongoDB connection without one; see list_databases."
+        "description": "Target database. Use the saved default if omitted. If a MongoDB connection has no default, pass a name from list_databases. For Redis, pass the database number as a string, such as \"0\". SQLite always uses main."
     })
 }
 
@@ -133,7 +139,7 @@ pub async fn call(state: &AppState, name: &str, mut args: Map<String, Value>) ->
         };
     }
     let database = target_database(&conn, args.get("database").and_then(Value::as_str));
-    if conn.engine.sql().is_none() && database.is_empty() {
+    if conn.engine == Engine::Mongo && database.is_empty() {
         return failed(AppError::invalid(format!(
             "Pass \"database\" for {}: the connection has no default database. Call list_databases",
             conn.name
@@ -294,6 +300,62 @@ mod tests {
         assert!(out.text.contains('3'), "{}", out.text);
     }
 
+    #[tokio::test]
+    async fn redis_read_dispatch_requires_sharing_and_uses_the_guard() {
+        let (_dir, st) = state();
+        let redis = st
+            .create_connection(
+                serde_json::from_value(json!({
+                    "name": "redis",
+                    "engine": "redis",
+                    "host": "127.0.0.1",
+                    "ssl": "disable"
+                }))
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        let args = |command: &str| {
+            Map::from_iter([
+                ("connection".into(), json!(redis.id)),
+                ("command".into(), json!(command)),
+            ])
+        };
+        let out = call(&st, "run_redis_read", args("KEYS *")).await;
+        assert!(
+            out.is_error && out.text.contains("not shared"),
+            "{}",
+            out.text
+        );
+
+        share(&st, &[redis.id.as_str()]);
+        for (command, reason) in [
+            ("KEYS *", "Use SCAN with MATCH and COUNT instead of KEYS."),
+            ("SET greeting hello", "SET is not a read"),
+            (
+                "CONFIG GET databases",
+                "CONFIG GET can expose private server details. Use the editor instead.",
+            ),
+        ] {
+            let out = call(&st, "run_redis_read", args(command)).await;
+            let content: Value = serde_json::from_str(&out.text).unwrap();
+            assert!(out.is_error, "{content}");
+            assert_eq!(content["error"]["code"], "guard_rejected");
+            assert!(
+                content["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(reason)
+            );
+        }
+        let out = call(&st, "propose_redis_write", args("SET greeting hello")).await;
+        assert!(
+            out.is_error && out.text.contains("Unknown tool"),
+            "{}",
+            out.text
+        );
+    }
+
     /// The list is fixed and read-only: no write tool, and every database tool picks a
     /// connection.
     #[test]
@@ -308,7 +370,8 @@ mod tests {
                 "list_tables",
                 "describe_table",
                 "run_read_query",
-                "run_mongo_read"
+                "run_mongo_read",
+                "run_redis_read",
             ]
         );
         for tool in &tools[1..] {
@@ -319,5 +382,11 @@ mod tests {
                 tool.name
             );
         }
+        let redis = &tools[tools.len() - 1];
+        assert_eq!(redis.schema["required"], json!(["command", "connection"]));
+        assert!(redis.schema["properties"].get("source").is_none());
+        assert!(redis.description.ends_with(
+            "Redis sources only: on SQL sources use run_read_query; on MongoDB use run_mongo_read."
+        ));
     }
 }

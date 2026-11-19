@@ -1,7 +1,5 @@
-//! The engine boundary. Every operation both engines implement is routed here once: the command
-//! layer calls these functions, and only the SQL side (`core::db`) or the MongoDB side
-//! (`core::mongo`) runs. A SQL module never sees a MongoDB connection, and no SQL or Mongo module
-//! imports the other.
+//! The engine boundary. The command layer calls these functions, which route to SQL, MongoDB
+//! or Redis. Each engine implements its operations without importing the other engines.
 
 use std::time::Duration;
 
@@ -10,39 +8,41 @@ use tokio_util::sync::CancellationToken;
 use crate::core::connections::{Connection, read_only_refusal};
 use crate::core::db::conn as sql_conn;
 use crate::core::db::{dump, edit, export, introspect, query, readonly, write};
-use crate::core::engine::{Engine, SqlEngine};
+use crate::core::engine::{Engine, Family, SqlEngine};
 use crate::core::error::AppError;
 use crate::core::guard;
 use crate::core::mongo;
 use crate::core::query_registry::Session;
+use crate::core::redis;
+use crate::core::redis::ai::ReadOrigin;
 use crate::core::result::{
     AiReadResult, ApplyEditsRequest, ApplyEditsResult, CellValueRequest, ColumnInfo,
     DocumentExportRequest, EditableRequest, EditableResult, ExportRequest, ExportResult,
-    GuardCheck, QueryProgress, QueryRun, ReadLimits, RunRequest, SchemaSnapshot, SqlExportRequest,
-    TableExportRequest, TableInfo, TableProperties, WriteInfo, WriteResult,
+    GuardCheck, KeyList, QueryProgress, QueryRun, ReadLimits, RunRequest, SchemaSnapshot,
+    SqlExportRequest, TableExportRequest, TableInfo, TableProperties, WriteInfo, WriteResult,
 };
 use crate::core::state::AppState;
 
 /// Longest wait of a cancel for the MongoDB server kill.
 const MONGO_KILL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The SQL engine of a connection; a MongoDB connection is a routing bug here (only SQL paths
-/// call this).
+/// This helper is only for routes that require a SQL connection.
 fn sql_engine(conn: &Connection) -> Result<SqlEngine, AppError> {
     conn.engine.sql().ok_or_else(AppError::not_sql)
 }
 
 pub async fn list_databases(state: &AppState, conn_id: &str) -> Result<Vec<String>, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(_) => introspect::list_databases(&state.db(), &conn).await,
-        None => {
+    match conn.engine.family() {
+        Family::Sql(_) => introspect::list_databases(&state.db(), &conn).await,
+        Family::Mongo => {
             mongo::introspect::databases(
                 &mongo::client::client(state, conn_id).await?,
                 &conn.database,
             )
             .await
         }
+        Family::Redis => redis::introspect::databases(state, &conn).await,
     }
 }
 
@@ -52,10 +52,9 @@ pub async fn list_schemas(
     database: &str,
 ) -> Result<Vec<String>, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => introspect::list_schemas(&state.db(), &conn, engine, database).await,
-        // MongoDB has no schema level.
-        None => Ok(vec![]),
+    match conn.engine.family() {
+        Family::Sql(engine) => introspect::list_schemas(&state.db(), &conn, engine, database).await,
+        Family::Mongo | Family::Redis => Ok(vec![]),
     }
 }
 
@@ -66,12 +65,34 @@ pub async fn list_tables(
     schema: Option<&str>,
 ) -> Result<Vec<TableInfo>, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(_) => introspect::list_tables(&state.db(), &conn, database, schema).await,
-        None => {
+    match conn.engine.family() {
+        Family::Sql(_) => introspect::list_tables(&state.db(), &conn, database, schema).await,
+        Family::Mongo => {
             mongo::introspect::tables(&mongo::client::client(state, conn_id).await?, database).await
         }
+        Family::Redis => {
+            Ok(
+                redis::introspect::keys(state, &conn, database, "*", redis::KEY_LIST_MAX)
+                    .await?
+                    .keys,
+            )
+        }
     }
+}
+
+pub async fn list_keys(
+    state: &AppState,
+    conn_id: &str,
+    database: &str,
+    pattern: &str,
+    limit: Option<usize>,
+) -> Result<KeyList, AppError> {
+    let conn = state.connection(conn_id)?;
+    if conn.engine != Engine::Redis {
+        return Err(AppError::invalid("Key search needs a Redis connection"));
+    }
+    let limit = limit.unwrap_or(redis::KEY_LIST_MAX).clamp(1, 10_000);
+    redis::introspect::keys(state, &conn, database, pattern, limit).await
 }
 
 pub async fn list_columns(
@@ -82,9 +103,11 @@ pub async fn list_columns(
     table: &str,
 ) -> Result<Vec<ColumnInfo>, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(_) => introspect::list_columns(&state.db(), &conn, database, schema, table).await,
-        None => {
+    match conn.engine.family() {
+        Family::Sql(_) => {
+            introspect::list_columns(&state.db(), &conn, database, schema, table).await
+        }
+        Family::Mongo => {
             // An empty collection yields an empty list; only an unknown name is `not_found`.
             mongo::introspect::columns(
                 &mongo::client::client(state, conn_id).await?,
@@ -93,6 +116,7 @@ pub async fn list_columns(
             )
             .await
         }
+        Family::Redis => redis::introspect::columns(state, &conn, database, table).await,
     }
 }
 
@@ -102,12 +126,15 @@ pub async fn schema_snapshot(
     database: &str,
 ) -> Result<SchemaSnapshot, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => introspect::schema_snapshot(&state.db(), &conn, engine, database).await,
-        None => {
+    match conn.engine.family() {
+        Family::Sql(engine) => {
+            introspect::schema_snapshot(&state.db(), &conn, engine, database).await
+        }
+        Family::Mongo => {
             mongo::introspect::snapshot(&mongo::client::client(state, conn_id).await?, database)
                 .await
         }
+        Family::Redis => redis::introspect::snapshot(state, &conn, database).await,
     }
 }
 
@@ -119,9 +146,11 @@ pub async fn table_properties(
     table: &str,
 ) -> Result<TableProperties, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(_) => introspect::table_properties(&state.db(), &conn, database, schema, table).await,
-        None => {
+    match conn.engine.family() {
+        Family::Sql(_) => {
+            introspect::table_properties(&state.db(), &conn, database, schema, table).await
+        }
+        Family::Mongo => {
             mongo::introspect::properties(
                 &mongo::client::client(state, conn_id).await?,
                 database,
@@ -129,6 +158,7 @@ pub async fn table_properties(
             )
             .await
         }
+        Family::Redis => redis::introspect::properties(state, &conn, database, table).await,
     }
 }
 
@@ -140,9 +170,9 @@ pub async fn table_ddl(
     table: &str,
 ) -> Result<String, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(_) => dump::table_ddl(&state.db(), &conn, database, schema, table).await,
-        None => {
+    match conn.engine.family() {
+        Family::Sql(_) => dump::table_ddl(&state.db(), &conn, database, schema, table).await,
+        Family::Mongo => {
             mongo::dump::collection_ddl(
                 &mongo::client::client(state, conn_id).await?,
                 database,
@@ -150,14 +180,16 @@ pub async fn table_ddl(
             )
             .await
         }
+        Family::Redis => redis::script::key_script(state, &conn, database, table).await,
     }
 }
 
 pub async fn run_query(state: &AppState, req: RunRequest) -> Result<QueryRun, AppError> {
     let conn = state.connection(&req.conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => query::run(&state.db(), &conn, engine, req).await,
-        None => mongo::run::run(state, &conn, req, true).await,
+    match conn.engine.family() {
+        Family::Sql(engine) => query::run(&state.db(), &conn, engine, req).await,
+        Family::Mongo => mongo::run::run(state, &conn, req, true).await,
+        Family::Redis => redis::run::run(state, &conn, req, true).await,
     }
 }
 
@@ -166,9 +198,10 @@ pub async fn run_query(state: &AppState, req: RunRequest) -> Result<QueryRun, Ap
 #[cfg(feature = "it")]
 pub async fn run_editor_unchecked(state: &AppState, req: RunRequest) -> Result<QueryRun, AppError> {
     let conn = state.connection(&req.conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => query::run_unchecked(&state.db(), &conn, engine, req).await,
-        None => mongo::run::run(state, &conn, req, false).await,
+    match conn.engine.family() {
+        Family::Sql(engine) => query::run_unchecked(&state.db(), &conn, engine, req).await,
+        Family::Mongo => mongo::run::run(state, &conn, req, false).await,
+        Family::Redis => redis::run::run(state, &conn, req, false).await,
     }
 }
 
@@ -177,9 +210,10 @@ pub async fn editable_result(
     request: EditableRequest,
 ) -> Result<EditableResult, AppError> {
     let conn = state.connection(&request.conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => edit::editable_result(&state.db(), &conn, engine, request).await,
-        None => mongo::edit::editable_result(state, &conn, request).await,
+    match conn.engine.family() {
+        Family::Sql(engine) => edit::editable_result(&state.db(), &conn, engine, request).await,
+        Family::Mongo => mongo::edit::editable_result(state, &conn, request).await,
+        Family::Redis => redis::edit::editable_result(state, &conn, request).await,
     }
 }
 
@@ -191,9 +225,10 @@ pub async fn apply_edits(
     if !conn.may_write() {
         return Err(read_only_refusal(&conn, None));
     }
-    match conn.engine.sql() {
-        Some(engine) => edit::apply_edits(&state.db(), &conn, engine, request).await,
-        None => mongo::edit::apply_edits(state, &conn, request).await,
+    match conn.engine.family() {
+        Family::Sql(engine) => edit::apply_edits(&state.db(), &conn, engine, request).await,
+        Family::Mongo => mongo::edit::apply_edits(state, &conn, request).await,
+        Family::Redis => redis::edit::apply_edits(state, &conn, request).await,
     }
 }
 
@@ -202,9 +237,10 @@ pub async fn cell_value(
     request: CellValueRequest,
 ) -> Result<Option<String>, AppError> {
     let conn = state.connection(&request.conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => edit::cell_value(&state.db(), &conn, engine, request).await,
-        None => mongo::edit::cell_value(state, &conn, request).await,
+    match conn.engine.family() {
+        Family::Sql(engine) => edit::cell_value(&state.db(), &conn, engine, request).await,
+        Family::Mongo => mongo::edit::cell_value(state, &conn, request).await,
+        Family::Redis => redis::edit::cell_value(state, &conn, request).await,
     }
 }
 
@@ -223,8 +259,9 @@ pub async fn cancel_query(state: &AppState, query_id: &str) -> Result<(), AppErr
             }
             return Ok(());
         };
-        let sent = match target.engine.sql() {
-            None => {
+        let sent = match target.engine.family() {
+            Family::Redis => return Ok(()),
+            Family::Mongo => {
                 // The run already stopped on the flag; the server kill is best effort, and a
                 // server that does not answer must not hold the cancel for the driver's monitor
                 // timeout.
@@ -237,7 +274,7 @@ pub async fn cancel_query(state: &AppState, query_id: &str) -> Result<(), AppErr
                     .unwrap_or(Ok(())),
                 )
             }
-            Some(_) => match target.session {
+            Family::Sql(_) => match target.session {
                 Some(session) => {
                     // SQLite's interrupt is in-process; the SQL engines need the pool their
                     // session belongs to.
@@ -277,7 +314,7 @@ pub fn query_progress(state: &AppState, query_id: &str) -> Option<QueryProgress>
     state.queries().progress(query_id)
 }
 
-/// AI read path: the guard, then a read-only session with `limits`.
+/// AI tools and chat replay share the assistant's read restrictions.
 pub async fn run_ai_read(
     state: &AppState,
     conn_id: &str,
@@ -285,12 +322,35 @@ pub async fn run_ai_read(
     sql: &str,
     limits: ReadLimits,
 ) -> Result<AiReadResult, AppError> {
+    guarded_read(state, conn_id, database, sql, limits, ReadOrigin::Assistant).await
+}
+
+/// A user-authored schedule uses the read guard without the assistant's extra restrictions.
+pub(crate) async fn run_scheduled_read(
+    state: &AppState,
+    conn_id: &str,
+    database: Option<&str>,
+    sql: &str,
+    limits: ReadLimits,
+) -> Result<AiReadResult, AppError> {
+    guarded_read(state, conn_id, database, sql, limits, ReadOrigin::Schedule).await
+}
+
+async fn guarded_read(
+    state: &AppState,
+    conn_id: &str,
+    database: Option<&str>,
+    sql: &str,
+    limits: ReadLimits,
+    origin: ReadOrigin,
+) -> Result<AiReadResult, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => {
+    match conn.engine.family() {
+        Family::Sql(engine) => {
             readonly::run_ai_read(&state.db(), &conn, engine, database, sql, limits).await
         }
-        None => mongo::ai::read(state, &conn, database, sql, limits).await,
+        Family::Mongo => mongo::ai::read(state, &conn, database, sql, limits).await,
+        Family::Redis => redis::ai::read(state, &conn, database, sql, limits, origin).await,
     }
 }
 
@@ -305,8 +365,14 @@ pub async fn run_read_only_unchecked(
     limits: ReadLimits,
 ) -> Result<AiReadResult, AppError> {
     let conn = state.connection(conn_id)?;
-    let engine = sql_engine(&conn)?;
-    readonly::run_read_only_unchecked(&state.db(), &conn, engine, database, sql, limits).await
+    match conn.engine.family() {
+        Family::Sql(engine) => {
+            readonly::run_read_only_unchecked(&state.db(), &conn, engine, database, sql, limits)
+                .await
+        }
+        Family::Redis => redis::ai::read_unchecked(state, &conn, database, sql, limits).await,
+        Family::Mongo => Err(AppError::not_sql()),
+    }
 }
 
 /// Runs an approved AI write: one transaction on the selected database, except that on MySQL a
@@ -319,23 +385,28 @@ pub async fn run_approved_write(
     stop: &CancellationToken,
 ) -> Result<WriteResult, AppError> {
     let conn = state.connection(conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => write::run_approved(&state.db(), &conn, engine, database, sql, stop).await,
-        None => mongo::ai::run_approved(state, &conn, database, sql, stop).await,
+    match conn.engine.family() {
+        Family::Sql(engine) => {
+            write::run_approved(&state.db(), &conn, engine, database, sql, stop).await
+        }
+        Family::Mongo => mongo::ai::run_approved(state, &conn, database, sql, stop).await,
+        Family::Redis => redis::ai::run_approved(state, &conn, database, sql, stop).await,
     }
 }
 
 pub fn guard_check(sql: &str, engine: Engine) -> GuardCheck {
-    match engine.sql() {
-        Some(sql_engine) => guard::classify::guard_check(sql, sql_engine),
-        None => mongo::guard::guard_check(sql),
+    match engine.family() {
+        Family::Sql(engine) => guard::classify::guard_check(sql, engine),
+        Family::Mongo => mongo::guard::guard_check(sql),
+        Family::Redis => redis::guard::guard_check(sql),
     }
 }
 
 pub fn classify_write(sql: &str, engine: Engine, database: Option<&str>) -> WriteInfo {
-    match engine.sql() {
-        Some(sql_engine) => guard::classify::classify_write(sql, sql_engine),
-        None => mongo::guard::classify_write(sql, database),
+    match engine.family() {
+        Family::Sql(engine) => guard::classify::classify_write(sql, engine),
+        Family::Mongo => mongo::guard::classify_write(sql, database),
+        Family::Redis => redis::guard::classify_write(sql, database),
     }
 }
 
@@ -343,18 +414,20 @@ pub fn classify_write(sql: &str, engine: Engine, database: Option<&str>) -> Writ
 /// must parse as exactly one write before the user sees it; SQL text is classified as it is (an
 /// unparsable statement is a warning there).
 pub fn write_preview(text: &str, engine: Engine, database: &str) -> Result<WriteInfo, AppError> {
-    match engine.sql() {
-        Some(sql_engine) => Ok(guard::classify::classify_write(text, sql_engine)),
-        None => mongo::ai::propose(text, database),
+    match engine.family() {
+        Family::Sql(engine) => Ok(guard::classify::classify_write(text, engine)),
+        Family::Mongo => mongo::ai::propose(text, database),
+        Family::Redis => redis::guard::write_preview(text, database),
     }
 }
 
 /// Rejects anything but one plain read, before the save dialog opens.
 pub fn check_export(state: &AppState, req: &ExportRequest) -> Result<(), AppError> {
     let conn = state.connection(&req.conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => export::check(engine, &req.sql),
-        None => mongo::export::check(&mongo::parse::parse(&req.sql)?),
+    match conn.engine.family() {
+        Family::Sql(engine) => export::check(engine, &req.sql),
+        Family::Mongo => mongo::export::check(&mongo::parse::parse(&req.sql)?),
+        Family::Redis => redis::export::check(&redis::parse::parse(&req.sql)?),
     }
 }
 
@@ -392,9 +465,10 @@ pub async fn export_csv(
     path: &std::path::Path,
 ) -> Result<ExportResult, AppError> {
     let conn = state.connection(&req.conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => export::export_csv(&state.db(), &conn, engine, req, path).await,
-        None => mongo::export::export_csv(state, &conn, req, path).await,
+    match conn.engine.family() {
+        Family::Sql(engine) => export::export_csv(&state.db(), &conn, engine, req, path).await,
+        Family::Mongo => mongo::export::export_csv(state, &conn, req, path).await,
+        Family::Redis => redis::export::export_csv(state, &conn, req, path).await,
     }
 }
 
@@ -424,8 +498,9 @@ pub async fn export_table_sql(
     path: &std::path::Path,
 ) -> Result<ExportResult, AppError> {
     let conn = state.connection(&req.conn_id)?;
-    match conn.engine.sql() {
-        Some(engine) => dump::export_table_sql(&state.db(), &conn, engine, req, path).await,
-        None => mongo::dump::export_collection(state, &conn, req, path).await,
+    match conn.engine.family() {
+        Family::Sql(engine) => dump::export_table_sql(&state.db(), &conn, engine, req, path).await,
+        Family::Mongo => mongo::dump::export_collection(state, &conn, req, path).await,
+        Family::Redis => redis::script::export_key(state, &conn, req, path).await,
     }
 }

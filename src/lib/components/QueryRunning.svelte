@@ -26,17 +26,8 @@
   }
 </script>
 
-<!-- Top bar: determinate for a script once its total is known, indeterminate otherwise. -->
-<div class="pointer-events-none absolute inset-x-0 top-0 z-[21] h-0.5 overflow-hidden bg-accent/15" aria-hidden="true">
-  {#if pct !== null}
-    <div class="h-full bg-accent transition-[width] duration-300" style:width="{pct}%"></div>
-  {:else}
-    <div class="h-full w-full origin-left animate-indeterminate bg-accent motion-reduce:animate-none motion-reduce:opacity-60"></div>
-  {/if}
-</div>
-
 {#if !run.again}
-  <div class="absolute inset-0 z-20 overflow-hidden {over ? 'bg-surface/70 backdrop-blur-[1.5px]' : ''}">
+  <div class="pointer-events-auto absolute inset-0 z-running overflow-hidden {over ? 'bg-surface/70 backdrop-blur-[1.5px]' : ''}">
     {#if !over}
       <!-- Skeleton grid: the shape of the rows to come, fading out downward. -->
       <div class="absolute inset-0 [mask-image:linear-gradient(to_bottom,black_30%,transparent)]" aria-hidden="true">
@@ -49,7 +40,7 @@
           {/each}
         </div>
         {#each { length: ROWS } as _, ri (ri)}
-          <div class="flex h-[26px] items-center border-b border-line/60">
+          <div class="flex h-list-row items-center border-b border-line/60">
             <div class="flex w-9 shrink-0 justify-end px-2"><div class="h-2 w-3 rounded-full bg-hover/70"></div></div>
             {#each COLS as w, ci (ci)}
               <div class="flex h-full flex-1 items-center border-l border-line/60 px-2.5">
@@ -69,30 +60,39 @@
       <div class="popover flex w-80 max-w-full flex-col gap-3 px-4 py-3.5" role="status" aria-live="polite">
         <div class="flex items-center gap-3">
           <span class="relative grid size-8 shrink-0 place-items-center rounded-full bg-accent/12 text-accent">
-            <LoaderCircle size={16} class="animate-spin" />
+            <LoaderCircle size={15} class="motion-safe:animate-spin" />
           </span>
           <div class="min-w-0 flex-1">
-            <div class="truncate text-[13px] font-semibold text-ink" title={script?.name}>{script ? script.name : isStopping ? 'Cancelling query' : 'Running query'}</div>
-            <div class="text-[11.5px] leading-snug text-muted">
+            <div class="truncate text-base font-semibold text-ink" title={script?.name}>{script ? script.name : isStopping ? 'Cancelling query' : 'Running query'}</div>
+            <div class="text-xs leading-snug text-muted">
               {#if isStopping}Waiting for the database to stop
               {:else if script}{script.total ? `Statement ${Math.min(script.done + 1, script.total)} of ${script.total}` : 'Reading the script'}
               {:else if over}The last result stays until this one is ready
               {:else}Waiting for the database{/if}
             </div>
           </div>
-          <span class="shrink-0 font-mono text-[12px] text-ink tabular-nums" aria-label="Elapsed time">{elapsed}</span>
+          <span class="shrink-0 font-mono text-sm text-ink tabular-nums" aria-label="Elapsed time">{elapsed}</span>
         </div>
         {#if script?.total}
           <div class="h-1 overflow-hidden rounded-full bg-hover" role="progressbar" aria-label="Script progress" aria-valuenow={script.done} aria-valuemin={0} aria-valuemax={script.total}>
-            <div class="h-full rounded-full bg-accent transition-[width] duration-300" style:width="{pct}%"></div>
+            <div class="h-full rounded-full bg-accent motion-safe:transition-[width] motion-safe:duration-150" style:width="{pct}%"></div>
           </div>
         {/if}
         {#if oncancel}
           <button class="btn btn-secondary w-full" onclick={stop} disabled={isStopping}>
-            {#if isStopping}<LoaderCircle size={12} class="animate-spin" /> Cancelling…{:else}<Square size={10} class="fill-current" /> Cancel query{/if}
+            {#if isStopping}<LoaderCircle size={13} class="motion-safe:animate-spin" /> Cancelling…{:else}<Square size={13} class="fill-current" /> Cancel query{/if}
           </button>
         {/if}
       </div>
     </div>
   </div>
 {/if}
+
+<!-- Render after the overlay so the two can share the running layer. -->
+<div class="pointer-events-none absolute inset-x-0 top-0 z-running h-0.5 overflow-hidden bg-accent/15" aria-hidden="true">
+  {#if pct !== null}
+    <div class="h-full bg-accent motion-safe:transition-[width] motion-safe:duration-150" style:width="{pct}%"></div>
+  {:else}
+    <div class="h-full w-full origin-left bg-accent motion-safe:animate-indeterminate motion-reduce:opacity-60"></div>
+  {/if}
+</div>

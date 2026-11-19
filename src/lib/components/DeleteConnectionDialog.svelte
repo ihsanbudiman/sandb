@@ -30,11 +30,11 @@
   }
 </script>
 
-<Modal title="Delete this connection?" role="alertdialog" {busy} {error} errorLabel="Delete failed:" onclose={() => answer(false)}>
-  {#snippet head()}<Trash size={15} class="text-red-600 dark:text-red-400" />{/snippet}
+<Modal title="Delete this connection?" role="alertdialog" describedBy="delete-connection-help" {busy} {error} errorLabel="Delete failed:" onclose={() => answer(false)}>
+  {#snippet head()}<Trash size={15} class="text-danger" />{/snippet}
 
   <TargetBadge {conn} />
-  <p class="mt-3 leading-relaxed text-muted">This removes the saved connection from sandb only. The database and its data are not changed. The audit log keeps its entries.</p>
+  <p id="delete-connection-help" class="mt-3 leading-relaxed text-muted">This removes the saved connection from sandb only. The database and its data are not changed. The audit log keeps its entries.</p>
 
   {#if prod}
     <ProdAck class="mt-3" bind:checked={ack}>
@@ -43,9 +43,9 @@
   {/if}
 
   {#snippet footer()}
-    <button class="btn btn-secondary" disabled={busy} onclick={() => answer(false)}>Cancel</button>
-    <button class="btn bg-red-600 text-white enabled:hover:bg-red-500" disabled={ackBlocked(prod, ack, busy)} onclick={remove}>
-      {#if busy}<LoaderCircle size={13} class="animate-spin" />{/if} Delete connection
+    <button class="btn btn-sm btn-secondary" data-autofocus disabled={busy} onclick={() => answer(false)}>Cancel</button>
+    <button class="btn btn-sm btn-danger" disabled={ackBlocked(prod, ack, busy)} onclick={remove}>
+      {#if busy}<LoaderCircle size={12} class="motion-safe:animate-spin" />{/if} Delete connection
     </button>
   {/snippet}
 </Modal>

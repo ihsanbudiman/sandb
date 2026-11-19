@@ -1,0 +1,3 @@
+ACL SETUSER sandb_rw on >sandb_rw_pw ~* &* +@all
+ACL SETUSER sandb_ro on >sandb_ro_pw ~* &* +@read +@connection +info +config|get +memory|usage +eval_ro +evalsha_ro +fcall_ro +script|exists +cluster|slots +cluster|shards +cluster|nodes
+ACL SETUSER default on >sandb_test_root ~* &* +@all

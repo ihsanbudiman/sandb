@@ -10,7 +10,7 @@ export interface AuditEntry {
   time: Date;
   connId: string;
   kind: 'READ' | 'WRITE';
-  source: 'AI' | 'You';
+  source: 'AI' | 'You' | 'Schedule';
   sql: string;
   result: AuditResult;
   ms: number;
