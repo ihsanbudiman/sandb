@@ -100,6 +100,7 @@
 
   const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
   let mainEl = $state<HTMLElement>();
+  let panesEl = $state<HTMLDivElement>();
   let viewportWidth = $state(window.innerWidth);
   const dockChat = $derived(viewportWidth >= 1100);
   // Keep room for the workspace; when the window is smaller than that budget, keep the overlay usable.
@@ -148,7 +149,7 @@
 
   const setSidebar = (w: number) => (ui.sidebarWidth = Math.round(clamp(w, 140, sidebarWidthLimit)));
   const setChat = (w: number) => (ui.chatWidth = Math.round(clamp(w, 240, chatWidthLimit)));
-  const setSplit = (px: number) => mainEl && (ui.editorSplit = clamp(px / mainEl.clientHeight, 0.1, 0.8));
+  const setSplit = (px: number) => panesEl?.clientHeight && (ui.editorSplit = clamp(px / panesEl.clientHeight, 0.1, 0.8));
 
   function resizeSidebar(e: PointerEvent) {
     const w = sidebarWidth;
@@ -164,7 +165,7 @@
   }
 
   function resizeEditor(e: PointerEvent) {
-    const h = ui.editorSplit * (mainEl?.clientHeight ?? 0);
+    const h = ui.editorSplit * (panesEl?.clientHeight ?? 0);
     restoreSplit = null;
     drag(e, (_, dy) => setSplit(h + dy));
   }
@@ -182,7 +183,14 @@
 
   function keyEditor(e: KeyboardEvent) {
     const d = { ArrowUp: -16, ArrowDown: 16 }[e.key];
-    if (d && mainEl) { e.preventDefault(); restoreSplit = null; setSplit(ui.editorSplit * mainEl.clientHeight + d); }
+    if (d && panesEl) { e.preventDefault(); restoreSplit = null; setSplit(ui.editorSplit * panesEl.clientHeight + d); }
+  }
+
+  function sidebarKey(e: KeyboardEvent) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    ui.sidebarView = e.key === 'Home' ? 'connections' : e.key === 'End' ? 'queries' : ui.sidebarView === 'connections' ? 'queries' : 'connections';
+    document.getElementById(`sidebar-tab-${ui.sidebarView}`)?.focus();
   }
 
   async function toggleResults() {
@@ -927,17 +935,17 @@
     </div>
 
     <div class="seg mb-1.5 flex w-full" role="tablist" aria-label="Sidebar">
-      <button class="seg-item flex-1 px-1.5 {ui.sidebarView === 'connections' ? 'seg-on' : ''}" role="tab" aria-selected={ui.sidebarView === 'connections'} onclick={() => (ui.sidebarView = 'connections')}>Connections</button>
-      <button class="seg-item flex flex-1 items-center justify-center gap-1.5 px-1.5 {ui.sidebarView === 'queries' ? 'seg-on' : ''}" role="tab" aria-selected={ui.sidebarView === 'queries'} onclick={() => (ui.sidebarView = 'queries')}>Queries {#if saved.list.length}<span class="text-xs font-normal text-faint tabular-nums">{saved.list.length}</span>{/if}</button>
+      <button id="sidebar-tab-connections" class="seg-item flex-1 px-1.5 {ui.sidebarView === 'connections' ? 'seg-on' : ''}" role="tab" aria-controls="sidebar-connections" aria-selected={ui.sidebarView === 'connections'} tabindex={ui.sidebarView === 'connections' ? 0 : -1} onkeydown={sidebarKey} onclick={() => (ui.sidebarView = 'connections')}>Connections</button>
+      <button id="sidebar-tab-queries" class="seg-item flex flex-1 items-center justify-center gap-1.5 px-1.5 {ui.sidebarView === 'queries' ? 'seg-on' : ''}" role="tab" aria-controls="sidebar-queries" aria-selected={ui.sidebarView === 'queries'} tabindex={ui.sidebarView === 'queries' ? 0 : -1} onkeydown={sidebarKey} onclick={() => (ui.sidebarView = 'queries')}>Queries {#if saved.list.length}<span class="text-xs font-normal text-faint tabular-nums">{saved.list.length}</span>{/if}</button>
     </div>
 
     <!-- Both stay mounted: the tree keeps its expanded nodes, the list its filter. -->
-    <nav class="flex-1 overflow-auto pb-2 [scrollbar-gutter:stable]" hidden={ui.sidebarView !== 'connections'}>
+    <div id="sidebar-connections" role="tabpanel" aria-labelledby="sidebar-tab-connections" class="min-h-0 flex-1 overflow-auto pb-2 [scrollbar-gutter:stable]" hidden={ui.sidebarView !== 'connections'}>
       <ConnectionTree {selected} {tableBusy} onopen={openTableView} onnew={newConnection} onedit={editConnection} onduplicate={duplicateConnection} ondelete={askDeleteConnection} ontable={tableAction} onredisnew={newRedisKey} onreorder={reorderConnections} />
-    </nav>
-    <nav class="flex-1 overflow-auto pb-2 [scrollbar-gutter:stable]" hidden={ui.sidebarView !== 'queries'} aria-label="Saved queries">
+    </div>
+    <div id="sidebar-queries" role="tabpanel" aria-labelledby="sidebar-tab-queries" class="min-h-0 flex-1 overflow-auto pb-2 [scrollbar-gutter:stable]" hidden={ui.sidebarView !== 'queries'}>
       <SavedQueries activeId={ui.page === 'query' ? (savedQ?.id ?? null) : null} onopen={(q) => openSaved(q)} onrun={(q) => openSaved(q, true)} onschedule={(q) => newSchedule(scheduleFromSaved(q))} ondelete={deleteQuery} />
-    </nav>
+    </div>
 
     <button class="nav-item shrink-0 {ui.page === 'scheduler' ? 'nav-item-active' : ''}" aria-current={ui.page === 'scheduler' ? 'page' : undefined} onclick={() => (ui.page = ui.page === 'scheduler' ? 'query' : 'scheduler')}>
       <CalendarClock size={13} /> <span class="flex-1">Schedules</span>
@@ -1046,7 +1054,7 @@
         {/if}
       {/if}
       <!-- A saved, unchanged tab shows "Saved"; ⌘S then has nothing to write. -->
-      <button class="btn btn-ghost shrink-0 px-2 xl:px-2.5" onclick={() => saveQuery()} disabled={!savedQ && kind === 'empty'} title={savedQ ? (tabClean ? `“${savedQ.name}” is saved · ⇧⌘S saves a copy` : `Save changes to “${savedQ.name}” (${KEYS.save.hint})`) : `Save query (${KEYS.save.hint})`} aria-label={tabClean ? 'Saved' : 'Save query'}>
+      <button class="btn btn-ghost shrink-0 px-2 xl:px-2.5" onclick={() => saveQuery()} disabled={!savedQ && kind === 'empty'} title={savedQ ? (tabClean ? `“${savedQ.name}” is saved · ${KEYS.saveAs.hint} saves a copy` : `Save changes to “${savedQ.name}” (${KEYS.save.hint})`) : `Save query (${KEYS.save.hint})`} aria-label={tabClean ? 'Saved' : 'Save query'}>
         {#if tabClean}<Check size={13} class="text-ok" />{:else}<Save size={13} />{/if}
         <span class="hidden xl:inline">{tabClean ? 'Saved' : 'Save'}</span>
       </button>
@@ -1072,8 +1080,9 @@
       </div>
     </div>
 
+    <div bind:this={panesEl} class="flex min-h-0 flex-1 flex-col">
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="min-h-28 overflow-hidden {ui.resultsOpen ? 'shrink-0' : 'flex-1'}" style:height={ui.resultsOpen ? `min(${ui.editorSplit * 100}%, calc(100% - 8.5rem))` : undefined} oncontextmenu={openEditorMenu}>
+    <div class="overflow-hidden {ui.resultsOpen ? 'shrink-0' : 'min-h-0 flex-1'}" style:min-height={ui.resultsOpen ? 'min(7rem, 25%)' : undefined} style:max-height={ui.resultsOpen ? 'calc(100% - min(10rem, 75%))' : undefined} style:height={ui.resultsOpen ? `${ui.editorSplit * 100}%` : undefined} oncontextmenu={openEditorMenu}>
       <!-- Keyed so undo never crosses into another tab's text. -->
       {#key tab.id}
         <SqlEditor bind:this={editor} bind:value={tab.query} onrun={() => { if (!switching) void run({ sql: currentSql() }); }} onrunnew={() => { if (!switching) void run({ sql: currentSql(), append: true }); }} onrunall={() => { if (!switching) void run({ sql: tab.query }); }} onformat={formatQuery} snapshot={snapItems} {tablesState} {columnsOf} {linksOf} dialect={conn.engine} />
@@ -1127,6 +1136,7 @@
     {#if !ui.resultsOpen}
       <GridToolbar summary={tab.result} {windowControls} />
     {/if}
+    </div>
 
     {/if}
     </div>

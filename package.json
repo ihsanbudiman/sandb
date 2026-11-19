@@ -8,6 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test:unit": "node --experimental-strip-types --test testdb/keys.test.ts",
+    "test:ui": "playwright test",
     "test": "pnpm check && cargo test --manifest-path src-tauri/Cargo.toml --lib --bins --all-features",
     "test:it": "cargo test --manifest-path src-tauri/Cargo.toml --features it",
     "tauri": "tauri",
@@ -23,6 +25,7 @@
     "mock-llm": "node testdb/mock-llm/server.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "1.56.1",
     "@sveltejs/vite-plugin-svelte": "^7.3.1",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2.12.4",

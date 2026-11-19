@@ -67,11 +67,12 @@
   }
 </script>
 
-<div class="flex h-full flex-col">
+<div class="@container flex h-full flex-col">
   <PageHeader title="Audit log" subtitle="Every query run by you or the AI" onback={() => (ui.page = 'query')} />
 
-  <div class="flex shrink-0 flex-wrap items-center gap-2 px-4 pb-3">
-    <div class="seg">
+  <div class="grid shrink-0 grid-cols-[minmax(0,1fr)_9rem] items-center gap-2 px-4 pb-2 @3xl:flex">
+    <div class="col-span-2 overflow-x-auto @3xl:shrink-0">
+    <div class="seg whitespace-nowrap">
       {#each tabs as t (t.id)}
         <button
           class="seg-item flex items-center gap-1.5 {tab === t.id ? 'seg-on' : ''}"
@@ -79,12 +80,13 @@
           onclick={() => (tab = t.id)}>{t.label} <span class="text-xs font-normal text-faint tabular-nums">{t.n}</span></button>
       {/each}
     </div>
-    <div class="flex-1"></div>
-    <div class="relative w-44">
+    </div>
+    <div class="hidden flex-1 @3xl:block"></div>
+    <div class="relative min-w-0 @3xl:w-44">
       <Search size={13} class="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-faint" />
       <input class="input input-sm pl-8" placeholder="Search" aria-label="Search SQL or connection" bind:value={q} autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" />
     </div>
-    <Select class="w-36" size="sm" bind:value={connId} options={connectionOptions} aria-label="Connection" />
+    <Select class="w-full @3xl:w-36" size="sm" bind:value={connId} options={connectionOptions} aria-label="Connection" />
   </div>
 
   <div class="min-h-0 flex-1 overflow-auto border-t border-line">
@@ -93,7 +95,7 @@
         {#snippet icon()}<Search size={15} />{/snippet}
       </EmptyState>
     {:else}
-      <table class="w-full table-fixed border-separate border-spacing-0 text-sm">
+      <table class="w-full min-w-[760px] table-fixed border-separate border-spacing-0 text-sm">
         <thead class="sticky top-0 z-sticky">
           <tr class="text-left [&>th]:border-b [&>th]:border-line [&>th]:bg-surface">
             <th scope="col" class="th w-[140px] py-2 pr-2 pl-9">Time</th>

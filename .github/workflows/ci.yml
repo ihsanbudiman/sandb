@@ -46,6 +46,15 @@ jobs:
       - name: Frontend build
         run: pnpm build
 
+      - name: Frontend unit tests
+        run: pnpm test:unit
+
+      - name: Browser dependencies
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Interface regression tests
+        run: pnpm test:ui
+
       - name: Rust lints
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-features --all-targets -- -D warnings
 

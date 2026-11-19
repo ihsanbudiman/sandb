@@ -273,7 +273,18 @@ class Writer {
     this.y += 10;
   }
 
-  async chart(svg: string, height: number) {
+  async chart(svg: string, height: number, title?: string) {
+    this.doc.setFont('helvetica', 'bold');
+    this.doc.setFontSize(12);
+    const lines: string[] = title ? this.doc.splitTextToSize(pdfText(title), this.width) : [];
+    const lineHeight = 18;
+    this.room(height + lines.length * lineHeight + 10);
+    this.doc.setTextColor(INK);
+    for (const line of lines) {
+      this.room(lineHeight);
+      this.doc.text(line, PAGE_MARGIN, this.y + 12);
+      this.y += lineHeight;
+    }
     this.room(height + 10);
     // svg2pdf reads styles of a node in the document.
     const host = document.createElement('div');
@@ -329,7 +340,7 @@ export async function replyPdf({ title, meta, parts }: ReportInput): Promise<{ b
     } else if (p.kind === 'chart') {
       const height = w.width * 0.5;
       // Drawn larger than the page and scaled down, so the labels come out small and sharp.
-      await w.chart(chartSvg(printable(p), 720, 360), height);
+      await w.chart(chartSvg(printable(p), 720, 360), height, p.spec.title);
     }
   }
 

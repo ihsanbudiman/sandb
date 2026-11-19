@@ -1,14 +1,14 @@
 // ECharts setup and the option for one chart part. The chat view and the PDF export share it.
 import * as echarts from 'echarts/core';
 import { BarChart, LineChart, PieChart, ScatterChart } from 'echarts/charts';
-import { GridComponent, LegendComponent, TitleComponent, TooltipComponent } from 'echarts/components';
+import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components';
 import { SVGRenderer } from 'echarts/renderers';
 import type { EChartsCoreOption } from 'echarts/core';
 import type { CellValue } from './api';
 import type { ChartPart } from './chatModel';
 import { formatCell } from './results';
 
-echarts.use([BarChart, LineChart, PieChart, ScatterChart, GridComponent, LegendComponent, TitleComponent, TooltipComponent, SVGRenderer]);
+echarts.use([BarChart, LineChart, PieChart, ScatterChart, GridComponent, LegendComponent, TooltipComponent, SVGRenderer]);
 
 export { echarts };
 
@@ -55,7 +55,6 @@ export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: bo
     animation: opts.animation ?? true,
     color: c.palette,
     textStyle: { fontFamily: font },
-    title: spec.title ? { text: spec.title, left: 0, top: 0, padding: 0, textStyle: { color: c.ink, fontSize: 14, fontWeight: 'bold', fontFamily: font } } : undefined,
     tooltip: { trigger: spec.type === 'pie' || spec.type === 'scatter' ? 'item' : 'axis', axisPointer: { type: spec.type === 'bar' ? 'shadow' : 'line' }, valueFormatter: full, confine: true },
   };
 
@@ -69,7 +68,7 @@ export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: bo
           type: 'pie',
           name: spec.y[0],
           radius: ['38%', '68%'],
-          center: ['50%', spec.title ? '52%' : '46%'],
+          center: ['50%', '46%'],
           label: { color: c.muted, fontSize: 11 },
           padAngle: 1,
           itemStyle: { borderColor: 'transparent', borderRadius: 4 },
@@ -96,7 +95,6 @@ export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: bo
   }
 
   const legend = named.size > 1;
-  const header = Boolean(spec.title) || legend;
   const axisLine = { lineStyle: { color: c.line } };
   // Value axes only on scatter, where both axes carry data. Bar, line and area show the values in the tooltip.
   const valueAxis = { type: 'value', axisLabel: { ...text, formatter: (v: number) => compact.format(v) }, splitLine: { lineStyle: { color: c.line } }, axisLine };
@@ -106,7 +104,7 @@ export function chartOption(p: ChartPart, c: ChartColors, opts: { animation?: bo
   return {
     ...base,
     legend: legend ? { ...legendStyle, top: 0, right: 0, padding: 0 } : undefined,
-    grid: { left: 0, right: 0, top: header ? 52 : 12, bottom: 4, outerBoundsMode: 'same', outerBoundsContain: 'all' },
+    grid: { left: 0, right: 0, top: legend ? 52 : 12, bottom: 4, outerBoundsMode: 'same', outerBoundsContain: 'all' },
     xAxis:
       scatter
         ? { ...valueAxis, name: spec.x, nameLocation: 'middle', nameGap: 24, nameTextStyle: text, scale: true }
