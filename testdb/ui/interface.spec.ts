@@ -76,6 +76,13 @@ for (const dark of [false, true]) {
     await page.setViewportSize({ width: 512, height: 275 });
     const row = page.getByRole('button', { name: /Show query details for/ }).first();
     await expect(row).toBeInViewport({ ratio: 1 });
+    await expect.poll(() => row.evaluate((button) => {
+      const scroller = button.closest('.overflow-auto')!;
+      const bounds = scroller.getBoundingClientRect();
+      const entry = button.closest('tr')!.getBoundingClientRect();
+      const top = bounds.top + scroller.clientTop;
+      return entry.top >= top && entry.bottom <= top + scroller.clientHeight;
+    })).toBe(true);
     await row.click();
     await expect(page.getByText('SELECT * FROM customers;', { exact: true }).last()).toBeVisible();
     await page.getByRole('textbox', { name: 'Search SQL or connection' }).fill('no matching query');

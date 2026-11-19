@@ -68,18 +68,18 @@
 </script>
 
 <div class="@container flex h-full flex-col">
-  <PageHeader title="Audit log" subtitle="Every query run by you or the AI" onback={() => (ui.page = 'query')} />
+  <PageHeader class="[@media(max-height:400px)]:h-8" title="Audit log" subtitle="Every query run by you or the AI" onback={() => (ui.page = 'query')} />
 
   <div class="grid shrink-0 grid-cols-[minmax(0,1fr)_9rem] items-center gap-2 px-4 pb-2 @3xl:flex">
     <div class="col-span-2 overflow-x-auto @3xl:shrink-0">
-    <div class="seg whitespace-nowrap">
-      {#each tabs as t (t.id)}
-        <button
-          class="seg-item flex items-center gap-1.5 {tab === t.id ? 'seg-on' : ''}"
-          aria-pressed={tab === t.id}
-          onclick={() => (tab = t.id)}>{t.label} <span class="text-xs font-normal text-faint tabular-nums">{t.n}</span></button>
-      {/each}
-    </div>
+      <div class="seg whitespace-nowrap">
+        {#each tabs as t (t.id)}
+          <button
+            class="seg-item flex items-center gap-1.5 {tab === t.id ? 'seg-on' : ''}"
+            aria-pressed={tab === t.id}
+            onclick={() => (tab = t.id)}>{t.label} <span class="text-xs font-normal text-faint tabular-nums">{t.n}</span></button>
+        {/each}
+      </div>
     </div>
     <div class="hidden flex-1 @3xl:block"></div>
     <div class="relative min-w-0 @3xl:w-44">
