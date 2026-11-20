@@ -4,7 +4,7 @@
 
 <h1 align="center">sandb</h1>
 
-<p align="center"><strong>Query your databases. Bring your own AI.</strong></p>
+<p align="center"><strong>Your databases. Your AI.</strong></p>
 
 <p align="center">
   A desktop database client for writing queries, exploring data, and building charts<br>
@@ -13,7 +13,8 @@
 
 <p align="center">
   <strong><a href="https://github.com/ihsanbudiman/sandb/releases/latest">Download for macOS</a></strong>
-  &nbsp;·&nbsp; <a href="https://db.sanlab.dev/">Website</a>
+  <br>
+  <a href="https://db.sanlab.dev/">Website</a>
   &nbsp;·&nbsp; <a href="docs/FEATURES.md">Feature guide</a>
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
 </p>
