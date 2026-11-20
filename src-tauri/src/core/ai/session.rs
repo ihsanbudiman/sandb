@@ -310,6 +310,9 @@ async fn converse(
                     StreamEvent::Text(delta) => ChatEvent::Text {
                         delta: delta.to_string(),
                     },
+                    StreamEvent::Reasoning(delta) => ChatEvent::Reasoning {
+                        delta: delta.to_string(),
+                    },
                     StreamEvent::ToolStarting(name) => ChatEvent::ToolStarting {
                         name: name.to_string(),
                         kind: tools::kind(name),
@@ -332,10 +335,11 @@ async fn converse(
             })
             .collect();
         let text = (!answer.text.is_empty()).then_some(answer.text.as_str());
-        push_message(
-            &mut body,
-            json!({"role": "assistant", "content": text, "tool_calls": calls}),
-        );
+        let mut message = json!({"role": "assistant", "content": text, "tool_calls": calls});
+        if !answer.reasoning_content.is_empty() {
+            message["reasoning_content"] = json!(answer.reasoning_content);
+        }
+        push_message(&mut body, message);
         for call in &answer.tool_calls {
             let args = tools::parse_args(&call.arguments).unwrap_or_default();
             if !emit(ChatEvent::ToolCall {
@@ -667,6 +671,7 @@ mod tests {
     async fn endless_tool_calls_stop_after_max_steps() {
         let (base, mut reqs) = serve(vec![
             head("200 OK", "text/event-stream"),
+            sse(json!({"choices": [{"delta": {"reasoning_content": "Find the tables."}}]})),
             sse(json!({"choices": [{"delta": {"tool_calls": [
                 {"index": 0, "id": "c", "function": {"name": "list_tables", "arguments": "{}"}}
             ]}, "finish_reason": "tool_calls"}]})),
@@ -691,20 +696,25 @@ mod tests {
             .filter(|e| matches!(e, ChatEvent::ToolResult { ok: true, .. }))
             .count();
         assert_eq!(results, MAX_STEPS);
-        // Each step: the name while the call streams, then the call, then its result.
+        // Each round keeps the thinking before the tool it leads to.
         assert!(matches!(
-            &events[..3],
+            &events[..5],
             [
+                ChatEvent::Reasoning { delta },
                 ChatEvent::ToolStarting { name, .. },
                 ChatEvent::ToolCall { name: n2, .. },
                 ChatEvent::ToolResult { ok: true, .. },
-            ] if name == "list_tables" && n2 == "list_tables"
+                ChatEvent::Reasoning { .. },
+            ] if delta == "Find the tables." && name == "list_tables" && n2 == "list_tables"
         ));
-        let mut calls = 0;
-        while reqs.try_recv().is_ok() {
-            calls += 1;
-        }
-        assert_eq!(calls, MAX_STEPS);
+        let requests: Vec<_> = std::iter::from_fn(|| reqs.try_recv().ok()).collect();
+        assert_eq!(requests.len(), MAX_STEPS);
+        let (_, body) = requests[1].split_once("\r\n\r\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        let assistant = &body["messages"][3];
+        assert_eq!(assistant["reasoning_content"], "Find the tables.");
+        assert!(assistant["content"].is_null());
+        assert_eq!(assistant["tool_calls"][0]["id"], "c");
     }
 
     #[tokio::test]

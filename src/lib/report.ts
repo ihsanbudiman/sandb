@@ -2,7 +2,7 @@
 import { marked, type Token, type Tokens } from 'marked';
 import { jsPDF } from 'jspdf';
 import { api } from './api';
-import type { ChartPart, Part } from './chatModel';
+import { answerParts, type ChartPart, type Part } from './chatModel';
 
 const PAGE_MARGIN = 50;
 const BODY = 10.5;
@@ -317,9 +317,10 @@ function printable(p: ChartPart): ChartPart {
   };
 }
 
-export async function replyPdf({ title, meta, parts }: ReportInput): Promise<{ bytes: Uint8Array<ArrayBuffer>; title: string }> {
+export async function replyPdf({ title, meta, parts: transcript }: ReportInput): Promise<{ bytes: Uint8Array<ArrayBuffer>; title: string }> {
   const doc = new jsPDF({ unit: 'pt', format: 'a4' });
   const w = new Writer(doc);
+  const parts = answerParts(transcript);
 
   // The reply's first heading is the document title when it is a level-1 heading at the very start.
   const docs = parts.map((p) => (p.kind === 'text' ? marked.lexer(p.text, { gfm: true, breaks: true }) : null));

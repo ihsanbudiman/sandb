@@ -77,6 +77,7 @@ pub struct ToolCall {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Completion {
     pub text: String,
+    pub reasoning_content: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
 }
@@ -85,6 +86,7 @@ pub struct Completion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamEvent<'a> {
     Text(&'a str),
+    Reasoning(&'a str),
     /// The name of a tool call, once per call, before its arguments finish streaming.
     ToolStarting(&'a str),
 }
@@ -453,6 +455,21 @@ impl Accumulator {
             return Ok(false);
         };
         let delta = choice.get("delta");
+        if let Some(delta) = delta {
+            let reasoning = delta["reasoning_content"].as_str();
+            if let Some(text) = reasoning.or_else(|| delta["reasoning"].as_str())
+                && !text.is_empty()
+            {
+                // DeepSeek needs this field back alongside its tool calls. Other dialects
+                // may stream display-only reasoning under a different field.
+                if reasoning.is_some() {
+                    self.out.reasoning_content.push_str(text);
+                }
+                if !on_event(StreamEvent::Reasoning(text)) {
+                    return Err(AppError::stopped());
+                }
+            }
+        }
         if let Some(text) = delta.and_then(|d| d.get("content")).and_then(Value::as_str)
             && !text.is_empty()
         {
@@ -758,6 +775,7 @@ mod tests {
     fn label(e: StreamEvent<'_>) -> String {
         match e {
             StreamEvent::Text(d) => d.to_string(),
+            StreamEvent::Reasoning(d) => format!("reasoning:{d}"),
             StreamEvent::ToolStarting(name) => format!("tool_starting:{name}"),
         }
     }
@@ -774,6 +792,33 @@ mod tests {
             })
             .await;
         (res, events)
+    }
+
+    #[tokio::test]
+    async fn separates_reasoning_from_answer_text() {
+        let chunk = |delta| sse(json!({"choices": [{"delta": delta}]}));
+        let (base, _) = serve(vec![
+            head("200 OK", "text/event-stream"),
+            chunk(json!({"reasoning_content": "Check", "reasoning": "not duplicated"})),
+            chunk(json!({"reasoning_content": " the schema."})),
+            chunk(json!({"reasoning": "Ollama-style delta."})),
+            text_chunk("The answer."),
+            done(),
+        ])
+        .await;
+        let (result, events) = run(&base, None).await;
+        let answer = result.unwrap();
+        assert_eq!(answer.reasoning_content, "Check the schema.");
+        assert_eq!(answer.text, "The answer.");
+        assert_eq!(
+            events,
+            [
+                "reasoning:Check",
+                "reasoning: the schema.",
+                "reasoning:Ollama-style delta.",
+                "The answer.",
+            ]
+        );
     }
 
     #[tokio::test]

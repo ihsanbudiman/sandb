@@ -127,7 +127,7 @@ export type ChartSpec = { type: string, title?: string, x: string, y: Array<stri
 
 export type ChatCancelArgs = { chatId: string, };
 
-export type ChatEvent = { "type": "text", delta: string, } | { "type": "tool_starting", name: string, kind: ToolKind, } | { "type": "tool_call", id: string, name: string, kind: ToolKind, 
+export type ChatEvent = { "type": "text", delta: string, } | { "type": "reasoning", delta: string, } | { "type": "tool_starting", name: string, kind: ToolKind, } | { "type": "tool_call", id: string, name: string, kind: ToolKind, 
 /**
  * The parsed arguments; `{}` when they are not a JSON object.
  */

@@ -2,7 +2,7 @@ import { untrack } from 'svelte';
 import { api, ApiError, type Cell, type ChatEvent, type ChatRequest, type ErrorCode, type ToolKind } from './api';
 import { logQuery, type AuditResult } from './audit.svelte';
 import { afterWrite } from './catalog.svelte';
-import { type Msg, type Session, type ToolPart } from './chatModel';
+import { replyText, type Msg, type Session, type ToolPart } from './chatModel';
 import { UI_ROWS } from './api/generated/constants';
 import { isReadTool, isWriteTool } from './chatTools';
 import { applicable } from './skills';
@@ -252,21 +252,15 @@ export async function runScheduledPrompt(input: { scheduleId: string; title: str
   return {
     sessionId: s.id,
     ok: !msg.parts.some((p) => p.kind === 'error'),
-    reply: msg.parts
-      .flatMap((p) => (p.kind === 'text' ? [p.text] : []))
-      .join('\n\n')
-      .trim(),
+    reply: replyText(msg.parts),
     error: msg.parts.find((p) => p.kind === 'error')?.text ?? '',
   };
 }
 
-// Earlier turns as plain text: the user's message, or the assistant's text parts. Tool steps stay out.
+// Earlier turns include questions and final answers, not intermediate activity.
 function historyOf(messages: Msg[]): ChatRequest['history'] {
   return messages.flatMap((m) => {
-    const content = m.parts
-      .flatMap((p) => (p.kind === 'text' ? [p.text] : []))
-      .join('\n\n')
-      .trim();
+    const content = replyText(m.parts);
     return content ? [{ role: m.role, content }] : [];
   });
 }
@@ -315,10 +309,11 @@ async function liveReply(msg: Msg, text: string, sources: Source[], history: Cha
 
   const onEvent = (e: ChatEvent) => {
     switch (e.type) {
-      case 'text': {
+      case 'text':
+      case 'reasoning': {
         const last = msg.parts.at(-1);
-        if (last?.kind === 'text') last.text += e.delta;
-        else msg.parts.push({ kind: 'text', text: e.delta });
+        if (last?.kind === e.type) last.text += e.delta;
+        else msg.parts.push({ kind: e.type, text: e.delta });
         break;
       }
       case 'tool_starting':

@@ -75,10 +75,10 @@ async function reply(request: ChatRequest, script: Script, emit: (e: ChatEvent) 
     await sleep(ms);
     if (script.cancelled) throw new Cancelled();
   };
-  const stream = async (body: string) => {
+  const stream = async (body: string, type: 'text' | 'reasoning' = 'text') => {
     for (const word of body.split(/(\s+)/)) {
       if (script.cancelled) throw new Cancelled();
-      emit({ type: 'text', delta: word });
+      emit({ type, delta: word });
       await sleep(18);
     }
   };
@@ -248,13 +248,16 @@ async function reply(request: ChatRequest, script: Script, emit: (e: ChatEvent) 
 
   const data = tableData(schema, target);
   const total = data.base.length + data.added.length;
+  await stream('I’ll check the table schema first.', 'reasoning');
   const t1 = call('describe', 'describe_table', { table: target });
   await waiting(500);
   done(t1, `${schema[target].length} columns · ${total.toLocaleString()} rows`);
+  await stream('Now I’ll read a small sample.');
   const q = call('read', 'run_read_query', { sql: `SELECT *\nFROM ${nsOf(conn.engine, target)}.${target}\nLIMIT 5;` });
   await waiting(700);
   const rows = data.base.slice(0, 5);
   done(q, `${rows.length} row${rows.length === 1 ? '' : 's'} · 41 ms`, { result: { rows: rows.length, ms: 41 }, columns: schema[target], rows: rowsOf(rows, schema[target]) });
+  await stream('The sample is ready to summarize.', 'reasoning');
   await stream(`Here are the first ${rows.length} rows of **${target}** (${total.toLocaleString()} rows in total). Ask me to filter or summarize them.`);
 }
 

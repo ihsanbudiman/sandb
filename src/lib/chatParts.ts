@@ -1,7 +1,7 @@
 import type { Row } from './api';
 import { connOf, dbOf, isSql, type Conn, type Source } from './connections.svelte';
 import type { Msg, Part, ToolPart } from './chatModel';
-import { isChartTool, isDescribeTool, isReadTool, mongoStep, redisStep } from './chatTools';
+import { isDescribeTool, isReadTool, mongoStep, redisStep } from './chatTools';
 import { skillTitle } from './skills';
 
 /** Consecutive tool steps of one reply form one timeline; `at` is the index of each part in the message. */
@@ -18,24 +18,6 @@ export function blocks(parts: Part[], skip?: (p: Part, at: number) => boolean): 
   });
   return out;
 }
-
-/** Steps that read data. A chart step only draws the chart part, so it is not work. */
-export const workSteps = (parts: Part[]) => parts.filter((x): x is ToolPart => x.kind === 'tool' && !isChartTool(x));
-
-export function workEnd(parts: Part[]) {
-  for (let i = parts.length - 1; i >= 0; i--) {
-    const x = parts[i];
-    if (x.kind === 'tool' && !isChartTool(x)) return i;
-  }
-  return -1;
-}
-
-export function processPart(p: Part, at: number, end: number, pending: boolean) {
-  if (p.kind === 'text') return at < end;
-  return p.kind === 'tool' && !(p.status === 'awaiting' && pending);
-}
-
-export const replyText = (parts: Part[]) => parts.flatMap((p) => (p.kind === 'text' ? [p.text] : [])).join('\n\n').trim();
 
 /** The step's target: a skill's title, a described table, or the query's first line. */
 export const stepTarget = (p: ToolPart) => (p.tool === 'skill' ? skillTitle(typeof p.args?.name === 'string' ? p.args.name : '') : isDescribeTool(p) ? p.sql : p.sql?.trim().split('\n')[0]) ?? '';
@@ -63,8 +45,6 @@ export function numeric(rows: Row[]) {
 export const argsOf = (p: ToolPart) => p.args ?? (p.sql === undefined ? {} : isDescribeTool(p) ? { table: p.sql } : redisStep(p) ? { command: p.sql } : { sql: p.sql });
 
 export const busy = (parts: Part[], pending: boolean) => parts.some((x) => x.kind === 'tool' && (x.status === 'running' || (x.status === 'awaiting' && pending)));
-
-export const afterStep = (parts: Part[], pending: boolean) => (parts.at(-1)?.kind === 'tool' || parts.at(-1)?.kind === 'chart') && !busy(parts, pending);
 
 export const chatDatabaseLabel = (c: Conn | undefined, database: string) => c?.engine === 'redis' ? `db${database}` : database;
 

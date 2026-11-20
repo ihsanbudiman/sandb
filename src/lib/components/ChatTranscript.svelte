@@ -4,9 +4,9 @@
   import TargetBadge from './TargetBadge.svelte';
   import { ApiError, type Row } from '../api';
   import { chat, decide, rerun } from '../chat.svelte';
-  import type { Msg, ToolPart } from '../chatModel';
+  import { isActivityPart, lastToolIndex, replyText, type Msg, type ToolPart } from '../chatModel';
   import { destructive, isChartTool, isDescribeTool, isReadTool, mongoStep, mongoTag, redisStep, startingLabel, STATUS_LABEL, STATUS_TEXT, STATUS_TONE, TOOL_LABEL } from '../chatTools';
-  import { afterStep, argsOf, blocks, busy, chatDatabaseLabel, duration, fenceSource, lastQuery, mongoInReply, numeric, processPart, replyMs, replyText, sourceLabel, stepTarget, toolMs, workEnd, workSteps } from '../chatParts';
+  import { argsOf, blocks, busy, chatDatabaseLabel, duration, fenceSource, lastQuery, mongoInReply, numeric, replyMs, sourceLabel, stepTarget, toolMs, type Block } from '../chatParts';
   import { connOf, dbOf, type Conn, type Source } from '../connections.svelte';
   import { Flash } from '../flash.svelte';
   import { csvCell, formatCell } from '../results';
@@ -33,7 +33,7 @@
     scope: Source[];
     scopeConns: Conn[];
     many: boolean;
-    showSteps: boolean;
+    showSteps: boolean | null;
     activeSource: Source | undefined;
     suggestions: { text: string; write?: boolean }[];
     oninsert: (sql: string, source?: Source) => void;
@@ -50,8 +50,13 @@
   let stream = $state<HTMLDivElement>();
 
   // ---- results only ----
-  /** Replies whose steps the user opened while steps are hidden, and long questions the user expanded. */
+  /** Long questions the user expanded. */
   let revealed = $state<Record<string, boolean>>({});
+  let activityOpen = $state<Record<string, boolean>>({});
+  $effect(() => {
+    showSteps;
+    activityOpen = {};
+  });
   // Open state the user chose, per step. Without a choice: closed, except while it waits for approval or after it failed.
   let opened = $state<Record<string, boolean>>({});
   const stepKey = (mi: number, at: number) => `${session?.id}:${mi}:${at}`;
@@ -184,23 +189,17 @@
           {/if}
         </div>
       {:else}
-        {@const work = workSteps(m.parts)}
-        {@const end = workEnd(m.parts)}
-        {@const compact = !showSteps && !!m.parts.some((x) => x.kind === 'tool')}
+        {@const live = !!chat.live && m === messages.at(-1)}
+        {@const waiting = live && !!chat.pending}
+        {@const work = m.parts.filter((p): p is ToolPart => p.kind === 'tool')}
+        {@const end = live && chat.starting ? m.parts.length : lastToolIndex(m.parts)}
         {@const rk = `${session?.id}:${mi}`}
-        {@const hide = compact && !revealed[rk]}
+        {@const expanded = waiting || (activityOpen[rk] ?? showSteps ?? live)}
         {@const rt = replyMs(m)}
         {@const qt = toolMs(work)}
-        <div class="space-y-2.5">
-          {#if compact && work.length}
-            {@const working = !!chat.live && m === messages.at(-1) && busy(m.parts, !!chat.pending)}
-            <button class="btn btn-sm btn-ghost -ml-1 px-1 text-faint" aria-expanded={!hide} onclick={() => (revealed[rk] = !revealed[rk])} title="{hide ? 'Show the steps of this reply' : 'Hide the steps of this reply'}{qt !== undefined ? ` · query ${duration(qt)}` : ''}">
-              {#if working}<LoaderCircle size={12} class="text-accent motion-safe:animate-spin" /> Working · step {work.length}
-              {:else}<ListTree size={12} /> {work.length} {work.length === 1 ? 'step' : 'steps'}{#if rt !== undefined} · {duration(rt)}{:else if qt !== undefined} · {duration(qt)}{/if}{/if}
-              <ChevronRight size={12} class="motion-safe:transition-transform motion-safe:duration-150 {hide ? '' : 'rotate-90'}" />
-            </button>
-          {/if}
-          {#each blocks(m.parts, hide ? (p, at) => processPart(p, at, end, !!chat.pending) : undefined) as b}
+        {@const activity = blocks(m.parts, (p, at) => !isActivityPart(p, at, end))}
+        {#snippet transcript(content: Block[])}
+          {#each content as b}
             {#if b.kind === 'part'}
             {@const p = b.p}
             {#if p.kind === 'text'}
@@ -208,6 +207,11 @@
                 const source = fenceSource(m, scope, activeSource, language);
                 if (source || !redisEditor) onrunmenu(sql, anchor, source);
               }} />
+            {:else if p.kind === 'reasoning'}
+              <div class="border-l-2 border-line pl-2.5 text-sm text-muted">
+                <div class="text-xs font-medium text-faint">Thinking</div>
+                <p class="mt-1 leading-relaxed break-words whitespace-pre-wrap">{p.text}</p>
+              </div>
             {:else if p.kind === 'chart'}
               {#await import('./ChartView.svelte')}
                 <p class="grid h-72 place-items-center text-muted" role="status">Loading chart…</p>
@@ -220,21 +224,11 @@
               <p class="flex items-start gap-2 leading-relaxed text-danger"><TriangleAlert size={13} class="mt-1 shrink-0" /><span class="min-w-0 break-words">{p.text}</span></p>
             {/if}
             {:else}
-              {@const running = b.steps.some((s) => s.p.status === 'running')}
               {@const asking = b.steps.some((s) => s.p.status === 'awaiting') && !!chat.pending}
               {@const danger = asking && b.steps.some((s) => s.p.status === 'awaiting' && !!s.p.sql && destructive(s.p))}
-              {@const total = b.steps.reduce((n, s) => n + (s.p.ms ?? 0), 0)}
               <div class="overflow-hidden rounded-lg border {asking ? (danger ? 'border-danger/50 ring-3 ring-danger-soft' : 'border-warn/50 ring-3 ring-warn-soft') : 'border-line'}">
-                <div class="flex h-list-row items-center gap-2 bg-sunken px-2.5 text-xs text-faint">
-                  {#if running}
-                    <LoaderCircle size={12} class="text-accent motion-safe:animate-spin" /> <span>Working · step {b.steps.length}</span>
-                  {:else}
-                    <span>{b.steps.length} {b.steps.length === 1 ? 'step' : 'steps'}</span>
-                  {/if}
-                  <span class="ml-auto tabular-nums" title={total ? 'Time the tools of these steps ran' : undefined}>{total ? `query ${duration(total)}` : ''}</span>
-                </div>
-                <ol>
-                  {#each b.steps as { p, at }, si}
+                <ol class="divide-y divide-line">
+                  {#each b.steps as { p, at }}
                     {@const key = stepKey(mi, at)}
                     {@const open = isOpen(p, key)}
                     {@const waiting = p.status === 'awaiting' && !!chat.pending}
@@ -243,9 +237,9 @@
                     {@const refused = p.status === 'blocked' || p.status === 'denied'}
                     {@const tone = STATUS_TONE[p.status]}
                     {@const sc = (p.source && connOf(p.source)) || scopeConns[0]}
-                    <li class="border-t border-line">
-                      <button class="focus-ring flex h-rich-menu-row w-full items-center gap-2 px-2.5 text-left text-sm hover:bg-hover focus-visible:outline-offset-[-2px]" aria-expanded={open} onclick={() => (opened[key] = !open)}>
-                        <span class="w-3.5 shrink-0 text-center text-2xs text-faint tabular-nums">{si + 1}</span>
+                    <li>
+                      <button class="focus-ring flex h-rich-menu-row w-full items-center gap-2 bg-sunken px-2.5 text-left text-sm hover:bg-hover focus-visible:outline-offset-[-2px]" aria-expanded={open} onclick={() => (opened[key] = !open)}>
+                        <span class="w-3.5 shrink-0 text-center text-2xs text-faint tabular-nums">{work.indexOf(p) + 1}</span>
                         {#if p.status === 'running'}<LoaderCircle size={13} class="shrink-0 motion-safe:animate-spin {tone}" />
                         {:else if refused}<Ban size={13} class="shrink-0 {tone}" />
                         {:else if p.status === 'failed'}<TriangleAlert size={13} class="shrink-0 {tone}" />
@@ -384,11 +378,31 @@
               </div>
             {/if}
           {/each}
-          {#if chat.live && m === messages.at(-1)}
+        {/snippet}
+        <div class="space-y-2.5">
+          {#if activity.length}
+            <div class="overflow-hidden rounded-lg border border-line">
+              <button class="focus-ring flex h-rich-menu-row w-full items-center gap-2 px-2.5 text-left text-sm text-muted hover:bg-hover focus-visible:outline-offset-[-2px]" aria-expanded={expanded} disabled={waiting} onclick={() => (activityOpen[rk] = !expanded)}>
+                {#if live && !waiting}<LoaderCircle size={13} class="shrink-0 text-accent motion-safe:animate-spin" />
+                {:else}<ListTree size={13} class="shrink-0" />{/if}
+                <span class="font-medium text-ink">Activity</span>
+                {#if work.length}<span>{work.length} {work.length === 1 ? 'step' : 'steps'}</span>{/if}
+                <span class="ml-auto text-xs text-faint tabular-nums" title={qt !== undefined ? `Tool time ${duration(qt)}` : undefined}>{duration(rt ?? qt)}</span>
+                <ChevronRight size={13} class="shrink-0 text-faint motion-safe:transition-transform motion-safe:duration-150 {expanded ? 'rotate-90' : ''}" />
+              </button>
+              {#if expanded}
+                <div class="space-y-2.5 border-t border-line p-2.5">
+                  {@render transcript(activity)}
+                </div>
+              {/if}
+            </div>
+          {/if}
+          {@render transcript(blocks(m.parts, (p, at) => isActivityPart(p, at, end)))}
+          {#if live}
             <!-- Steps show their own state; otherwise the reply waits for the model or streams text. -->
             {#if chat.starting && !busy(m.parts, !!chat.pending)}
               <div class="flex items-center gap-2 text-sm text-muted"><LoaderCircle size={13} class="text-accent motion-safe:animate-spin" /> {startingLabel(chat.starting.kind, chat.starting.name)}</div>
-            {:else if m.parts.length === 0 || afterStep(m.parts, !!chat.pending)}
+            {:else if !busy(m.parts, waiting) && m.parts.at(-1)?.kind !== 'error' && m.parts.at(-1)?.kind !== 'text'}
               <div class="flex items-center gap-2 text-sm text-muted"><LoaderCircle size={13} class="text-accent motion-safe:animate-spin" /> Thinking…</div>
             {:else if m.parts.at(-1)?.kind === 'text'}
               <div class="flex items-center gap-2 text-sm text-muted"><LoaderCircle size={13} class="text-accent motion-safe:animate-spin" /> Writing…</div>
@@ -396,7 +410,7 @@
           {:else}
             {@const text = replyText(m.parts)}
             {@const printable = !!text || m.parts.some((x) => x.kind === 'chart')}
-            {@const q = hide ? lastQuery(m.parts) : undefined}
+            {@const q = !expanded ? lastQuery(m.parts) : undefined}
             {#if q}
               {@const qc = (q.p.source && connOf(q.p.source)) || scopeConns[0]}
               <details class="group overflow-hidden rounded-lg border border-line">
@@ -419,9 +433,6 @@
                 <button class="btn btn-sm btn-ghost gap-1 px-1.5" title="Export the reply as a PDF" aria-label="Export as PDF" disabled={exporting !== null} onclick={() => exportPdf(mi)}>{#if exporting === mi}<LoaderCircle size={13} class="motion-safe:animate-spin" />{:else}<FileDown size={13} />{/if} Export PDF</button>
               {/if}
               <button class="btn btn-sm btn-ghost size-6 p-0" title="Ask again" aria-label="Ask again" disabled={!!chat.live} onclick={() => onretry(mi)}><RotateCw size={13} /></button>
-              {#if !compact && work.length && rt !== undefined}
-                <span class="ml-auto pr-1 text-xs tabular-nums" title="Reply time{qt !== undefined ? ` · query ${duration(qt)}` : ''}">{duration(rt)}</span>
-              {/if}
             </div>
             {#if exported?.mi === mi}
               <p class="text-sm break-all {exported.ok ? 'text-muted' : 'text-danger'}">{exported.text}</p>
