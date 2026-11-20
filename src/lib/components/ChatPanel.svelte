@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { ArrowLeft, CalendarClock, FileCode, History, ListCollapse, LoaderCircle, Play, SquarePen, SquarePlus, Trash2, X } from '@lucide/svelte';
+  import { ArrowLeft, CalendarClock, FileCode, History, ListCollapse, LoaderCircle, Play, Search, SquarePen, SquarePlus, Trash2, X } from '@lucide/svelte';
   import ChatTranscript from './ChatTranscript.svelte';
   import ChatComposer from './ChatComposer.svelte';
   import Menu from './ui/Menu.svelte';
+  import Select from './ui/Select.svelte';
+  import EngineBadge from './ui/EngineBadge.svelte';
   import { chat, current, deleteSession, openSession, scopeOf, send, sessionsByDate, setSkills, skillsOf } from '../chat.svelte';
   import { ago, sourceLabel } from '../chatParts';
-  import { environmentLabel, connOf, sameSource, type Conn, type Source } from '../connections.svelte';
+  import { environmentLabel, connOf, dbOf, sameSource, type Conn, type Source } from '../connections.svelte';
   import { KEYS, isKey } from '../keys';
   import { Pref } from '../persist.svelte';
   import { ui } from '../state.svelte';
@@ -159,6 +161,50 @@
     showHistory = false;
   }
 
+  // History filters: a text match on the title and one database of the chat's scope.
+  let historyQuery = $state('');
+  let historySource = $state('');
+  const sourceKey = (s: Source) => `${s.connId}\u0000${dbOf(s)}`;
+  /** Each database used by a past chat, with how many chats use it. */
+  const sourceOptions = $derived.by(() => {
+    const seen = new Map<string, { source: Source; count: number }>();
+    for (const s of past) {
+      for (const key of new Set(s.sources.map(sourceKey))) {
+        const hit = seen.get(key);
+        if (hit) hit.count++;
+        else seen.set(key, { source: s.sources.find((x) => sourceKey(x) === key)!, count: 1 });
+      }
+    }
+    const each = [...seen].map(([value, { source, count }]) => ({ value, label: `${sourceLabel(source)} (${count})` })).sort((a, b) => a.label.localeCompare(b.label));
+    return [{ value: '', label: `All databases (${past.length})` }, ...each];
+  });
+  /** A deleted chat can take the chosen database out of the list; then all chats show. */
+  const sourceFilter = $derived(sourceOptions.some((o) => o.value === historySource) ? historySource : '');
+  const filtering = $derived(!!historyQuery.trim() || !!sourceFilter);
+  const historyGroups = $derived.by(() => {
+    const q = historyQuery.trim().toLowerCase();
+    const day = 86_400_000;
+    const today = new Date().setHours(0, 0, 0, 0);
+    const buckets = [
+      { label: 'Today', from: today },
+      { label: 'Yesterday', from: today - day },
+      { label: 'Previous 7 days', from: today - 7 * day },
+      { label: 'Previous 30 days', from: today - 30 * day },
+      { label: 'Older', from: -Infinity },
+    ].map((b) => ({ ...b, items: [] as typeof past }));
+    for (const s of past) {
+      if (sourceFilter && !s.sources.some((x) => sourceKey(x) === sourceFilter)) continue;
+      if (q && !s.title.toLowerCase().includes(q)) continue;
+      buckets.find((b) => s.updated >= b.from)!.items.push(s);
+    }
+    return buckets.filter((b) => b.items.length);
+  });
+
+  function clearHistoryFilters() {
+    historyQuery = '';
+    historySource = '';
+  }
+
   const placeholder = $derived(chat.pending ? 'Approve or deny the write above…' : ready ? (many ? 'Ask across these databases…' : 'Ask about your data…') : 'Add a database to ask about…');
 </script>
 
@@ -175,19 +221,60 @@
   </header>
 
   {#if showHistory}
-    <div class="flex-1 overflow-auto px-2 pt-2 pb-3">
-      <button class="nav-item mb-1 text-muted" onclick={() => (showHistory = false)}><ArrowLeft size={13} /> Back to chat</button>
-      <div class="label px-2 pt-2 pb-1.5 text-faint">All chats</div>
-      {#each past as s (s.id)}
-        <div class="group relative">
-          <button class="focus-ring flex w-full flex-col items-start gap-0.5 rounded-lg px-2.5 py-2 pr-9 text-left hover:bg-hover {s.id === session?.id ? 'bg-active' : ''}" onclick={() => pick(s.id)}>
-            <span class="w-full truncate text-sm text-ink">{#if s.scheduleId}<CalendarClock size={12} class="mr-1 inline text-accent" />{/if}{s.title}</span>
-            <span class="w-full truncate text-xs text-faint" title={s.sources.map(sourceLabel).join(', ')}>{ago(s.updated)} · {Math.ceil(s.messages.length / 2)} {s.messages.length > 2 ? 'questions' : 'question'} · {s.sources.length === 1 ? sourceLabel(s.sources[0]) : `${s.sources.length} databases`}</span>
-          </button>
-          <button class="btn btn-sm btn-ghost nav-item-danger absolute top-1/2 right-1.5 size-6 -translate-y-1/2 p-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100" onclick={() => deleteSession(s.id)} title="Delete chat" aria-label="Delete chat {s.title}"><Trash2 size={13} /></button>
+    <div class="flex shrink-0 flex-col gap-1.5 border-b border-line px-2 py-2">
+      <button class="nav-item text-muted" onclick={() => (showHistory = false)}><ArrowLeft size={13} /> Back to chat</button>
+      {#if past.length}
+        <div class="flex items-center gap-1.5 px-0.5">
+          <div class="relative min-w-0 flex-1">
+            <Search size={12} class="pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2 text-faint" />
+            <input
+              bind:value={historyQuery}
+              onkeydown={(e) => { if (e.key === 'Escape' && historyQuery) { e.stopPropagation(); historyQuery = ''; } }}
+              class="input input-sm pr-6 pl-7"
+              placeholder="Search chats"
+              aria-label="Search chats by title"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+              autocomplete="off"
+            />
+            {#if historyQuery}
+              <button class="focus-ring absolute top-1/2 right-1.5 grid size-4 -translate-y-1/2 place-items-center rounded text-faint hover:text-ink" aria-label="Clear search" onclick={() => (historyQuery = '')}><X size={12} /></button>
+            {/if}
+          </div>
+          <Select size="sm" class="w-44 shrink-0" bind:value={historySource} options={sourceOptions} placeholder="All databases" aria-label="Filter chats by database" />
         </div>
+      {/if}
+    </div>
+    <div class="flex-1 overflow-auto px-2 pb-3">
+      {#each historyGroups as g (g.label)}
+        <div class="label px-2.5 pt-3 pb-1 text-faint">{g.label}</div>
+        {#each g.items as s (s.id)}
+          {@const one = s.sources.length === 1 ? connOf(s.sources[0]) : undefined}
+          <div class="group relative">
+            <button class="focus-ring flex w-full flex-col items-start gap-1 rounded-lg px-2.5 py-2 text-left hover:bg-hover {s.id === session?.id ? 'bg-active' : ''}" aria-current={s.id === session?.id ? 'true' : undefined} onclick={() => pick(s.id)}>
+              <span class="flex w-full items-baseline gap-2">
+                <span class="min-w-0 flex-1 truncate text-sm text-ink">{#if s.scheduleId}<CalendarClock size={12} class="mr-1 inline text-accent" />{/if}{s.title}</span>
+                <span class="shrink-0 text-2xs text-faint tabular-nums group-hover:invisible group-has-[:focus-visible]:invisible">{ago(s.updated, { year: true })}</span>
+              </span>
+              <span class="flex w-full items-center gap-1.5 text-xs text-faint" title={s.sources.map(sourceLabel).join(', ')}>
+                {#if one}<EngineBadge engine={one.engine} />{/if}
+                <span class="min-w-0 truncate">{s.sources.length === 1 ? sourceLabel(s.sources[0]) : `${s.sources.length} databases`}</span>
+                <span class="shrink-0">· {Math.ceil(s.messages.length / 2)} {s.messages.length > 2 ? 'questions' : 'question'}</span>
+              </span>
+            </button>
+            <button class="btn btn-sm btn-ghost nav-item-danger absolute top-1.5 right-1.5 size-6 p-0 opacity-0 group-hover:opacity-100 focus-visible:opacity-100" onclick={() => deleteSession(s.id)} title="Delete chat" aria-label="Delete chat {s.title}"><Trash2 size={13} /></button>
+          </div>
+        {/each}
       {:else}
-        <p class="px-2.5 py-2 text-sm text-muted">No chats yet.</p>
+        {#if filtering}
+          <div class="flex flex-col items-start gap-1 px-2.5 py-3 text-sm text-muted">
+            <p>No chats match these filters.</p>
+            <button class="btn btn-sm btn-ghost -ml-2" onclick={clearHistoryFilters}>Clear filters</button>
+          </div>
+        {:else}
+          <p class="px-2.5 py-3 text-sm text-muted">No chats yet.</p>
+        {/if}
       {/each}
     </div>
   {:else}

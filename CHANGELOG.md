@@ -4,6 +4,20 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-20
+
+- New: search chats by title, and filter the chat history by database. The database list shows how many chats use each database.
+- Improved: the chat history groups chats by date (Today, Yesterday, Previous 7 days, Previous 30 days, Older). Each chat shows its database with the engine badge.
+- New: each assistant reply has an **Activity** toggle. It shows the thinking, progress text and database calls of the model in order. Activity is open while the reply streams, and closes when the reply is complete. The final answer and charts stay visible. Copy, PDF export and scheduled replies do not include the activity.
+- New: give a connection a custom environment label (up to 48 characters). The label does not change the permissions. **Protect writes** keeps the production safeguards, and **Read-only** blocks writes. A label change does not reconnect or close an open transaction.
+- Improved: a `BEGIN` that you type in a writable production query tab opens one transaction. The transaction stays open across runs. **Commit** and **Rollback** are available before the first write. A second `BEGIN` stops and does not change the pending changes.
+- Improved: on MySQL and MariaDB, a statement that can commit an open transaction without a command stops before it runs.
+- Improved: the assistant proposes writes only for databases that allow writes. MCP tools reject unknown or incorrect arguments. For example, use `{"database":"1"}` to select Redis database 1.
+- Improved: the app starts faster. Charts load when a reply shows one, and the PDF renderer loads when you export.
+- Improved: in short windows, the editor and the results stay usable. The sidebar tabs accept the arrow keys, Home and End. Keyboard hints show the correct keys for macOS, Linux and Windows.
+- Fixed: long chart titles no longer overlap the legend, in the app and in PDF exports.
+- Fixed: a SQLite export and restore keeps all rows and the next AUTOINCREMENT ID. Text with NUL characters exports correctly.
+
 ## [0.15.0] - 2026-11-19
 
 - New: Redis support for standalone, Cluster and Sentinel. Connect with fields or a `redis://` or `rediss://` URI.
