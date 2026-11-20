@@ -124,3 +124,23 @@ test('long chart titles wrap outside the plot without overlapping its legend', a
   expect(titleLines.length).toBeGreaterThan(1);
   expect(titleLines.join(' ')).toContain(title);
 });
+
+test('chat activity shows thinking and database calls in order without hiding the final answer', async ({ page }) => {
+  await page.getByPlaceholder('Ask about your data…').fill('Show rows from table customers');
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  const toggle = page.getByRole('button', { name: /^Activity/ });
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.getByText('I’ll check the table schema first.', { exact: true })).toBeVisible();
+
+  const answer = page.getByText(/Here are the first \d+ rows of customers/);
+  await expect(answer).toBeVisible();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByRole('button', { name: /Describe table/ })).toBeHidden();
+
+  await toggle.click();
+  await expect(toggle.locator('..')).toContainText(/check the table schema first.*Describe table.*read a small sample.*Read query.*sample is ready to summarize/s);
+  await expect(answer).toBeVisible();
+  await toggle.click();
+  await expect(page.getByText('The sample is ready to summarize.', { exact: true })).toBeHidden();
+  await expect(answer).toBeVisible();
+});

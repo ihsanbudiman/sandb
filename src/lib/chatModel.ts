@@ -33,7 +33,25 @@ export type ErrorPart = { kind: 'error'; text: string };
 /** A chart of a `render_chart` read. `rows` are arrays in `columns` order. `truncated`: the read had more rows than the chart keeps. */
 export type ChartPart = { kind: 'chart'; spec: ChartSpec; columns: string[]; rows: CellValue[][]; truncated: boolean };
 
-export type Part = { kind: 'text'; text: string } | ToolPart | ErrorPart | ChartPart;
+export type Part = { kind: 'text' | 'reasoning'; text: string } | ToolPart | ErrorPart | ChartPart;
+
+export function lastToolIndex(parts: Part[]) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (parts[i].kind === 'tool') return i;
+  }
+  return -1;
+}
+
+export function isActivityPart(p: Part, at: number, lastTool: number) {
+  return p.kind === 'tool' || p.kind === 'reasoning' || (p.kind === 'text' && at < lastTool);
+}
+
+export function answerParts(parts: Part[]) {
+  const end = lastToolIndex(parts);
+  return parts.filter((p, at) => !isActivityPart(p, at, end));
+}
+
+export const replyText = (parts: Part[]) => answerParts(parts).flatMap((p) => (p.kind === 'text' ? [p.text] : [])).join('\n\n').trim();
 
 /**
  * `started`/`ended`: when the assistant reply was sent and when it finished, stopped or failed (missing in chats saved before they were kept).

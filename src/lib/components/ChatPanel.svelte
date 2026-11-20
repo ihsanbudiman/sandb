@@ -114,10 +114,11 @@
     return out.filter((s) => writesOn || !s.write).slice(0, 4);
   });
 
-  const stepsPref = new Pref('sandb.chat.steps', true, { version: 1, migrate: (v) => v !== 'hidden' && v !== false });
+  const stepsPref = new Pref<boolean | null>('sandb.chat.steps', null, { version: 1, migrate: (v) => v !== 'hidden' && v !== false });
   const showSteps = $derived(stepsPref.value);
+  const stepsExpanded = $derived(showSteps ?? !!chat.live);
   function toggleSteps() {
-    stepsPref.set(!stepsPref.value);
+    stepsPref.set(!stepsExpanded);
   }
 
   function keyComposer(e: KeyboardEvent) {
@@ -166,7 +167,7 @@
     <span class="mr-1 text-lg font-semibold">{showHistory ? 'Chats' : 'Assistant'}</span>
     <div class="flex-1"></div>
     {#if !showHistory}
-      <button class="btn btn-ghost btn-on size-7 p-0" onclick={toggleSteps} aria-pressed={!showSteps} title={showSteps ? `Hide steps, show only results (${KEYS.toggleSteps.hint})` : `Show steps (${KEYS.toggleSteps.hint})`} aria-label={showSteps ? 'Hide steps' : 'Show steps'}><ListCollapse size={15} /></button>
+      <button class="btn btn-ghost btn-on size-7 p-0" onclick={toggleSteps} aria-pressed={!stepsExpanded} title={stepsExpanded ? `Hide steps, show only results (${KEYS.toggleSteps.hint})` : `Show steps (${KEYS.toggleSteps.hint})`} aria-label={stepsExpanded ? 'Hide steps' : 'Show steps'}><ListCollapse size={15} /></button>
     {/if}
     <button class="btn btn-ghost btn-on size-7 p-0" onclick={() => (showHistory = !showHistory)} disabled={!!chat.live} aria-pressed={showHistory} title={chat.live ? 'Wait for the reply to finish' : 'Chat history'} aria-label="Chat history"><History size={15} /></button>
     <button class="btn btn-ghost size-7 p-0" onclick={newChat} disabled={!!chat.live || (!session && !showHistory)} title="New chat" aria-label="New chat"><SquarePen size={15} /></button>

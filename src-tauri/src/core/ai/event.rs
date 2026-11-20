@@ -58,6 +58,9 @@ pub enum ChatEvent {
     Text {
         delta: String,
     },
+    Reasoning {
+        delta: String,
+    },
     /// The model has begun a tool call; its arguments are still streaming. Once per call,
     /// before that call's `tool_call`.
     ToolStarting {
