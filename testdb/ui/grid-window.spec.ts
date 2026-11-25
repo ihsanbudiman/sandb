@@ -101,6 +101,23 @@ test('deleting a select-all block keeps rows already marked for deletion', async
   await expect(page.getByText('200 changes', { exact: true })).toBeVisible();
 });
 
+test('restoring a mixed selection keeps unsaved new rows', async ({ page }) => {
+  await openCustomers(page);
+  const edit = page.getByRole('button', { name: 'Edit', exact: true });
+  await edit.click();
+  await expect(edit).toHaveAttribute('aria-pressed', 'true');
+  await page.locator('button[title="Add row"]').click();
+  await expect(page.getByText('1 change', { exact: true })).toBeVisible();
+  const first = page.locator('#query-results tr[data-row="0"]');
+  await page.getByRole('button', { name: 'Select row 1', exact: true }).click();
+  await page.locator('button[title="Delete selected rows"]').click();
+  await expect(page.getByText('2 changes', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Select all rows and columns', exact: true }).click();
+  await first.locator('td').nth(1).click({ button: 'right' });
+  await page.getByRole('menuitem', { name: 'Restore row', exact: true }).click();
+  await expect(page.getByText('1 change', { exact: true })).toBeVisible();
+});
+
 // Chromium fires blur on a removed focused element, so only WebKit (Tauri on macOS) shows a regression here.
 test('an open cell editor commits its value when its row scrolls out of the window', async ({ page }) => {
   await openCustomers(page);

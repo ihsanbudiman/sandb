@@ -747,8 +747,9 @@
       if (!r) continue;
       const bad = mongoConn && !restore ? idProblem(r) : null;
       if (bad) edits.error = { message: bad, key: r.key };
-      else if (r.isNew) edits.added = edits.added.filter((a) => 'a' + a.key !== k);
-      else if (edits.deleted[r.idx]) {
+      else if (r.isNew) {
+        if (!restore) edits.added = edits.added.filter((a) => 'a' + a.key !== k);
+      } else if (edits.deleted[r.idx]) {
         if (restore) delete edits.deleted[r.idx];
       } else if (!restore) edits.deleted[r.idx] = true;
     }
