@@ -63,6 +63,7 @@ test('$elemMatch completion context is the array field path', () => {
     ["{ items: { $elemMatch: { sk", 'items'],
     ['{ "items": { $elemMatch: { sk', 'items'],
     ["{ items: { $elemMatch: { variants: { $elemMatch: { sk", 'items.variants'],
+    ["{ $or: [{ items: { $elemMatch: { sk", 'items'],
   ] as const) {
     assert.equal(mongoElemMatchPath(text, text.length), path, text);
   }

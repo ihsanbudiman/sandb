@@ -353,7 +353,7 @@ function scanObject(toks: Tok[], i: number, path: string, active: string | null)
     }
     i++;
     const elem = key === '$elemMatch';
-    const childPath = elem ? path : joinPath(path, key);
+    const childPath = elem || key.startsWith('$') ? path : joinPath(path, key);
     const childActive = elem && path ? path : active;
     const out = scanValue(toks, i, childPath, childActive);
     if (out.eof) return out;
