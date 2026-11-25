@@ -733,7 +733,7 @@
   });
 
   function deleteRows(keys: string[], restore = false) {
-    if (redisConn) {
+    if (redisConn && !restore) {
       if (!result || !edits.on || !canWrite(conn)) return;
       const picked = new Set(keys);
       for (const r of rows) {
@@ -745,7 +745,7 @@
     for (const k of keys) {
       const r = rows.find((x) => x.key === k);
       if (!r) continue;
-      const bad = mongoConn ? idProblem(r) : null;
+      const bad = mongoConn && !restore ? idProblem(r) : null;
       if (bad) edits.error = { message: bad, key: r.key };
       else if (r.isNew) edits.added = edits.added.filter((a) => 'a' + a.key !== k);
       else if (edits.deleted[r.idx]) {
@@ -1155,7 +1155,7 @@
   {@const { anchor, cell, r, col } = menu}
   {@const picked = contextRows(r)}
   {@const editProblem = redisConn && result ? redisCellProblem(result, r.idx, col) : null}
-  {@const deleteProblem = redisConn && result ? picked.reduce<string | null>((bad, row) => bad ?? (isDeleted(row) ? null : redisDeleteProblem(result, row.idx)), null) : null}
+  {@const deleteProblem = redisConn && result && !isDeleted(r) ? picked.reduce<string | null>((bad, row) => bad ?? (isDeleted(row) ? null : redisDeleteProblem(result, row.idx)), null) : null}
   <Menu {anchor} returnFocus={cell} label="Cell actions" onclose={() => (menu = null)}>
     <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => copyCell(r, col)}><Copy size={13} /> Copy cell</button>
     <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => copyRows(picked)}><Copy size={13} /> Copy {picked.length > 1 ? 'rows' : 'row'}</button>
