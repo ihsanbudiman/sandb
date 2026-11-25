@@ -1017,7 +1017,7 @@
       {@const columns = tab.result?.columns.length ? tab.result.columns : (schema[key] ?? [])}
       {#key tab.id}
         <div class="flex min-h-0 flex-1 flex-col border-t border-line">
-          {#if !redis}<TableFilterBar {columns} types={tab.result?.types ?? []} bind:filters={tab.filters} loading={!!busy} onapply={() => loadTableData(tab)} />{/if}
+          {#if !redis}<TableFilterBar engine={conn.engine} {columns} fields={(schema[key]?.length ? schema[key] : undefined) ?? columns} types={tab.result?.types ?? []} bind:filters={tab.filters} bind:mongoFilter={tab.mongoFilter} loading={!!busy} onapply={() => loadTableData(tab)} />{/if}
           <div class="relative min-h-0 flex-1">
             <ResultsGrid tab={tab} running={busy} oncancel={() => cancelRun(tab)} sort={tab.sort ?? null} onsort={(s) => sortResult(tab, s)} onloadmore={() => loadMore(tab)} onsaved={() => { structureChanged(tab.resultConn); refreshResult(tab); }} foreignKeys={tableFks} onfollow={(fk, row) => followForeignKey(conn, t, fk, row)} />
           </div>

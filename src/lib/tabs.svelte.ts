@@ -24,6 +24,8 @@ export interface Tab {
   /** Set on a table tab (double-click or ⌘-click in the tree): it shows the table's data or properties, not the editor. */
   table: TableRef | null;
   filters: TableFilter[];
+  /** Compass-style filter document of a MongoDB table tab. */
+  mongoFilter: string;
   sort?: RunSort;
   view: 'data' | 'properties';
   /** The saved query this tab edits; ⌘S writes to it. */
@@ -97,6 +99,7 @@ export function newTab(query = '', title = nextQueryTitle()): Tab {
     status: null,
     table: null,
     filters: [],
+    mongoFilter: '',
     view: 'data',
     savedId: null,
     edits: newEdits(),

@@ -10,7 +10,7 @@ pnpm exec playwright install chromium
 pnpm test:ui
 ```
 
-Node.js 22.18+ is required for the TypeScript unit tests. Playwright starts Vite automatically (or reuses a running dev server locally).
+Node.js 22.18+ is required for the TypeScript unit tests. Playwright starts an isolated `pnpm test-env mock` server automatically.
 
 ## Database fixtures
 

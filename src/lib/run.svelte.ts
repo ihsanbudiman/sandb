@@ -183,7 +183,7 @@ export function loadTableData(t: Tab) {
   let sql: string;
   try {
     const key = isRedis(c) ? redisKeys(c.id, ref.database)?.items.keys.find((k) => k.name === ref.name) : undefined;
-    sql = tableDataSql(c.engine, key ? { ...ref, redisType: key.redisType, rowEstimate: key.rowEstimate } : ref, t.filters, t.result?.columns ?? [], t.result?.types ?? []);
+    sql = tableDataSql(c.engine, key ? { ...ref, redisType: key.redisType, rowEstimate: key.rowEstimate } : ref, t.filters, t.result?.columns ?? [], t.result?.types ?? [], t.mongoFilter);
   } catch (e) {
     notify(false, e instanceof Error ? e.message : String(e));
     return;

@@ -1,7 +1,7 @@
 import type { ColumnInfo, ConstraintInfo, Engine, ForeignKeyInfo, IndexInfo, TableInfo, TableKind } from './api';
 import { REDIS_VIEW_MAX_ELEMENTS } from './api/generated/constants';
 import type { Conn } from './connections.svelte';
-import { mongoValueText } from './mongo/value';
+import { mongoFilterDocument } from './mongo/filter';
 import type { SqlEngine } from './sql/text';
 import { quoteIdent, sqlLiteral } from './sql/value';
 
@@ -21,7 +21,7 @@ export const displayName = (t: TableRef) => (t.schema ? t.schema + '.' : '') + t
 export type TableFilterOperator = '=' | '<>' | '>' | '>=' | '<' | '<=' | 'contains' | 'startsWith' | 'endsWith' | 'isNull' | 'isNotNull';
 export type TableFilter = { id: string; column: string; operator: TableFilterOperator; value: string };
 
-/** One filter-row operator, with the SQL and mongosh forms it emits. `type` is the column's declared type. */
+/** One SQL filter-row operator. `type` is the column's declared type. */
 export type FilterOperator = {
   value: TableFilterOperator;
   label: string;
@@ -31,25 +31,20 @@ export type FilterOperator = {
   noValue?: boolean;
   /** The SQL condition; `col` is the quoted column. */
   sql: (col: string, value: string, engine: Engine, type: string) => string;
-  /** The mongosh field condition; `key` is the field name as written. */
-  mongo: (key: string, value: string, type: string) => string;
 };
 
-/** The pattern of a `contains`-family filter: metacharacters escaped, so the value matches literally. */
-const regexText = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
 const OPERATORS: Record<TableFilterOperator, FilterOperator> = {
-  '=': { value: '=', label: 'equals', sql: (c, v, e, t) => `${c} = ${sqlLiteral(e, v, t)}`, mongo: (k, v, t) => `${k}: ${mongoValueText(t, v)}` },
-  '<>': { value: '<>', label: 'does not equal', sql: (c, v, e, t) => `${c} <> ${sqlLiteral(e, v, t)}`, mongo: (k, v, t) => `${k}: { $ne: ${mongoValueText(t, v)} }` },
-  '>': { value: '>', label: 'greater than', sql: (c, v, e, t) => `${c} > ${sqlLiteral(e, v, t)}`, mongo: (k, v, t) => `${k}: { $gt: ${mongoValueText(t, v)} }` },
-  '>=': { value: '>=', label: 'at least', sql: (c, v, e, t) => `${c} >= ${sqlLiteral(e, v, t)}`, mongo: (k, v, t) => `${k}: { $gte: ${mongoValueText(t, v)} }` },
-  '<': { value: '<', label: 'less than', sql: (c, v, e, t) => `${c} < ${sqlLiteral(e, v, t)}`, mongo: (k, v, t) => `${k}: { $lt: ${mongoValueText(t, v)} }` },
-  '<=': { value: '<=', label: 'at most', sql: (c, v, e, t) => `${c} <= ${sqlLiteral(e, v, t)}`, mongo: (k, v, t) => `${k}: { $lte: ${mongoValueText(t, v)} }` },
-  contains: { value: 'contains', label: 'contains', text: true, sql: (c, v, e) => `${c} LIKE ${sqlLiteral(e, `%${v}%`, 'text')}`, mongo: (k, v) => `${k}: { $regex: ${JSON.stringify(regexText(v))} }` },
-  startsWith: { value: 'startsWith', label: 'starts with', text: true, sql: (c, v, e) => `${c} LIKE ${sqlLiteral(e, `${v}%`, 'text')}`, mongo: (k, v) => `${k}: { $regex: ${JSON.stringify(`^${regexText(v)}`)} }` },
-  endsWith: { value: 'endsWith', label: 'ends with', text: true, sql: (c, v, e) => `${c} LIKE ${sqlLiteral(e, `%${v}`, 'text')}`, mongo: (k, v) => `${k}: { $regex: ${JSON.stringify(`${regexText(v)}$`)} }` },
-  isNull: { value: 'isNull', label: 'is NULL', noValue: true, sql: (c) => `${c} IS NULL`, mongo: (k) => `${k}: null` },
-  isNotNull: { value: 'isNotNull', label: 'is not NULL', noValue: true, sql: (c) => `${c} IS NOT NULL`, mongo: (k) => `${k}: { $ne: null }` },
+  '=': { value: '=', label: 'equals', sql: (c, v, e, t) => `${c} = ${sqlLiteral(e, v, t)}` },
+  '<>': { value: '<>', label: 'does not equal', sql: (c, v, e, t) => `${c} <> ${sqlLiteral(e, v, t)}` },
+  '>': { value: '>', label: 'greater than', sql: (c, v, e, t) => `${c} > ${sqlLiteral(e, v, t)}` },
+  '>=': { value: '>=', label: 'at least', sql: (c, v, e, t) => `${c} >= ${sqlLiteral(e, v, t)}` },
+  '<': { value: '<', label: 'less than', sql: (c, v, e, t) => `${c} < ${sqlLiteral(e, v, t)}` },
+  '<=': { value: '<=', label: 'at most', sql: (c, v, e, t) => `${c} <= ${sqlLiteral(e, v, t)}` },
+  contains: { value: 'contains', label: 'contains', text: true, sql: (c, v, e) => `${c} LIKE ${sqlLiteral(e, `%${v}%`, 'text')}` },
+  startsWith: { value: 'startsWith', label: 'starts with', text: true, sql: (c, v, e) => `${c} LIKE ${sqlLiteral(e, `${v}%`, 'text')}` },
+  endsWith: { value: 'endsWith', label: 'ends with', text: true, sql: (c, v, e) => `${c} LIKE ${sqlLiteral(e, `%${v}`, 'text')}` },
+  isNull: { value: 'isNull', label: 'is NULL', noValue: true, sql: (c) => `${c} IS NULL` },
+  isNotNull: { value: 'isNotNull', label: 'is not NULL', noValue: true, sql: (c) => `${c} IS NOT NULL` },
 };
 
 /** The filter-row operators in menu order; OPERATORS is their only declaration. */
@@ -62,22 +57,12 @@ export const filterOperator = (value: TableFilterOperator) => OPERATORS[value];
 export const isTextType = (dataType: string) => /char|text|uuid|json|xml|citext|string/i.test(dataType || 'text');
 
 /** The command for one Data view run. Values are literals because the query API accepts text. */
-export function tableDataSql(engine: Engine, table: TableRef, filters: TableFilter[], columns: string[] = [], types: string[] = []) {
+export function tableDataSql(engine: Engine, table: TableRef, filters: TableFilter[], columns: string[] = [], types: string[] = [], mongoFilter = '') {
   if (engine === 'redis') return redisViewCommand(table.name, table.redisType, table.rowEstimate);
   if (engine === 'mongo') {
-    // mongosh: db.<collection>.find({ ... }). Fields with several filters cannot share one key,
-    // so their conditions go through $and; the others merge into one document.
-    const counts = new Map<string, number>();
-    for (const f of filters) counts.set(f.column, (counts.get(f.column) ?? 0) + 1);
-    const plain: string[] = [];
-    const ands: string[] = [];
-    for (const f of filters) {
-      // A sampled field can have several types (`decimal128 | int32 | string`); the most common one types the value.
-      const cond = mongoCondition(f, (types[columns.indexOf(f.column)] ?? '').split(' | ')[0]);
-      (counts.get(f.column) ?? 0) > 1 ? ands.push(`{ ${cond} }`) : plain.push(cond);
-    }
-    const doc = [plain.join(', '), ands.length ? `$and: [${ands.join(', ')}]` : ''].filter(Boolean).join(', ');
-    return `db.${mongoName(table.name)}.find({${doc ? ` ${doc} ` : ''}})`;
+    // Compass accepts one mongosh filter document. The backend parses it as written, so all
+    // query operators and BSON constructors behave as they do in the Compass query bar.
+    return `db.${mongoName(table.name)}.find(${mongoFilterDocument(mongoFilter)}\n)`;
   }
   const where = filters.map((f) => filterOperator(f.operator).sql(quoteIdent(engine, f.column), f.value, engine, types[columns.indexOf(f.column)] ?? ''));
   return `SELECT *\nFROM ${qualified(engine, table)}${where.length ? `\nWHERE ${where.join(' AND ')}` : ''}`;
@@ -105,11 +90,6 @@ export const PLAIN_IDENT = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
  */
 export function mongoName(name: string) {
   return `getCollection(${JSON.stringify(name)})`;
-}
-
-function mongoCondition(f: TableFilter, type: string) {
-  const key = PLAIN_IDENT.test(f.column) ? f.column : JSON.stringify(f.column);
-  return filterOperator(f.operator).mongo(key, f.value, type);
 }
 
 export const selectSql = (e: Engine, t: TableRef, cols: ColumnInfo[]) =>

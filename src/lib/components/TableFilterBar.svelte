@@ -1,21 +1,40 @@
 <script lang="ts">
   import { ListFilter, Plus, X } from '@lucide/svelte';
   import { FILTER_OPERATORS, filterOperator, isTextType, type TableFilter } from '../tableActions';
+  import { emptyMongoFilter, validateMongoFilter } from '../mongo/filter';
+  import type { Engine } from '../api';
   import Select from './ui/Select.svelte';
+  import MongoFilterInput from './MongoFilterInput.svelte';
 
   let {
+    engine,
     columns,
     types,
+    fields = columns,
     filters = $bindable([]),
+    mongoFilter = $bindable(''),
     loading = false,
     onapply,
-  }: { columns: string[]; types: string[]; filters?: TableFilter[]; loading?: boolean; onapply: () => void } = $props();
+  }: {
+    engine: Engine;
+    columns: string[];
+    types: string[];
+    /** MongoDB schema paths for completion; the flattened result columns are the fallback. */
+    fields?: string[];
+    filters?: TableFilter[];
+    /** The Compass-style MongoDB filter document; SQL tables use `filters` instead. */
+    mongoFilter?: string;
+    loading?: boolean;
+    onapply: () => void;
+  } = $props();
 
   let editing = $state(false);
   const allOperators = FILTER_OPERATORS.map(({ value, label }) => ({ value, label }));
   const nonTextOperators = FILTER_OPERATORS.filter((op) => !op.text).map(({ value, label }) => ({ value, label }));
   // Mongo columns type their fields `string` (or a union containing it); SQL uses char/text/...
   const isText = (column: string) => isTextType(types[columns.indexOf(column)] ?? '');
+  const mongoValidation = $derived(validateMongoFilter(mongoFilter));
+  const mongoValid = $derived(mongoValidation.valid);
 
   function addFilter() {
     if (!columns.length) return;
@@ -33,8 +52,27 @@
     editing = false;
     onapply();
   }
+
+  function applyMongo() {
+    if (mongoValid && !loading) onapply();
+  }
+
+  function resetMongo() {
+    mongoFilter = '';
+    if (!loading) onapply();
+  }
 </script>
 
+{#if engine === 'mongo'}
+  <form class="shrink-0 border-b border-line bg-sunken/45" onsubmit={(e) => { e.preventDefault(); applyMongo(); }}>
+    <div class="flex min-h-sub-toolbar items-center gap-2 px-2 py-1">
+      <span class="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-muted"><ListFilter size={13} /> Filter</span>
+      <MongoFilterInput bind:value={mongoFilter} fields={fields} invalid={!mongoValid} error={mongoValidation.valid ? '' : mongoValidation.error} onapply={applyMongo} />
+      <button class="btn btn-sm btn-ghost shrink-0" type="button" disabled={loading || emptyMongoFilter(mongoFilter)} onclick={resetMongo}>Reset</button>
+      <button class="btn btn-sm btn-secondary shrink-0" type="submit" disabled={!mongoValid || loading}>Find</button>
+    </div>
+  </form>
+{:else}
 <form class="shrink-0 border-b border-line bg-sunken/45" onsubmit={(e) => { e.preventDefault(); onapply(); }}>
   <div class="flex h-sub-toolbar items-center gap-2 px-2">
     {#if !editing && !filters.length}
@@ -74,3 +112,4 @@
     </div>
   {/if}
 </form>
+{/if}

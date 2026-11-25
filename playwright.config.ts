@@ -2,10 +2,10 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './testdb/ui',
-  use: { baseURL: 'http://localhost:5199', browserName: 'chromium' },
+  use: { baseURL: 'http://localhost:5299', browserName: 'chromium' },
   webServer: {
-    command: 'pnpm dev',
-    url: 'http://localhost:5199',
-    reuseExistingServer: !process.env.CI,
+    command: 'SANDB_TEST_FOREGROUND=1 scripts/test-env.sh mock',
+    url: 'http://localhost:5299',
+    reuseExistingServer: false,
   },
 });
