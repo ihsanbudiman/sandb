@@ -14,8 +14,9 @@
 set -euo pipefail
 [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; } \
   || { echo "test-env: needs bash 4.3 or later (brew install bash)" >&2; exit 1; }
-# Each background job gets its own process group, so cleanup stops its whole tree.
-set -m
+# Each background job gets its own process group, so cleanup stops its whole tree. Foreground
+# mode keeps one group instead: Playwright SIGKILLs that whole group, supervisor and server alike.
+[ "${SANDB_TEST_FOREGROUND:-}" = 1 ] || set -m
 cd "$(dirname "$0")/.."
 
 mode=${1:-}
@@ -135,7 +136,12 @@ mock)
   # Playwright SIGKILLs the web-server process group, so a supervisor never gets to clean up.
   # Foreground mock mode replaces this script with Vite after the same port and environment checks.
   if [ "${SANDB_TEST_FOREGROUND:-}" = 1 ]; then
-    exec env SANDB_DEV_PORT="$dev_port" VITE_BACKEND=mock VITE_BRIDGE_TOKEN= node node_modules/vite/bin/vite.js
+    SANDB_DEV_PORT="$dev_port" VITE_BACKEND=mock VITE_BRIDGE_TOKEN= node node_modules/vite/bin/vite.js </dev/null >"$tmp/vite.log" 2>&1 &
+    vite=$!
+    wait_port "$dev_port" vite "$vite"
+    echo "test-env: READY mode=mock url=http://localhost:$dev_port logs=$tmp"
+    wait "$vite"
+    exit $?
   fi
   start_vite env VITE_BACKEND=mock VITE_BRIDGE_TOKEN=
   ;;
