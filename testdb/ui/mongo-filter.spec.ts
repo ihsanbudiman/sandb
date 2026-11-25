@@ -1,14 +1,17 @@
 import { expect, test, type Page } from '@playwright/test';
 
-async function openMongoCustomers(page: Page) {
+async function openMongoCollection(page: Page, collection: string, rowText?: string) {
   await page.goto('/');
   const conn = page.getByRole('button', { name: /MG local mongo/ });
   if ((await conn.getAttribute('aria-expanded')) !== 'true') await conn.click();
   const db = page.getByRole('button', { name: /shop_staging/ });
   if ((await db.getAttribute('aria-expanded')) !== 'true') await db.click();
-  await page.locator('button[title^="customers"]').dblclick();
-  await expect(page.locator('table[aria-rowcount]')).toContainText('Maria Lubin');
+  await page.locator(`button[title^="${collection}"]`).dblclick();
+  await expect(page.locator('table[aria-rowcount]')).toBeVisible();
+  if (rowText) await expect(page.locator('table[aria-rowcount]')).toContainText(rowText);
 }
+
+const openMongoCustomers = (page: Page) => openMongoCollection(page, 'customers', 'Maria Lubin');
 
 const input = (page: Page) => page.locator('.mongo-filter-input .cm-content');
 const results = (page: Page) => page.locator('table[aria-rowcount]');
@@ -50,4 +53,14 @@ test('an invalid MongoDB filter disables Find', async ({ page }) => {
   await expect(find).toBeDisabled();
   await input(page).fill("{ country: 'DE' }");
   await expect(find).toBeEnabled();
+});
+
+test('completion inside $elemMatch uses paths relative to the array element', async ({ page }) => {
+  await openMongoCollection(page, 'orders');
+  await input(page).fill('{ items: { $elemMatch: { ');
+  await page.keyboard.type('s');
+
+  const completion = page.locator('.cm-tooltip-autocomplete');
+  await expect(completion).toContainText('sku');
+  await expect(completion).not.toContainText('items.sku');
 });

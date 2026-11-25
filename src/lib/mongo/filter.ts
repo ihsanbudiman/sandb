@@ -284,6 +284,94 @@ class Parser {
 }
 
 
+type Scan = { i: number; active: string | null; eof: boolean };
+
+const joinPath = (base: string, key: string) => (base ? `${base}.${key}` : key);
+
+function stringKey(raw: string): string | null {
+  const quote = raw[0];
+  if (quote === '"') {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (quote === "'") return raw.slice(1, -1).replace(/\\(['\\])/g, '$1');
+  return null;
+}
+
+function keyText(t: Tok): string | null {
+  if (t.t === 'ident' || t.t === 'num') return t.v;
+  if (t.t === 'str') return stringKey(t.v);
+  return null;
+}
+
+function scanValue(toks: Tok[], i: number, path: string, active: string | null): Scan {
+  const t = toks[i];
+  if (t.t === 'eof') return { i, active, eof: true };
+  if (t.t === 'punct' && 'v' in t && t.v === '{') return scanObject(toks, i + 1, path, active);
+  if (t.t === 'punct' && 'v' in t && (t.v === '[' || t.v === '(')) {
+    const close = t.v === '[' ? ']' : ')';
+    i++;
+    while (true) {
+      const here = toks[i];
+      if (here.t === 'eof') return { i, active, eof: true };
+      if (here.t === 'punct' && 'v' in here && here.v === close) return { i: i + 1, active, eof: false };
+      if (here.t === 'punct' && 'v' in here && here.v === ',') {
+        i++;
+        continue;
+      }
+      const out = scanValue(toks, i, path, active);
+      if (out.eof) return out;
+      i = out.i;
+    }
+  }
+  return { i: i + 1, active, eof: false };
+}
+
+/** A tolerant object-literal scan used while the filter is still incomplete. */
+function scanObject(toks: Tok[], i: number, path: string, active: string | null): Scan {
+  while (true) {
+    const t = toks[i];
+    if (t.t === 'eof') return { i, active, eof: true };
+    if (t.t === 'punct' && 'v' in t && t.v === '}') return { i: i + 1, active, eof: false };
+    if (t.t === 'punct' && 'v' in t && t.v === ',') {
+      i++;
+      continue;
+    }
+    const key = keyText(t);
+    if (key === null) {
+      i++;
+      continue;
+    }
+    i++;
+    const colon = toks[i];
+    if (!(colon.t === 'punct' && 'v' in colon && colon.v === ':')) {
+      if (colon.t === 'eof') return { i, active, eof: true };
+      continue;
+    }
+    i++;
+    const elem = key === '$elemMatch';
+    const childPath = elem ? path : joinPath(path, key);
+    const childActive = elem && path ? path : active;
+    const out = scanValue(toks, i, childPath, childActive);
+    if (out.eof) return out;
+    i = out.i;
+  }
+}
+
+/**
+ * The array field whose `$elemMatch` object contains `pos`, for completion inside that object.
+ * Paths in that object are relative to one array element, so `items.sku` completes as `sku`.
+ */
+export function mongoElemMatchPath(text: string, pos: number): string | null {
+  const out = lex(text.slice(0, pos));
+  if ('error' in out || out.toks[0]?.t !== 'punct' || !('v' in out.toks[0]) || out.toks[0].v !== '{') return null;
+  const scan = scanObject(out.toks, 1, '', null);
+  return scan.eof ? scan.active : null;
+}
+
 export type MongoFilterValidation = { valid: true } | { valid: false; error: string };
 
 /**

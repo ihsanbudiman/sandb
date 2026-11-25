@@ -7,7 +7,7 @@
   import { syntaxHighlighting, HighlightStyle, indentUnit } from '@codemirror/language';
   import { acceptCompletion, autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap, startCompletion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
   import { tags as t } from '@lezer/highlight';
-  import { MONGO_FILTER_OPERATORS, mongoQueryPath } from '../mongo/filter';
+  import { MONGO_FILTER_OPERATORS, mongoElemMatchPath, mongoQueryPath } from '../mongo/filter';
 
   let {
     value = $bindable(''),
@@ -45,8 +45,12 @@
     const quote = keyPosition(ctx.state, word.from);
     if (quote === null) return null;
     if (word.text.startsWith('$') && !quote) return { from: word.from, options: operators, validFor: /^[\w$]*$/ };
-    if (!queryFields.length) return null;
-    const options = queryFields.map((field) => {
+    const elemPath = mongoElemMatchPath(ctx.state.doc.toString(), ctx.pos);
+    const available = elemPath
+      ? queryFields.filter((f) => f.startsWith(`${elemPath}.`)).map((f) => f.slice(elemPath.length + 1))
+      : queryFields;
+    if (!available.length) return null;
+    const options = available.map((field) => {
       const insert = quote ? escapeKey(field, quote) : plainKey.test(field) ? field : JSON.stringify(field);
       return { label: field, type: 'property', apply: insert };
     });

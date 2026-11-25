@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { emptyMongoFilter, mongoFilterDocument, mongoQueryPath, validateMongoFilter } from '../src/lib/mongo/filter.ts';
+import { emptyMongoFilter, mongoElemMatchPath, mongoFilterDocument, mongoQueryPath, validateMongoFilter } from '../src/lib/mongo/filter.ts';
 
 const valid = [
   '{}',
@@ -55,4 +55,19 @@ test('schema array paths complete as MongoDB query paths', () => {
   assert.equal(mongoQueryPath('items[].sku'), 'items.sku');
   assert.equal(mongoQueryPath('items[].variants[].sku'), 'items.variants.sku');
   assert.equal(mongoQueryPath('status'), 'status');
+});
+
+test('$elemMatch completion context is the array field path', () => {
+  for (const [text, path] of [
+    ["{ items: { $elemMatch: { sku: 'x', ", 'items'],
+    ["{ items: { $elemMatch: { sk", 'items'],
+    ['{ "items": { $elemMatch: { sk', 'items'],
+    ["{ items: { $elemMatch: { variants: { $elemMatch: { sk", 'items.variants'],
+  ] as const) {
+    assert.equal(mongoElemMatchPath(text, text.length), path, text);
+  }
+
+  const closed = "{ items: { $elemMatch: { sku: 'x' } }, status: 'paid' }";
+  assert.equal(mongoElemMatchPath(closed, closed.length), null);
+  assert.equal(mongoElemMatchPath("{ items: { $elemMatch: { sku: 'x' } }, st", "{ items: { $elemMatch: { sku: 'x' } }, st".length), null);
 });
