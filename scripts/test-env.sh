@@ -125,13 +125,18 @@ wait_port() {
 # Vite reads `.env.local` too; the process env wins over it, so these values always apply.
 # Background jobs read /dev/null: under job control a read from the terminal would stop them.
 start_vite() {
-  SANDB_DEV_PORT=$dev_port "$@" pnpm exec vite </dev/null >"$tmp/vite.log" 2>&1 &
+  SANDB_DEV_PORT=$dev_port "$@" node node_modules/vite/bin/vite.js </dev/null >"$tmp/vite.log" 2>&1 &
   pids+=($!)
   wait_port "$dev_port" vite $!
 }
 
 case "$mode" in
 mock)
+  # Playwright SIGKILLs the web-server process group, so a supervisor never gets to clean up.
+  # Foreground mock mode replaces this script with Vite after the same port and environment checks.
+  if [ "${SANDB_TEST_FOREGROUND:-}" = 1 ]; then
+    exec env SANDB_DEV_PORT="$dev_port" VITE_BACKEND=mock VITE_BRIDGE_TOKEN= node node_modules/vite/bin/vite.js
+  fi
   start_vite env VITE_BACKEND=mock VITE_BRIDGE_TOKEN=
   ;;
 

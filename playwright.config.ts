@@ -4,8 +4,8 @@ export default defineConfig({
   testDir: './testdb/ui',
   use: { baseURL: 'http://localhost:5299', browserName: 'chromium' },
   webServer: {
-    command: 'pnpm test-env mock',
+    command: 'SANDB_TEST_FOREGROUND=1 scripts/test-env.sh mock',
     url: 'http://localhost:5299',
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
   },
 });
