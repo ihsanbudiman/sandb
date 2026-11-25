@@ -732,7 +732,7 @@
     return null;
   });
 
-  function deleteRows(keys: string[]) {
+  function deleteRows(keys: string[], restore = false) {
     if (redisConn) {
       if (!result || !edits.on || !canWrite(conn)) return;
       const picked = new Set(keys);
@@ -748,8 +748,9 @@
       const bad = mongoConn ? idProblem(r) : null;
       if (bad) edits.error = { message: bad, key: r.key };
       else if (r.isNew) edits.added = edits.added.filter((a) => 'a' + a.key !== k);
-      else if (edits.deleted[r.idx]) delete edits.deleted[r.idx];
-      else edits.deleted[r.idx] = true;
+      else if (edits.deleted[r.idx]) {
+        if (restore) delete edits.deleted[r.idx];
+      } else if (!restore) edits.deleted[r.idx] = true;
     }
     grid.selected = {};
   }
@@ -1187,7 +1188,7 @@
         {/if}
       {/if}
       {#if canEditRows}
-        <button type="button" role="menuitem" tabindex="-1" class="menu-item {isDeleted(r) ? '' : 'nav-item-danger'}" disabled={!!deleteProblem} title={deleteProblem ?? undefined} onclick={() => deleteRows(picked.map((row) => row.key))}>
+        <button type="button" role="menuitem" tabindex="-1" class="menu-item {isDeleted(r) ? '' : 'nav-item-danger'}" disabled={!!deleteProblem} title={deleteProblem ?? undefined} onclick={() => deleteRows(picked.map((row) => row.key), isDeleted(r))}>
           {#if isDeleted(r)}<Undo2 size={13} /> Restore {mongoConn ? 'document' : 'row'}
           {:else}<Minus size={13} /> Delete {mongoConn ? 'document' : 'row'}{picked.length > 1 ? 's' : ''}{/if}
         </button>
