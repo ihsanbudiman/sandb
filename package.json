@@ -9,7 +9,7 @@
     "test:bundle": "node tests/frontend-bundle.mjs",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test:unit": "node --experimental-strip-types --test testdb/keys.test.ts testdb/complete.test.ts",
+    "test:unit": "node --experimental-strip-types --test testdb/keys.test.ts testdb/complete.test.ts testdb/mongo-filter.test.ts",
     "test:ui": "playwright test",
     "test": "pnpm check && cargo test --manifest-path src-tauri/Cargo.toml --lib --bins --all-features",
     "test:it": "cargo test --manifest-path src-tauri/Cargo.toml --features it",

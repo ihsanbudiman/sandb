@@ -43,12 +43,36 @@ tmp_base=${tmp_base%/}
 tmp=""
 data=""
 pids=()
+
+# A job's whole process tree. pnpm may put its server child in a new process group, so group
+# cleanup alone would leave that server behind after the test run.
+job_tree_pids() {
+  ps -eo pid=,ppid= | awk -v root="$1" '
+    { pid[NR] = $1; parent[NR] = $2 }
+    END {
+      inside[root] = 1
+      print root
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (i = 1; i <= NR; i++) {
+          if (!inside[pid[i]] && inside[parent[i]]) {
+            inside[pid[i]] = 1
+            print pid[i]
+            changed = 1
+          }
+        }
+      }
+    }'
+}
+
 cleanup() {
   trap - EXIT INT TERM
   for pid in ${pids[@]+"${pids[@]}"}; do
-    kill -TERM -- "-$pid" 2>/dev/null || true
+    tree=$(job_tree_pids "$pid")
+    kill -TERM $tree 2>/dev/null || true
     # A stopped job only gets the TERM once it runs again.
-    kill -CONT -- "-$pid" 2>/dev/null || true
+    kill -CONT $tree 2>/dev/null || true
   done
   wait 2>/dev/null || true
   # A custom data dir has its own credential store service (src-tauri/src/lib.rs); remove its items.
@@ -70,15 +94,27 @@ mkdir -p "$data"
 real_data="$HOME/Library/Application Support/dev.sandb.app"
 case "$(cd "$data" && pwd -P)/" in "$(cd "$real_data" 2>/dev/null && pwd -P || echo /nonexistent)"/*) die "data dir resolves inside the real app data" ;; esac
 
-# Waits until a process of job `pid` (its process group) listens on `port`. A listener from any
-# other process fails, so READY never points at a server this script did not start.
+# Waits until a descendant of job `pid` listens on `port`. A listener from any other process fails,
+# so READY never points at a server this script did not start. pnpm may put its server child in a
+# new process group, so the owner is checked by ancestry rather than by the job's process group.
+owned_by_job() {
+  local owner=$1 pid=$2 parent
+  for _ in $(seq 1 32); do
+    [ "$owner" = "$pid" ] && return 0
+    parent=$(ps -o ppid= -p "$owner" 2>/dev/null | tr -d ' ')
+    [ -n "$parent" ] && [ "$parent" -ge 1 ] 2>/dev/null || return 1
+    owner=$parent
+  done
+  return 1
+}
+
 wait_port() {
   local port=$1 name=$2 pid=$3 owner
   for _ in $(seq 1 600); do
     kill -0 "$pid" 2>/dev/null || die "$name exited; see $tmp/$name.log"
     owner=$(lsof -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
     if [ -n "$owner" ]; then
-      [ "$(ps -o pgid= -p "$owner" | tr -d ' ')" = "$pid" ] || die "port $port is held by another process ($owner)"
+      owned_by_job "$owner" "$pid" || die "port $port is held by another process ($owner)"
       return 0
     fi
     sleep 0.5
