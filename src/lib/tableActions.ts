@@ -62,7 +62,7 @@ export function tableDataSql(engine: Engine, table: TableRef, filters: TableFilt
   if (engine === 'mongo') {
     // Compass accepts one mongosh filter document. The backend parses it as written, so all
     // query operators and BSON constructors behave as they do in the Compass query bar.
-    return `db.${mongoName(table.name)}.find(${mongoFilterDocument(mongoFilter)})`;
+    return `db.${mongoName(table.name)}.find(${mongoFilterDocument(mongoFilter)}\n)`;
   }
   const where = filters.map((f) => filterOperator(f.operator).sql(quoteIdent(engine, f.column), f.value, engine, types[columns.indexOf(f.column)] ?? ''));
   return `SELECT *\nFROM ${qualified(engine, table)}${where.length ? `\nWHERE ${where.join(' AND ')}` : ''}`;
