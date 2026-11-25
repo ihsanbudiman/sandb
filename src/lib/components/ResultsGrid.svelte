@@ -27,7 +27,7 @@
 
 <script lang="ts">
   import { tick, untrack, type Snippet } from 'svelte';
-  import { ArrowUpDown, ArrowUp, ArrowDown, ArrowUpRight, Check, X, Pencil, Minus, Eye, Undo2, CircleSlash, CircleAlert, CircleCheck, Copy, Braces, Clock, LoaderCircle } from '@lucide/svelte';
+  import { ArrowUpDown, ArrowUp, ArrowDown, ArrowUpRight, Check, X, Pencil, Minus, Eye, Undo2, CircleSlash, CircleAlert, CircleCheck, Copy, Braces, Clock, LoaderCircle, Grid2x2 } from '@lucide/svelte';
   import { api, ApiError, type Cell, type ForeignKeyInfo, type Row, type RunSort, type TypedValue } from '../api';
   import { focusOnMount } from '../actions';
   import { canWrite, isSql } from '../connections.svelte';
@@ -336,10 +336,10 @@
     return v === true || v === 1 || v === 'true' || v === '1';
   };
 
-  async function enableEdit(): Promise<boolean> {
+  async function enableEdit(reportBlocker = true): Promise<boolean> {
     if (!result || preparing) return false;
     if (blocker) {
-      edits.error = { message: blocker, key: '' };
+      if (reportBlocker) edits.error = { message: blocker, key: '' };
       return false;
     }
     const current = result;
@@ -348,7 +348,9 @@
     preparing = false;
     if (result !== current || !canWrite(conn)) return false;
     if (reason) {
-      edits.error = { message: reason, key: '' };
+      // A quiet double-click hides only a persistent "not editable" answer,
+      // which the disabled Edit button already explains; a lookup failure still reports.
+      if (reportBlocker || current.editReason !== reason) edits.error = { message: reason, key: '' };
       return false;
     }
     edits.on = true;
@@ -372,17 +374,17 @@
     } else setCell(edits, r.idx, r.row, c, v);
   }
 
-  async function startEdit(r: GridRow, c: string, multiline = false) {
+  async function startEdit(r: GridRow, c: string, { multiline = false, reportBlocker = true } = {}) {
     if (isDeleted(r) || loadingCell) return;
     // Outside edit mode a nested cell opens for reading; Edit turns on editing.
     if (!edits.on && isNested(r, c)) return viewCell(r, c);
     const current = result;
     if (!edits.on || !current?.edit) {
-      if (preparing || blocker) { await enableEdit(); return; }
+      if (preparing || blocker) { await enableEdit(reportBlocker); return; }
       const cell = { key: r.key, col: c };
       loadingCell = cell;
       try {
-        if (!(await enableEdit()) || loadingCell !== cell) return;
+        if (!(await enableEdit(reportBlocker)) || loadingCell !== cell) return;
       } finally {
         if (loadingCell === cell) loadingCell = null;
       }
@@ -653,20 +655,43 @@
     e.currentTarget.focus({ preventScroll: true });
   }
 
+  function pickAll(e: MouseEvent & { currentTarget: HTMLButtonElement }) {
+    if (!result) return;
+    const allRows: Record<string, true> = {};
+    for (const r of rows) allRows[r.key] = true;
+    const allCols: Record<string, true> = {};
+    for (const c of result.columns) allCols[c] = true;
+    grid.selected = allRows;
+    grid.pickedCols = allCols;
+    grid.rowAnchor = rows.length ? 0 : -1;
+    grid.colAnchor = result.columns.length ? 0 : -1;
+    e.currentTarget.focus({ preventScroll: true });
+  }
+
   const hasRows = $derived(Object.keys(selected).length > 0);
   const hasCols = $derived(Object.keys(pickedCols).length > 0);
   /** The copied block: picked rows (all if none) × picked columns (all if none). */
   const inBlock = (r: GridRow, c: string) => (hasRows || hasCols) && (!hasRows || !!selected[r.key]) && (!hasCols || !!pickedCols[c]);
 
   function copyBlock(e: KeyboardEvent) {
-    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.key.toLowerCase() !== 'c' || editing || !result || !(hasRows || hasCols)) return;
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.key.toLowerCase() !== 'c' || editing || !result) return;
+    if (hasRows || hasCols) {
+      e.preventDefault();
+      const cols = result.columns.filter((c) => !hasCols || pickedCols[c]);
+      const text = rows
+        .filter((r) => !hasRows || selected[r.key])
+        .map((r) => cols.map((c) => cellText(value(r, c))).join('\t'))
+        .join('\n');
+      navigator.clipboard?.writeText(text).catch(() => {});
+      return;
+    }
+    const active = document.activeElement;
+    if (!(active instanceof HTMLTableCellElement) || active.cellIndex < 1 || !scroller?.contains(active)) return;
+    const r = rows[Number(active.closest<HTMLTableRowElement>('tr[data-row]')?.dataset.row)];
+    const col = result.columns[active.cellIndex - 1];
+    if (!r || !col) return;
     e.preventDefault();
-    const cols = result.columns.filter((c) => !hasCols || pickedCols[c]);
-    const text = rows
-      .filter((r) => !hasRows || selected[r.key])
-      .map((r) => cols.map((c) => cellText(value(r, c))).join('\t'))
-      .join('\n');
-    navigator.clipboard?.writeText(text).catch(() => {});
+    copyCell(r, col);
   }
 
   /**
@@ -707,8 +732,8 @@
     return null;
   });
 
-  function deleteRows(keys: string[]) {
-    if (redisConn) {
+  function deleteRows(keys: string[], restore = false) {
+    if (redisConn && !restore) {
       if (!result || !edits.on || !canWrite(conn)) return;
       const picked = new Set(keys);
       for (const r of rows) {
@@ -720,11 +745,13 @@
     for (const k of keys) {
       const r = rows.find((x) => x.key === k);
       if (!r) continue;
-      const bad = mongoConn ? idProblem(r) : null;
+      const bad = mongoConn && !restore ? idProblem(r) : null;
       if (bad) edits.error = { message: bad, key: r.key };
-      else if (r.isNew) edits.added = edits.added.filter((a) => 'a' + a.key !== k);
-      else if (edits.deleted[r.idx]) delete edits.deleted[r.idx];
-      else edits.deleted[r.idx] = true;
+      else if (r.isNew) {
+        if (!restore) edits.added = edits.added.filter((a) => 'a' + a.key !== k);
+      } else if (edits.deleted[r.idx]) {
+        if (restore) delete edits.deleted[r.idx];
+      } else if (!restore) edits.deleted[r.idx] = true;
     }
     grid.selected = {};
   }
@@ -933,7 +960,11 @@
         </colgroup>
         <thead class="sticky top-0 z-sticky">
           <tr aria-rowindex={1}>
-            <th class="sticky left-0 w-9 border-b border-line bg-surface shadow-[1px_0_0_var(--c-line)]"></th>
+            <th class="sticky left-0 w-9 border-b border-line bg-surface p-0 shadow-[1px_0_0_var(--c-line)]">
+              <button type="button" class="focus-ring flex h-8 w-full cursor-pointer items-center justify-center text-faint hover:bg-accent/10 hover:text-accent" title="Select all rows and columns" aria-label="Select all rows and columns" onclick={pickAll}>
+                <Grid2x2 size={11} />
+              </button>
+            </th>
             {#each result.columns as c, ci}
               <th class="group/th relative h-8 border-b border-l border-line bg-surface px-2.5 py-0 text-left font-normal" title={result.types?.[ci]}>
                 {#if pickedCols[c]}<span class="pointer-events-none absolute inset-0 bg-accent/10"></span>{/if}
@@ -998,7 +1029,7 @@
                   class="focus-ring relative h-list-row {tableWidth === null ? 'max-w-72' : ''} truncate select-none border-b border-l border-line/60 {fk ? 'pr-7 pl-2.5' : 'px-2.5'} {isChanged(r, c) && !isDeleted(r) ? 'bg-warn-soft' : hasCols && inBlock(r, c) ? 'bg-accent/10' : ''} {typeof v === 'number' ? 'text-right' : ''}"
                   aria-busy={isLoading || undefined}
                   tabindex={i === tabRow && ci === 0 ? 0 : -1}
-                  ondblclick={() => startEdit(r, c)}
+                  ondblclick={() => startEdit(r, c, { reportBlocker: false })}
                   onclick={(e) => {
                     if (e.metaKey || e.ctrlKey) return;
                     grid.pickedCols = {};
@@ -1125,7 +1156,7 @@
   {@const { anchor, cell, r, col } = menu}
   {@const picked = contextRows(r)}
   {@const editProblem = redisConn && result ? redisCellProblem(result, r.idx, col) : null}
-  {@const deleteProblem = redisConn && result ? picked.reduce<string | null>((bad, row) => bad ?? (isDeleted(row) ? null : redisDeleteProblem(result, row.idx)), null) : null}
+  {@const deleteProblem = redisConn && result && !isDeleted(r) ? picked.reduce<string | null>((bad, row) => bad ?? (isDeleted(row) ? null : redisDeleteProblem(result, row.idx)), null) : null}
   <Menu {anchor} returnFocus={cell} label="Cell actions" onclose={() => (menu = null)}>
     <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => copyCell(r, col)}><Copy size={13} /> Copy cell</button>
     <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => copyRows(picked)}><Copy size={13} /> Copy {picked.length > 1 ? 'rows' : 'row'}</button>
@@ -1145,7 +1176,7 @@
           <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => setMongoNull(r, col)}><CircleSlash size={13} /> Set null</button>
         {:else if redisConn}
           {#if !editProblem}
-            <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => startEdit(r, col, true)}><Pencil size={13} /> Edit as multiline text…</button>
+            <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => startEdit(r, col, { multiline: true })}><Pencil size={13} /> Edit as multiline text…</button>
           {/if}
         {:else}
           <button type="button" role="menuitem" tabindex="-1" class="menu-item" onclick={() => write(r, col, null)}><CircleSlash size={13} /> Set NULL</button>
@@ -1158,7 +1189,7 @@
         {/if}
       {/if}
       {#if canEditRows}
-        <button type="button" role="menuitem" tabindex="-1" class="menu-item {isDeleted(r) ? '' : 'nav-item-danger'}" disabled={!!deleteProblem} title={deleteProblem ?? undefined} onclick={() => deleteRows(picked.map((row) => row.key))}>
+        <button type="button" role="menuitem" tabindex="-1" class="menu-item {isDeleted(r) ? '' : 'nav-item-danger'}" disabled={!!deleteProblem} title={deleteProblem ?? undefined} onclick={() => deleteRows(picked.map((row) => row.key), isDeleted(r))}>
           {#if isDeleted(r)}<Undo2 size={13} /> Restore {mongoConn ? 'document' : 'row'}
           {:else}<Minus size={13} /> Delete {mongoConn ? 'document' : 'row'}{picked.length > 1 ? 's' : ''}{/if}
         </button>

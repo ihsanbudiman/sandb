@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { confirmMockBackend } from './mock';
 
 async function runQuery(page: Page) {
   const editor = page.locator('.cm-content');
@@ -11,6 +12,7 @@ async function runQuery(page: Page) {
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
   await expect(page.locator('.cm-content')).toBeVisible();
+  await confirmMockBackend(page);
 });
 
 test('sidebar tabs support arrows, Home/End, and a single tab stop', async ({ page }) => {
