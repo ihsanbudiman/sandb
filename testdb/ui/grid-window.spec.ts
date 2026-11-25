@@ -4,15 +4,17 @@ import { expect, test, type Page } from '@playwright/test';
 
 const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
 
-async function openCustomers(page: Page) {
+async function openQuery(page: Page, sql: string) {
   await page.goto('/');
   await expect(page.locator('.cm-content')).toBeVisible();
   const gotIt = page.getByRole('button', { name: 'Got it' });
   if (await gotIt.isVisible().catch(() => false)) await gotIt.click();
-  await page.locator('.cm-content').fill('SELECT * FROM customers;');
+  await page.locator('.cm-content').fill(sql);
   await page.getByRole('button', { name: 'Run', exact: true }).click();
   await expect(page.locator('#query-results tr[data-row="0"]')).toBeVisible();
 }
+
+const openCustomers = (page: Page) => openQuery(page, 'SELECT * FROM customers;');
 
 const grid = (page: Page) => page.locator('#query-results table');
 const scrollTo = (page: Page, top: number) =>
@@ -51,6 +53,34 @@ test('copying selected rows still works after they scroll out of the window', as
   await expect(page.locator('#query-results tr[data-row="0"]')).toHaveCount(0);
   await page.keyboard.press(`${mod}+c`);
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toMatch(new RegExp(`^${id}\\t`));
+});
+
+test('copying a focused cell works when the result has no primary key', async ({ page, context, browserName }) => {
+  await context.grantPermissions(browserName === 'webkit' ? ['clipboard-read'] : ['clipboard-read', 'clipboard-write']);
+  await openQuery(page, 'SELECT name FROM customers;');
+  await expect(grid(page).locator('thead th')).toHaveCount(2);
+  const cell = page.locator('#query-results tr[data-row="0"] td').nth(1);
+  const text = await cell.innerText();
+  await cell.click();
+  await page.keyboard.press(`${mod}+c`);
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(text);
+  await cell.dblclick();
+  await expect(page.getByRole('button', { name: 'Edit', exact: true })).toBeDisabled();
+  await expect(page.getByRole('textbox', { name: 'Cell value' })).toHaveCount(0);
+  await expect(page.locator('#query-results [role="alert"]')).toHaveCount(0);
+});
+
+test('the corner button selects every row and column for copying', async ({ page, context, browserName }) => {
+  await context.grantPermissions(browserName === 'webkit' ? ['clipboard-read'] : ['clipboard-read', 'clipboard-write']);
+  await openCustomers(page);
+  await page.getByRole('button', { name: 'Select all rows and columns', exact: true }).click();
+  await page.keyboard.press(`${mod}+c`);
+  const total = Number(await grid(page).getAttribute('aria-rowcount')) - 1;
+  await expect.poll(async () => (await page.evaluate(() => navigator.clipboard.readText())).split('\n').length).toBe(total);
+  const lines = (await page.evaluate(() => navigator.clipboard.readText())).split('\n');
+  expect(lines).toHaveLength(total);
+  expect(lines[0].split('\t')).toHaveLength(6);
+  expect(lines.at(-1)?.split('\t')).toHaveLength(6);
 });
 
 // Chromium fires blur on a removed focused element, so only WebKit (Tauri on macOS) shows a regression here.

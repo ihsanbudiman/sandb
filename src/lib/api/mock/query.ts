@@ -77,6 +77,10 @@ export function runStatement(sql: string, schema: Schema, conn: { engine: Connec
   if (!schema[table] || !okPrefix) return { columns: [], rows: [], ms, error: `relation "${prefix ? prefix + '.' : ''}${table}" does not exist` };
   const sqlLimit = Number(normalized.match(/limit\s+(\d+)/i)?.[1] ?? NaN);
   const limit = Number.isFinite(sqlLimit) ? Math.min(options.limit ?? sqlLimit, sqlLimit) : (options.limit ?? 200);
+  const picked = selectItems(normalized).map(plainColumn);
+  const columns = picked.length && picked.every((c): c is string => c !== undefined) ? picked : schema[table];
+  const unknown = columns.find((c) => !schema[table].includes(c));
+  if (unknown) return { columns: [], rows: [], ms, error: `column "${unknown}" does not exist` };
   const d = tableData(schema, table);
   const filters = filtersOf(normalized);
   const base = filters?.length ? filterRows(d.base, filters) : d.base;
@@ -94,7 +98,7 @@ export function runStatement(sql: string, schema: Schema, conn: { engine: Connec
     });
     rows = rows.slice(0, limit);
   }
-  return { columns: schema[table], rows, ms, table };
+  return { columns, rows, ms, table };
 }
 
 /** The statements of a run, as `run_query` answers them. Without `requested`, the last statement's own LIMIT above the default sizes the run, like `result::limit`. */
