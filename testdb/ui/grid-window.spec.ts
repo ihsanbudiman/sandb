@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { confirmMockBackend } from './mock';
 
 // The results grid renders only the rows near the viewport. These cases cover what that must not break.
 
@@ -7,6 +8,7 @@ const mod = process.platform === 'darwin' ? 'Meta' : 'Control';
 async function openQuery(page: Page, sql: string) {
   await page.goto('/');
   await expect(page.locator('.cm-content')).toBeVisible();
+  await confirmMockBackend(page);
   const gotIt = page.getByRole('button', { name: 'Got it' });
   if (await gotIt.isVisible().catch(() => false)) await gotIt.click();
   await page.locator('.cm-content').fill(sql);
@@ -82,6 +84,7 @@ test('the corner button selects every row and column for copying', async ({ page
   expect(lines[0].split('\t')).toHaveLength(6);
   expect(lines.at(-1)?.split('\t')).toHaveLength(6);
 });
+
 
 // Chromium fires blur on a removed focused element, so only WebKit (Tauri on macOS) shows a regression here.
 test('an open cell editor commits its value when its row scrolls out of the window', async ({ page }) => {

@@ -64,6 +64,10 @@ const demo: Capabilities = {
 function pick(): Backend {
   if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) return makeBackend(tauriTransport, desktop);
   if (import.meta.env.DEV && import.meta.env.VITE_BACKEND === 'bridge') return makeBackend(bridgeTransport(), bridge);
+  if (typeof document !== 'undefined') {
+    // Browser tests must prove they are on the isolated demo backend before they run SQL.
+    document.documentElement.dataset.sandbBackend = 'mock';
+  }
   return makeBackend(mockTransport, demo);
 }
 
