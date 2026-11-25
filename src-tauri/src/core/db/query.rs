@@ -9,7 +9,7 @@ use sqlparser::parser::Parser;
 
 use crate::core::conn_ro;
 use crate::core::connections::{Connection, Env, target_database};
-use crate::core::db::conn::{CLOSE_TIMEOUT, Conn};
+use crate::core::db::conn::{CLOSE_TIMEOUT, Conn, large_rows_notice};
 use crate::core::db::ctx::Ctx;
 use crate::core::db::session;
 use crate::core::engine::SqlEngine;
@@ -246,13 +246,14 @@ async fn execute(
     drop(run);
     // The text heuristic only stands in when the server could not be asked.
     let open_tx = in_tx.unwrap_or_else(|| split::leaves_transaction_open(engine, &req.sql));
+    let notices = open_tx
+        .then(|| OPEN_TX_NOTICE.to_string())
+        .into_iter()
+        .chain(large_rows_notice(&statements))
+        .collect();
     Ok(QueryRun {
         statements,
-        notices: if open_tx {
-            vec![OPEN_TX_NOTICE.to_string()]
-        } else {
-            Vec::new()
-        },
+        notices,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }
@@ -399,11 +400,14 @@ async fn run_in_session(
     session::refresh(&mut s).await;
     let r = match r {
         Ok(mut statements) => Ok(QueryRun {
+            notices: notices
+                .into_iter()
+                .chain(large_rows_notice(&statements))
+                .collect(),
             statements: {
                 mark_sortable(engine, stmts, reads, &mut statements);
                 statements
             },
-            notices,
             elapsed_ms: started.elapsed().as_millis() as u64,
         }),
         Err(mut e) => {

@@ -820,6 +820,17 @@ async fn the_cancel_aborts_an_open_save_transaction() {
         0,
         "the inserts rolled back"
     );
+    // The aborted transaction holds no lock: another client writes the save's first document at
+    // once. A transaction left open on the server holds it until `transactionLifetimeLimitSeconds`.
+    let docs = seed_client
+        .database(common::seed::STAGING)
+        .collection::<Document>(&coll);
+    let write = docs.update_one(doc! { "_id": 1 }, doc! { "$set": { "a": "after-cancel" } });
+    let written = tokio::time::timeout(Duration::from_secs(5), write)
+        .await
+        .expect("the cancelled save still holds doc 1 on the server")
+        .unwrap();
+    assert_eq!(written.modified_count, 1);
     drop_a(&seed_client, &coll).await;
     drop(proxy);
 }

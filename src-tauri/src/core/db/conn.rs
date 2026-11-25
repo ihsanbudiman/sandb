@@ -15,7 +15,7 @@ use sqlx::mysql::{MySql, MySqlConnection};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgConnection;
 use sqlx::sqlite::{Sqlite, SqliteConnection};
-use sqlx::{Connection as _, Database, Either, Executor, Row};
+use sqlx::{Connection as _, Database, Decode, Either, Executor, Row, TypeInfo, ValueRef};
 use tokio_util::sync::CancellationToken;
 
 use crate::core::db::pool::{DbPool, sqlite_options};
@@ -33,6 +33,23 @@ pub(crate) const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const TX_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound for opening the extra connection that sends a cancel.
 const CANCEL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound for the raw bytes of the rows that one result keeps. The grid shows only a preview of
+/// each cell, but the server sends every value whole: 200 rows of six full-precision boundary
+/// geometries are gigabytes, and the driver's buffers for them stay in the process for a long
+/// time after the run. A result stops at this size like it stops at the row limit.
+pub(crate) const RESULT_BYTES: usize = 64 << 20;
+
+/// The notice for a result that stopped at [`RESULT_BYTES`] before the row limit.
+pub(crate) fn large_rows_notice(statements: &[StatementResult]) -> Option<String> {
+    let s = statements
+        .iter()
+        .find(|s| s.truncated && s.rows.len() < s.limit)?;
+    Some(format!(
+        "Showing {} rows: the rows are large, so the result stopped at {} MB. Select fewer columns to see more rows.",
+        s.rows.len(),
+        RESULT_BYTES >> 20
+    ))
+}
 
 /// `rows_affected` for a query result of any engine, so the generic runner needs no
 /// per-call-site function.
@@ -49,6 +66,43 @@ impl RowsAffected for sqlx::postgres::PgQueryResult {
 impl RowsAffected for sqlx::mysql::MySqlQueryResult {
     fn rows_affected(&self) -> u64 {
         sqlx::mysql::MySqlQueryResult::rows_affected(self)
+    }
+}
+
+/// Raw size of a row as the server sent it; the cells the grid keeps are cut, this is not.
+trait RowBytes {
+    fn row_bytes(&self) -> usize;
+}
+
+/// `&[u8]` does not decode a PG text-format value (the simple query protocol), so PG reads
+/// the raw bytes directly.
+impl RowBytes for sqlx::postgres::PgRow {
+    fn row_bytes(&self) -> usize {
+        (0..self.len())
+            .filter_map(|i| self.try_get_raw(i).ok()?.as_bytes().ok().map(<[u8]>::len))
+            .sum()
+    }
+}
+
+impl RowBytes for sqlx::mysql::MySqlRow {
+    fn row_bytes(&self) -> usize {
+        (0..self.len())
+            .filter_map(|i| self.try_get_raw(i).ok())
+            .filter(|v| !v.is_null())
+            .map(|v| <&[u8] as Decode<MySql>>::decode(v).map_or(0, <[u8]>::len))
+            .sum()
+    }
+}
+
+/// Only TEXT and BLOB are read as bytes: SQLite gives the bytes of a number by formatting it
+/// as text, which is work for nothing. Numbers are small; they count 0.
+impl RowBytes for sqlx::sqlite::SqliteRow {
+    fn row_bytes(&self) -> usize {
+        (0..self.len())
+            .filter_map(|i| self.try_get_raw(i).ok())
+            .filter(|v| matches!(v.type_info().name(), "TEXT" | "BLOB"))
+            .map(|v| <&[u8] as Decode<Sqlite>>::decode(v).map_or(0, <[u8]>::len))
+            .sum()
     }
 }
 
@@ -695,14 +749,17 @@ where
 struct ResultSet {
     columns: Option<Vec<ColumnMeta>>,
     rows: Vec<Vec<Value>>,
+    /// Raw bytes of `rows`, for [`RESULT_BYTES`].
+    bytes: usize,
     truncated: bool,
     changed: u64,
 }
 
 /// Runs one piece of SQL and returns one result per result set: one for a split statement,
 /// several for text the splitter could not split. The `bool` is true when a read stopped
-/// mid-result at `limit` and left the connection unusable; `in_session` holds the run's
-/// connection, so a session-mode read drains like a write instead (it never sets the flag).
+/// mid-result at `limit` or [`RESULT_BYTES`] and left the connection unusable; `in_session`
+/// holds the run's connection, so a session-mode read drains like a write instead (it never
+/// sets the flag).
 async fn run_one<DB>(
     conn: &mut DB::Connection,
     source_sql: &str,
@@ -715,6 +772,7 @@ async fn run_one<DB>(
 where
     DB: Database,
     DB::QueryResult: RowsAffected,
+    DB::Row: RowBytes,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
 {
     let started = Instant::now();
@@ -734,7 +792,7 @@ where
                     if cur.columns.is_none() {
                         cur.columns = Some(row.columns().iter().map(reader::meta).collect());
                     }
-                    if cur.rows.len() >= limit {
+                    if cur.rows.len() >= limit || cur.bytes >= RESULT_BYTES {
                         cur.truncated = true;
                         // Dropping the stream of a write (RETURNING) would roll it back, and
                         // inside a tab session it would cost the open transaction the next
@@ -746,6 +804,7 @@ where
                         }
                         continue;
                     }
+                    cur.bytes += row.row_bytes();
                     cur.rows.push(
                         (0..row.len())
                             .map(|i| cell(&row, i))
@@ -855,6 +914,58 @@ mod tests {
         assert!(tx(SqlEngine::Sqlite, true, Some(true)).dirty(false));
         assert!(!tx(SqlEngine::Sqlite, true, Some(false)).dirty(true));
         assert!(tx(SqlEngine::Sqlite, true, None).dirty(true));
+    }
+
+    /// Large values must not reach the process in full just to be cut to a preview: a result
+    /// stops at `RESULT_BYTES` before the row limit, and says why. Small rows still reach
+    /// the row limit.
+    #[tokio::test]
+    async fn a_result_of_large_rows_stops_at_the_byte_bound() {
+        let mut c = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        let row = 10 << 20;
+        let sql = format!(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) \
+             SELECT i, zeroblob({row}) AS geom FROM n"
+        );
+        let (r, cut) = run_one::<Sqlite>(
+            &mut c,
+            &sql,
+            &sql,
+            true,
+            200,
+            false,
+            reader::sqlite_cell::<Preview>,
+        )
+        .await
+        .unwrap();
+        let kept = RESULT_BYTES.div_ceil(row);
+        assert_eq!(r[0].rows.len(), kept);
+        assert!(r[0].truncated && cut);
+        assert!(
+            large_rows_notice(&r)
+                .unwrap()
+                .starts_with(&format!("Showing {kept} rows"))
+        );
+
+        let small = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300) SELECT i FROM n";
+        let (r, _) = run_one::<Sqlite>(
+            &mut c,
+            small,
+            small,
+            true,
+            200,
+            false,
+            reader::sqlite_cell::<Preview>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r[0].rows.len(), 200);
+        assert!(r[0].truncated);
+        assert_eq!(
+            large_rows_notice(&r),
+            None,
+            "the row limit is not a size problem"
+        );
     }
 
     #[test]

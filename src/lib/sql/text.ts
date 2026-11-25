@@ -147,6 +147,22 @@ export function maskLiterals(text: string, dialect: Dialect): string {
   return out.join('');
 }
 
+/** Whether `pos` sits inside a Postgres `$tag$…$tag$` quote: the body of a `DO` block or a function. */
+export function inDollarQuote(text: string, pos: number, dialect: Dialect): boolean {
+  if (dialect !== 'pg') return false;
+  for (let i = 0; i < pos; i++) {
+    if (text[i] !== '$') continue;
+    const tag = /^\$(?:[A-Za-z_]\w*)?\$/.exec(text.slice(i, i + 64))?.[0];
+    if (!tag) continue;
+    const end = text.indexOf(tag, i + tag.length);
+    // An unterminated quote runs to the end of the text, and the cursor sits there while typing.
+    const close = end < 0 ? text.length + 1 : end + tag.length;
+    if (pos < close) return true;
+    i = close - 1;
+  }
+  return false;
+}
+
 /**
  * The `$1`, `$2`… placeholders of the text, outside strings, comments, quoted names and dollar
  * quotes. A `$` inside a name, as in `price$1`, is not a placeholder.

@@ -4,6 +4,9 @@ All notable changes to sandb. Versions follow [Semantic Versioning](https://semv
 
 ## [Unreleased]
 
+- Fixed: on MongoDB, a grid save that you cancel no longer keeps its transaction open on the server. Before, other writes to the same documents could wait for 60 seconds or more.
+- Fixed: a PostgreSQL `DO` block or a function body keeps its colors. Before, the `$$` quotes made the whole body one string.
+
 ## [0.16.0] - 2026-11-20
 
 - New: search chats by title, and filter the chat history by database. The database list shows how many chats use each database.

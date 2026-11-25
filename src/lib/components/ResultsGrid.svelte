@@ -26,7 +26,7 @@
 </script>
 
 <script lang="ts">
-  import { untrack, type Snippet } from 'svelte';
+  import { tick, untrack, type Snippet } from 'svelte';
   import { ArrowUpDown, ArrowUp, ArrowDown, ArrowUpRight, Check, X, Pencil, Minus, Eye, Undo2, CircleSlash, CircleAlert, CircleCheck, Copy, Braces, Clock, LoaderCircle } from '@lucide/svelte';
   import { api, ApiError, type Cell, type ForeignKeyInfo, type Row, type RunSort, type TypedValue } from '../api';
   import { focusOnMount } from '../actions';
@@ -119,6 +119,7 @@
   }
   function onScroll(e: Event & { currentTarget: HTMLDivElement }) {
     if (e.currentTarget !== scroller || !e.currentTarget.clientHeight) return;
+    setScrollY(e.currentTarget.scrollTop);
     grid.scrollTop = e.currentTarget.scrollTop;
     grid.scrollLeft = e.currentTarget.scrollLeft;
     loadIfAtEnd();
@@ -128,6 +129,58 @@
     if (!scroller || !viewportHeight) return;
     const prefs = grid;
     scroller.scrollTo({ top: untrack(() => prefs.scrollTop), left: untrack(() => prefs.scrollLeft) });
+    untrack(() => scroller && setScrollY(scroller.scrollTop));
+  });
+
+  // Only the rows near the viewport are in the DOM; spacer rows keep the full scroll height.
+  // Every row has the same height (`h-list-row`), so a row's position is its index times that height.
+  const OVERSCAN = 15;
+  let scrollY = $state(0);
+  let rowHeight = $state(26);
+  let table = $state<HTMLTableElement>();
+  const windowAt = (y: number) => [Math.max(0, Math.floor(y / rowHeight) - OVERSCAN), Math.min(rows.length, Math.ceil((y + (viewportHeight || 800)) / rowHeight) + OVERSCAN)];
+  const [firstShown, endShown] = $derived(windowAt(scrollY));
+  const shown = $derived(rows.slice(firstShown, endShown));
+  /** The roving tab stop: the first row in view, not one in the overscan above it. */
+  const tabRow = $derived(Math.min(Math.max(firstShown, Math.floor(scrollY / rowHeight)), Math.max(0, endShown - 1)));
+
+  const rowOf = (el: Element | null | undefined) => Number(el?.closest<HTMLElement>('tr[data-row]')?.dataset.row);
+
+  /**
+   * Moves the rendered window. A row that leaves it is removed from the DOM, and WebKit fires no blur for a removed
+   * focused element: focus moves to the scroller first, so an open cell editor commits and ⌘C still reaches the grid.
+   */
+  function setScrollY(y: number) {
+    const [first, end] = windowAt(y);
+    const outside = (i: number) => i < first || i >= end;
+    const active = document.activeElement;
+    if (scroller && active && scroller.contains(active) && outside(rowOf(active))) scroller.focus({ preventScroll: true });
+    if (menu && outside(rowOf(menu.cell))) {
+      // The menu would return focus to its removed cell; the scroller keeps keyboard focus in the grid.
+      scroller?.focus({ preventScroll: true });
+      menu = null;
+    }
+    scrollY = y;
+  }
+
+  $effect(() => {
+    shown;
+    const h = table?.tBodies[0]?.querySelector<HTMLElement>('tr[data-row]')?.getBoundingClientRect().height;
+    if (h) rowHeight = h;
+  });
+
+  // Auto-sized columns would change width as other rows scroll in, so a windowed grid keeps the content widths of
+  // its first render. The table keeps its full width: a fixed layout shares the extra width among the columns.
+  $effect(() => {
+    if (!table || !viewportHeight || tableWidth !== null || columnWidths.length || view === 'json' || shown.length >= rows.length) return;
+    untrack(() => {
+      const header = table?.tHead?.rows[0];
+      if (!table || !header) return;
+      table.style.width = 'max-content';
+      const widths = Array.from(header.cells).slice(1).map((cell) => Math.ceil(cell.getBoundingClientRect().width));
+      table.style.width = '';
+      if (widths.every((w) => w > 0)) grid.columnWidths = widths;
+    });
   });
 
   // Also after each page lands: a pane taller than the rows has no scroll event to wait for.
@@ -163,6 +216,7 @@
 
   function measuredColumns(handle: HTMLElement) {
     const table = handle.closest('table');
+    if (!table?.getBoundingClientRect().width) return null;
     const header = table?.tHead?.rows[0];
     if (!table || !header || !result) return null;
     if (columnWidths.length === result.columns.length && tableWidth !== null) return { widths: [...columnWidths], width: tableWidth };
@@ -697,9 +751,17 @@
     if (e.key === 'ArrowLeft') next = cell.cellIndex > 1 ? cell.previousElementSibling : null;
     else if (e.key === 'ArrowRight') next = cell.nextElementSibling;
     else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-      const row = cell.parentElement;
-      const adjacent = e.key === 'ArrowUp' ? row?.previousElementSibling : row?.nextElementSibling;
-      if (adjacent instanceof HTMLTableRowElement) next = adjacent.cells[cell.cellIndex];
+      const target = Number(cell.parentElement?.dataset.row) + (e.key === 'ArrowUp' ? -1 : 1);
+      if (!(target >= 0 && target < rows.length)) return;
+      e.preventDefault();
+      // The target row can be outside the rendered window: scroll it into range first.
+      if (scroller && (target < firstShown || target >= endShown)) {
+        scroller.scrollTop = e.key === 'ArrowUp' ? target * rowHeight : scroller.scrollTop + rowHeight;
+        setScrollY(scroller.scrollTop);
+      }
+      const col = cell.cellIndex;
+      void tick().then(() => table?.querySelector<HTMLTableRowElement>(`tr[data-row="${target}"]`)?.cells[col]?.focus());
+      return;
     }
     if (next instanceof HTMLTableCellElement) {
       e.preventDefault();
@@ -862,7 +924,7 @@
       {#if mongoDocs && view === 'json'}
         <JsonTree documents={result.documents ?? []} more={moreRows(result)} {loading} onloadmore={onloadmore} />
       {:else}
-      <table class="w-full border-separate border-spacing-0 font-mono text-sm {tableWidth === null ? '' : 'table-fixed'}" style:width={tableWidth === null ? undefined : `${tableWidth}px`}>
+      <table bind:this={table} aria-rowcount={rows.length + 1} class="w-full border-separate border-spacing-0 font-mono text-sm {tableWidth === null && !columnWidths.length ? '' : 'table-fixed'}" style:width={tableWidth === null ? undefined : `${tableWidth}px`}>
         <colgroup>
           <col class="w-9" />
           {#each result.columns as _, ci}
@@ -870,7 +932,7 @@
           {/each}
         </colgroup>
         <thead class="sticky top-0 z-sticky">
-          <tr>
+          <tr aria-rowindex={1}>
             <th class="sticky left-0 w-9 border-b border-line bg-surface shadow-[1px_0_0_var(--c-line)]"></th>
             {#each result.columns as c, ci}
               <th class="group/th relative h-8 border-b border-l border-line bg-surface px-2.5 py-0 text-left font-normal" title={result.types?.[ci]}>
@@ -913,8 +975,12 @@
           </tr>
         </thead>
         <tbody>
-          {#each rows as r, i (r.key)}
-            <tr class="group/row {ROW_TINT[tintOf(r)]}">
+          {#if firstShown > 0}
+            <tr aria-hidden="true" style:height="{firstShown * rowHeight}px"><td class="p-0" colspan={result.columns.length + 1}></td></tr>
+          {/if}
+          {#each shown as r, j (r.key)}
+            {@const i = firstShown + j}
+            <tr class="group/row {ROW_TINT[tintOf(r)]}" data-row={i} aria-rowindex={i + 2}>
               <td
                 class="sticky left-0 border-b border-line/60 bg-surface p-0 text-right text-2xs tabular-nums shadow-[1px_0_0_var(--c-line)] select-none {selected[r.key] ? 'font-medium text-ink' : 'text-faint'}"
               >
@@ -931,7 +997,7 @@
                   title={mongoDocs ? (r.isNew ? 'new document' : isChanged(r, c) ? (edits.changed[r.idx][c] as TypedValue).type : (result.cellTypes?.[r.idx]?.[ci] ?? 'missing')) : undefined}
                   class="focus-ring relative h-list-row {tableWidth === null ? 'max-w-72' : ''} truncate select-none border-b border-l border-line/60 {fk ? 'pr-7 pl-2.5' : 'px-2.5'} {isChanged(r, c) && !isDeleted(r) ? 'bg-warn-soft' : hasCols && inBlock(r, c) ? 'bg-accent/10' : ''} {typeof v === 'number' ? 'text-right' : ''}"
                   aria-busy={isLoading || undefined}
-                  tabindex={i === 0 && ci === 0 ? 0 : -1}
+                  tabindex={i === tabRow && ci === 0 ? 0 : -1}
                   ondblclick={() => startEdit(r, c)}
                   onclick={(e) => {
                     if (e.metaKey || e.ctrlKey) return;
@@ -1010,6 +1076,9 @@
               {/each}
             </tr>
           {/each}
+          {#if endShown < rows.length}
+            <tr aria-hidden="true" style:height="{(rows.length - endShown) * rowHeight}px"><td class="p-0" colspan={result.columns.length + 1}></td></tr>
+          {/if}
         </tbody>
       </table>
       {/if}

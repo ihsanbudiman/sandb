@@ -5,15 +5,33 @@
  */
 
 import { insertCompletionText, pickedCompletion, startCompletion, type Completion, type CompletionContext, type CompletionResult, type CompletionSource } from '@codemirror/autocomplete';
-import { keywordCompletionSource, MySQL, PostgreSQL, SQLite, type SQLDialect } from '@codemirror/lang-sql';
+import { keywordCompletionSource, MySQL, PostgreSQL, SQLite, SQLDialect } from '@codemirror/lang-sql';
 import { syntaxTree } from '@codemirror/language';
 import type { EditorView } from '@codemirror/view';
+import { parseMixed } from '@lezer/common';
 import type { ForeignKeyInfo, SnapshotTable } from '../api';
 import { tableLabel } from '../tableId';
 import { JOIN_MODS, NOT_ALIAS, relationsIn, tokenize, type Relation, type Token } from './columns';
-import { maskLiterals, statementRangeAt, type Dialect } from './text';
+import { maskLiterals, inDollarQuote, statementRangeAt, type Dialect } from './text';
 
-export const SQL_DIALECTS: Record<Dialect, SQLDialect> = { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite };
+/** Parser of a code body: no dollar quotes, so a `$ddl$` inside a `DO` block reads as SQL too. */
+const bodyParser = SQLDialect.define({ ...PostgreSQL.spec, doubleDollarQuotedStrings: false }).language.parser;
+
+/**
+ * PostgreSQL reads `$tag$…$tag$` as one string. The body of a `DO` block or of `AS $$…$$` is SQL, so
+ * that body gets its own parse and keeps its colors. Any other dollar quote stays a string, so
+ * `SELECT $$it's$$` keeps its apostrophe as text.
+ */
+export const POSTGRES: SQLDialect = PostgreSQL.configureLanguage({
+  wrap: parseMixed((node, input) => {
+    if (node.name !== 'String' || !input.read(node.from, node.to).startsWith('$')) return null;
+    // Only a code body follows `DO` or `AS`.
+    const before = input.read(Math.max(0, node.from - 40), node.from);
+    return /\b(?:do|as)\s*$/i.test(before) ? { parser: bodyParser } : null;
+  }),
+});
+
+export const SQL_DIALECTS: Record<Dialect, SQLDialect> = { pg: POSTGRES, mysql: MySQL, sqlite: SQLite };
 
 export interface Column {
   name: string;
@@ -163,9 +181,9 @@ export function quoteIdent(name: string, dialect: Dialect): string {
 
 const quotePath = (path: string[], dialect: Dialect) => path.map((p) => quoteIdent(p, dialect)).join('.');
 
-/** Short alias from the initials of the words of a table name (`order_items` → `oi`), unique in the statement. */
+/** Short alias from the initials of the words of a table name (`order_items` → `oi`, `lvl_1_range` → `lr`), unique in the statement. */
 export function makeAlias(name: string, taken: Set<string>): string {
-  const words = name.split(/[^A-Za-z\d]+|(?<=[a-z\d])(?=[A-Z])/).filter(Boolean);
+  const words = name.split(/[^A-Za-z\d]+|(?<=[a-z\d])(?=[A-Z])/).filter((w) => /^[A-Za-z]/.test(w));
   let base = words.map((w) => w[0]).join('').toLowerCase();
   if (!/^[a-z]/.test(base)) base = 't' + base;
   let alias = base;
@@ -311,12 +329,28 @@ async function onConditions(relations: Relation[], opts: SqlCompletionOptions): 
   return out;
 }
 
-function tableOptions(opts: SqlCompletionOptions): SqlCompletion[] {
+/**
+ * Writes a picked table with its alias from its initials, as DBeaver does: `adm_area` → `adm_area aa`.
+ * No alias is added when one already follows the name.
+ */
+function withAlias(written: string, name: string, taken: Set<string>) {
+  return (view: EditorView, completion: Completion, from: number, to: number) => {
+    const next = /^\s+([A-Za-z_][\w$]*)/.exec(view.state.sliceDoc(to, to + 64))?.[1];
+    const text = next && !NOT_ALIAS.has(next.toLowerCase()) ? written : `${written} ${makeAlias(name, taken)}`;
+    view.dispatch({ ...insertCompletionText(view.state, text, from, to), annotations: pickedCompletion.of(completion) });
+  };
+}
+
+/** `aliasTaken` is set where a table reference takes an alias (`FROM`, `JOIN`, `UPDATE`): the names already used in the statement. */
+function tableOptions(opts: SqlCompletionOptions, aliasTaken?: Set<string>): SqlCompletion[] {
   const d = opts.dialect;
   const out: SqlCompletion[] = opts.tables.map((t) => {
     const label = tableLabel(t);
     const apply = quotePath(label === t.name ? [t.name] : [t.schema!, t.name], d);
-    return { label, type: t.kind === 'table' ? 'table' : 'view', boost: B_FIT, origin: t.kind === 'table' ? (t.schema ?? '') : t.kind, ...(apply !== label ? { apply } : {}) };
+    return {
+      label, type: t.kind === 'table' ? 'table' : 'view', boost: B_FIT, origin: t.kind === 'table' ? (t.schema ?? '') : t.kind,
+      ...(aliasTaken ? { apply: withAlias(apply, t.name, aliasTaken) } : apply !== label ? { apply } : {}),
+    };
   });
   // PG schemas other than `public`: picking one writes `schema.` and lists its tables.
   for (const s of new Set(opts.tables.map((t) => t.schema).filter((s): s is string => !!s && s !== 'public'))) {
@@ -377,7 +411,7 @@ function qualifiers(relations: Relation[]): SqlCompletion[] {
 }
 
 /** After `x.`: the columns of the table or alias `x`, or the tables of PG schema `x`. */
-async function dotted(ctx: CompletionContext, relations: Relation[], opts: SqlCompletionOptions): Promise<CompletionResult | null> {
+async function dotted(ctx: CompletionContext, relations: Relation[], opts: SqlCompletionOptions, aliasTaken?: Set<string>): Promise<CompletionResult | null> {
   const line = ctx.state.sliceDoc(ctx.state.doc.lineAt(ctx.pos).from, ctx.pos);
   const m = /((?:(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`)\.)+)([\w$]*)$/.exec(line);
   if (!m) return null;
@@ -389,7 +423,10 @@ async function dotted(ctx: CompletionContext, relations: Relation[], opts: SqlCo
     else if (opts.tables.some((t) => t.schema === path[0]) && !opts.tables.some((t) => tableLabel(t) === path[0])) {
       const options = opts.tables
         .filter((t) => t.schema === path[0])
-        .map((t): SqlCompletion => ({ label: t.name, type: t.kind === 'table' ? 'table' : 'view', origin: t.kind === 'table' ? '' : t.kind, ...(quoteIdent(t.name, opts.dialect) !== t.name ? { apply: quoteIdent(t.name, opts.dialect) } : {}) }));
+        .map((t): SqlCompletion => {
+          const apply = quoteIdent(t.name, opts.dialect);
+          return { label: t.name, type: t.kind === 'table' ? 'table' : 'view', origin: t.kind === 'table' ? '' : t.kind, ...(aliasTaken ? { apply: withAlias(apply, t.name, aliasTaken) } : apply !== t.name ? { apply } : {}) };
+        });
       return { from, options, validFor: IDENT };
     }
   }
@@ -412,6 +449,7 @@ function dialectKeywords(ctx: CompletionContext, d: Dialect): SqlCompletion[] {
   return r && !(r instanceof Promise) ? (r.options as SqlCompletion[]) : [];
 }
 
+
 /** First wins: a fitting keyword phrase hides the plain lang-sql keyword with the same label. */
 function merge(...lists: SqlCompletion[][]): SqlCompletion[] {
   const seen = new Set<string>();
@@ -432,6 +470,8 @@ export async function sqlCompletion(ctx: CompletionContext, opts: SqlCompletionO
   const node = syntaxTree(state).resolveInner(pos, -1);
   if (node.name === 'String' || node.name === 'LineComment' || node.name === 'BlockComment' || node.name === 'QuotedIdentifier') return null;
   const doc = state.doc.toString();
+  // A `DO $$…$$` body is SQL to color, but the clause scan masks it: complete nothing inside it.
+  if (inDollarQuote(doc, pos, opts.dialect)) return null;
   const range = statementRangeAt(doc, pos, opts.dialect);
   const start = range?.[0] ?? pos;
   const sql = range ? doc.slice(range[0], range[1]) : '';
@@ -439,12 +479,24 @@ export async function sqlCompletion(ctx: CompletionContext, opts: SqlCompletionO
 
   const word = ctx.matchBefore(/[\w$]+/);
   const wordFrom = word?.from ?? pos;
-  if (state.sliceDoc(wordFrom - 1, wordFrom) === '.') return dotted(ctx, relations, opts);
+  // The word being typed is not a table of the statement yet, so its letters stay free as an alias.
+  const takenNames = () => {
+    const own = range ? relationsIn(doc.slice(start, wordFrom) + doc.slice(pos, range[1]), opts.dialect) : [];
+    return new Set(own.flatMap((r) => [qualifierOf(r).toLowerCase(), r.path[r.path.length - 1].toLowerCase()]));
+  };
+  if (state.sliceDoc(wordFrom - 1, wordFrom) === '.') {
+    const line = state.sliceDoc(state.doc.lineAt(pos).from, wordFrom);
+    const pathFrom = wordFrom - (/(?:(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`)\.)+$/.exec(line)?.[0].length ?? 0);
+    const s = scan(doc.slice(start, pathFrom), opts.dialect);
+    const aliasable = (s.context === 'table' && (s.clause === 'from' || s.clause === 'update')) || s.context === 'join';
+    return dotted(ctx, relations, opts, aliasable ? takenNames() : undefined);
+  }
   // Typing opens the list on a word; Ctrl+Space and a picked keyword open it on an empty one.
   if (!word && !ctx.explicit) return null;
 
   const { context, clause } = scan(doc.slice(start, wordFrom), opts.dialect);
   const d = opts.dialect;
+  const aliasTaken = (context === 'table' && (clause === 'from' || clause === 'update')) || context === 'join' ? takenNames() : undefined;
   const kw = () => dialectKeywords(ctx, d);
   // A small falling boost keeps the written order (most used first, e.g. `WHERE` before `CROSS JOIN`) instead of A–Z.
   const phrases = (list: string[]) => list.map((l, i) => keyword(l, B_FIT - i * 0.01));
@@ -457,11 +509,11 @@ export async function sqlCompletion(ctx: CompletionContext, opts: SqlCompletionO
       options = merge(word && SNIPPETS.some((s) => s.label.startsWith(word.text.toLowerCase()) && word.text.length >= 3) ? SNIPPETS.map(snippet) : [], phrases(STATEMENTS[d]), kw());
       break;
     case 'table':
-      options = tableOptions(opts);
+      options = tableOptions(opts, aliasTaken);
       if (!options.length) options = [tablesNote(opts)];
       break;
     case 'join':
-      options = merge(await joinClauses(relations, opts), tableOptions(opts));
+      options = merge(await joinClauses(relations, opts), tableOptions(opts, aliasTaken));
       if (!options.length) options = [tablesNote(opts)];
       break;
     case 'on':

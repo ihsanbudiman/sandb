@@ -6,13 +6,10 @@ sandb uses Semantic Versioning (`MAJOR.MINOR.PATCH`). `package.json` holds the o
 
 1. The updater signing key is at `~/.tauri/sandb.key` (private) and `~/.tauri/sandb.key.pub` (public, already in `tauri.conf.json`).
    Keep a backup of the private key, for example in a password manager. If you lose it, installed apps can never update again.
-2. In GitHub, open the repo, then Settings > Secrets and variables > Actions, and add:
-   - `TAURI_SIGNING_PRIVATE_KEY`: the full text of `~/.tauri/sandb.key`.
-   Do not create `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. The key has no password.
-   - `MACOS_CODESIGN_CERTIFICATE`: the output of `base64 -i ~/.tauri/sandb-codesign.p12`.
-   - `MACOS_CODESIGN_CERTIFICATE_PASSWORD`: the text of `~/.tauri/sandb-codesign.p12.password`.
+2. Install and log in to the GitHub CLI: `brew install gh`, then `gh auth login`. `scripts/release.sh` uses it to publish the release.
 3. The code signing certificate is at `~/.tauri/sandb-codesign.p12`. It is self-signed, with the name `sandb Code Signing`, and it is valid for 10 years.
-   The workflow signs the app with it. macOS does not trust a self-signed certificate, so it keeps a Keychain "Always Allow" permission for one build only (the cdhash), not for the certificate.
+   On the first run, `scripts/release.sh` imports it into the login keychain with the password in `~/.tauri/sandb-codesign.p12.password`.
+   macOS does not trust a self-signed certificate, so it keeps a Keychain "Always Allow" permission for one build only (the cdhash), not for the certificate.
    Thus macOS asks for Keychain access one time after each update. sandb keeps one Keychain entry (the key of `secrets.enc`), so this is one prompt. A Developer ID certificate from Apple is necessary to remove it.
    Keep a backup of the `.p12` file and its password.
 4. The repo must be public. The app downloads `latest.json` from `https://github.com/ihsanbudiman/sandb/releases/latest/download/latest.json`.
@@ -22,17 +19,29 @@ sandb uses Semantic Versioning (`MAJOR.MINOR.PATCH`). `package.json` holds the o
 1. Change `version` in `package.json` (for example `0.1.0` to `0.2.0`).
    Optional: set the same version in `src-tauri/Cargo.toml`. The app does not read it.
 2. In `CHANGELOG.md`, move the `[Unreleased]` items under a new `## [0.2.0] - <date>` heading.
-3. Commit, tag and push:
+3. Run the checks, then commit and push:
 
    ```sh
+   pnpm ci:local
    git commit -am "Release v0.2.0"
-   git tag v0.2.0
-   git push origin main v0.2.0
+   git push origin main
    ```
 
-4. GitHub Actions (`.github/workflows/release.yml`) builds the app and publishes the release. The workflow stops if the tag does not match `package.json`, or if `CHANGELOG.md` has no `## [x.y.z]` section for the tag. The items of that section become the release notes on GitHub and in `latest.json`.
+4. Build and publish on this Mac:
+
+   ```sh
+   pnpm release:local
+   ```
+
+   `scripts/release.sh` builds Apple Silicon and Intel, signs them, and writes `latest.json`. Then it tags `HEAD` as `v<version>`, pushes the tag, and publishes the GitHub Release with `gh`.
+   It stops before the build if tracked files have changes, if the release exists, or if `CHANGELOG.md` has no `## [x.y.z]` section for the version. The items of that section become the release notes on GitHub and in `latest.json`.
+   The build files stay in `src-tauri/target/release-upload/v<version>/`.
 5. Installed apps see the update at the next start, or with Settings > Updates > Check for updates.
 6. On the first start after the update, the app shows a "What's new" dialog with the `CHANGELOG.md` sections from the last version that was opened up to the new version. The app bundles `CHANGELOG.md` at build time, so a section must exist before the build.
+
+## GitHub Actions
+
+`.github/workflows/ci.yml` and `.github/workflows/release.yml` do not start on push or on tags. They run only when you start them in the Actions tab. `release.yml` needs a `v*` tag as the ref, and the secrets `TAURI_SIGNING_PRIVATE_KEY`, `MACOS_CODESIGN_CERTIFICATE` (output of `base64 -i ~/.tauri/sandb-codesign.p12`) and `MACOS_CODESIGN_CERTIFICATE_PASSWORD`.
 
 ## Local build
 

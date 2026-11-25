@@ -67,3 +67,8 @@ INSERT INTO type_zoo (c_int, c_bigint, c_numeric, c_float, c_bool, c_text, c_var
 (-2147483648, -9223372036854775808, -0.0001, -1.5e300, false, 'Unicode: café, 日本語, 🚀🎉', 'emoji 👍', '00000000-0000-0000-0000-000000000000',
  '[]', '{}', '1970-01-01', '1999-12-31 23:59:59.999999', '2000-01-01 00:00:00+00', '00:00:00', '-3 months', '\x00', '{}', '{}', 'sad'),
 (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+
+-- Fresh statistics, as a real database has: without them the planner can sort a whole table
+-- where the primary key gives the order, and the result then depends on when autovacuum runs.
+-- shop_staging (a template copy, 03_roles.sql) gets the same statistics.
+ANALYZE;

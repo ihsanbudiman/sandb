@@ -1,11 +1,10 @@
 name: CI
 
-# Every push and pull request: type-check, build the frontend, lint and unit-test the Rust core,
+# Manual only, to keep CI off GitHub runners. The normal path is local: pnpm ci:local (scripts/ci.sh).
+# Type-check, build the frontend, lint and unit-test the Rust core,
 # then every integration suite against the throwaway testdb stack.
 on:
-  push:
-    branches: ['**']
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

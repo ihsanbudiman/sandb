@@ -126,11 +126,22 @@ test('long chart titles wrap outside the plot without overlapping its legend', a
 });
 
 test('chat activity shows thinking and database calls in order without hiding the final answer', async ({ page }) => {
+  // The demo reply runs on timers (about 2.5 s in total). A paused clock holds it open, so the
+  // checks of the live state do not race the reply on a slow or busy machine. The fake clock is
+  // installed before the page's scripts run (installed into a running page, it mixes with timers
+  // the page already started); it runs normally until the pause right before Send.
+  await page.clock.install();
+  await page.reload();
   await page.getByPlaceholder('Ask about your data…').fill('Show rows from table customers');
-  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  const send = page.getByRole('button', { name: 'Send', exact: true });
+  await expect(send).toBeEnabled();
+  await page.clock.pauseAt(Date.now() + 1_000);
+  await send.click();
   const toggle = page.getByRole('button', { name: /^Activity/ });
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await page.clock.runFor(1_000);
   await expect(page.getByText('I’ll check the table schema first.', { exact: true })).toBeVisible();
+  await page.clock.resume();
 
   const answer = page.getByText(/Here are the first \d+ rows of customers/);
   await expect(answer).toBeVisible();

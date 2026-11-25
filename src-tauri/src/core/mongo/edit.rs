@@ -422,11 +422,19 @@ async fn in_transaction(
         let finished = {
             let op = write.run(coll, Some(&mut session), comment);
             tokio::pin!(op);
-            tokio::select! {
+            let finished = tokio::select! {
                 biased;
                 () = cancelled(cancelled_run) => None,
                 r = &mut op => Some(r),
+            };
+            // The driver marks the transaction as open on the server only when its first
+            // operation returns. Dropped before that, the abort sends nothing, and the server
+            // holds the transaction (and its locks) until `transactionLifetimeLimitSeconds`.
+            // The cancel's kill ends that operation, so its reply comes back quickly.
+            if finished.is_none() && index == 0 {
+                let _ = tokio::time::timeout(WRITE_REPLY_WAIT, &mut op).await;
             }
+            finished
         };
         match finished {
             None => {

@@ -1,11 +1,12 @@
 name: Release
 
-# Push a tag such as v0.2.0 to build the macOS app and publish a GitHub Release.
+# Manual only. The normal path is local: pnpm release:local (scripts/release.sh), see docs/RELEASING.md.
+# To use this workflow, run it from the Actions tab with a tag such as v0.2.0 as the ref.
+# It builds the macOS app and publishes a GitHub Release.
 # The release includes latest.json, which installed apps read to find updates.
 # Both macOS architectures are built: Apple Silicon (arm64) and Intel (x86_64).
 on:
-  push:
-    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write

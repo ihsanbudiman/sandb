@@ -1,11 +1,12 @@
 // SQL as HTML with the editor's colors, for read-only code in the assistant. The `tok-*` classes are in app.css.
 import { highlightCode, tagHighlighter, tags as t } from '@lezer/highlight';
-import { PostgreSQL, MySQL, SQLite, StandardSQL, type SQLDialect } from '@codemirror/lang-sql';
+import { MySQL, SQLite, StandardSQL, type SQLDialect } from '@codemirror/lang-sql';
 import type { Engine } from './api';
+import { POSTGRES } from './sql/complete';
 import type { SqlEngine } from './sql/text';
 
-const byFence: Record<string, SQLDialect> = { sql: StandardSQL, postgres: PostgreSQL, postgresql: PostgreSQL, pgsql: PostgreSQL, psql: PostgreSQL, mysql: MySQL, mariadb: MySQL, sqlite: SQLite };
-const byEngine: Record<SqlEngine, SQLDialect> = { pg: PostgreSQL, mysql: MySQL, sqlite: SQLite };
+const byFence: Record<string, SQLDialect> = { sql: StandardSQL, postgres: POSTGRES, postgresql: POSTGRES, pgsql: POSTGRES, psql: POSTGRES, mysql: MySQL, mariadb: MySQL, sqlite: SQLite };
+const byEngine: Record<SqlEngine, SQLDialect> = { pg: POSTGRES, mysql: MySQL, sqlite: SQLite };
 const looksSql = /^\s*(?:--[^\n]*\n\s*)*(?:SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|EXPLAIN|SHOW|DESCRIBE|GRANT|REVOKE|BEGIN|COMMIT|ROLLBACK)\b/i;
 
 const tokens = tagHighlighter([
